@@ -1,0 +1,10 @@
+[project]
+name = "nonebot-plugin-tavily-search"
+version = "0.1.0"
+description = "Tavily Search for NoneBot2 with Serper fallback"
+dependencies = [
+    "httpx>=0.24.0",
+]
+
+[tool.nonebot]
+plugin_name = "nonebot_plugin_tavily_search"

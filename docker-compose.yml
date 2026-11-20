@@ -1,0 +1,95 @@
+# ============================================================
+# 日志轮转（必须配，否则 json log 会无限增长把磁盘吃满）
+#   每个容器最多 3 × 20MB = 60MB，超出自动删最老的
+#   不配的话默认是「永不轮转」，跑几天就能到几个 G
+# ============================================================
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "20m"
+    max-file: "3"
+
+services:
+  # 你的大肥鱼机器人
+  bot:
+    build: .
+    container_name: qq-grok-bot
+    restart: always
+    # ⚠️ host 模式：容器直接用宿主机网络栈。
+    #    所以 .env 里访问宿主机/隧道服务必须写 127.0.0.1，
+    #    不能写 host.docker.internal（那是 bridge 模式专用的 DNS 名，
+    #    host 模式下会报 "Name or service not known"）。
+    #    · AGENT_BASE_URL=http://127.0.0.1:8001
+    #    · LOCAL_LLM_URL=http://127.0.0.1:11434/v1/chat/completions
+    network_mode: "host"
+    env_file: .env
+    environment:
+      - TZ=Asia/Shanghai
+    logging: *default-logging
+    volumes:
+      - ./plugins:/app/plugins
+      - ./services:/app/services     # 👈 新增：映射服务层
+      # ⚠️ 2026-11-20：新增 core/ 内核层（tuning / pipeline / llm_gateway）。
+      #    镜像里没有这个目录（镜像是加 core 之前构建的），不挂载的话
+      #    `from core import tuning` 会直接 ImportError → 容器起不来。
+      - ./core:/app/core
+      - ./bot.py:/app/bot.py         # 👈 新增：映射主入口
+      - ./.env:/app/.env
+      - ./data:/app/data
+      - ./napcat/qq:/app/.config/QQ
+      - ./scripts:/app/scripts        # 👈 排查脚本，改完不用再 docker cp
+
+  # ============================================================
+  # RSSHub（已移除，2026-11-13）
+  #
+  # 原来给 pixivrank 提供 RSS 源，现在用不上了：
+  #   pixivrank 的排行改成直连 pixiv 网页版公开接口
+  #     https://www.pixiv.net/ranking.php?mode=daily&format=json
+  #   不需要登录态、不需要中转，一个容器省下 100MB+ 内存。
+  #
+  # 为什么不能继续用 RSSHub：
+  #   RSSHub 的 /pixiv/* 只认 PIXIV_REFRESH_TOKEN（源码 lib/routes/pixiv/token.ts），
+  #   而拿 token 的三条路全断了 ——
+  #     · 账号密码授权被 pixiv 关闭：code 1508 "grant type is unauthorized"
+  #     · PKCE 签发 code 的 /web/v1/users/auth/pixiv/start 接口 404 已下线
+  #     · RSSHub 不支持 cookie 方案
+  #   没有 token 时路由直接抛错，对外就是 503 + "Welcome to RSSHub!" 错误页。
+  #
+  # 代码里仍保留 RSSHub 作为**降级兜底**（pixivrank_search/data_source.py 的
+  # parser_data），网页接口哪天挂了还能手动把这段加回来应急：
+  #
+  #  rsshub:
+  #    image: diygod/rsshub:latest
+  #    container_name: rsshub
+  #    restart: always
+  #    # ⚠️ 只绑 127.0.0.1，不要写 "1200:1200"：RSSHub 没有鉴权，
+  #    #    绑 0.0.0.0 等于给全网开免费 RSS 代理，会被白嫖带宽甚至封 IP。
+  #    ports:
+  #      - "127.0.0.1:1200:1200"
+  #    environment:
+  #      TZ: Asia/Shanghai
+  #      NODE_ENV: production
+  #      CACHE_TYPE: memory
+  #      CACHE_EXPIRE: 300
+  #      PIXIV_REFRESH_TOKEN: ${PIXIV_REFRESH_TOKEN:-}
+  #    logging: *default-logging
+  # ============================================================
+
+  # QQ 客户端 (NapCat)
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    container_name: napcat
+    restart: always
+    network_mode: "host"
+    environment:
+      TZ: "Asia/Shanghai"
+      ACCOUNT: "${NAPCAT_ACCOUNT:-}"
+      WEBUI_PORT: "6099"
+      WEBUI_HOST: "0.0.0.0"
+    logging: *default-logging
+    volumes:
+      - ./napcat/config:/app/napcat/config
+      - ./napcat/qq:/app/.config/QQ
+      - ./plugins:/app/plugins
+      - ./.env:/app/.env
+      - ./data:/app/data             # 让 NapCat 能读语音文件

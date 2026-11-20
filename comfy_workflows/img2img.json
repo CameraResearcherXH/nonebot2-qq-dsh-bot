@@ -1,0 +1,104 @@
+{
+  "1": {
+    "class_type": "CheckpointLoaderSimple",
+    "inputs": { "ckpt_name": "__MODEL__" }
+  },
+  "2": {
+    "class_type": "LoraLoader",
+    "inputs": {
+      "model": ["1", 0], "clip": ["1", 1],
+      "lora_name": "__LORA1_NAME__",
+      "strength_model": "__LORA1_STRENGTH__",
+      "strength_clip": "__LORA1_STRENGTH__"
+    }
+  },
+  "3": {
+    "class_type": "LoraLoader",
+    "inputs": {
+      "model": ["2", 0], "clip": ["2", 1],
+      "lora_name": "__LORA2_NAME__",
+      "strength_model": "__LORA2_STRENGTH__",
+      "strength_clip": "__LORA2_STRENGTH__"
+    }
+  },
+  "4": {
+    "class_type": "LoraLoader",
+    "inputs": {
+      "model": ["3", 0], "clip": ["3", 1],
+      "lora_name": "__LORA3_NAME__",
+      "strength_model": "__LORA3_STRENGTH__",
+      "strength_clip": "__LORA3_STRENGTH__"
+    }
+  },
+  "5": {
+    "class_type": "CLIPSetLastLayer",
+    "inputs": { "clip": ["4", 1], "stop_at_clip_layer": -2 }
+  },
+  "6": {
+    "class_type": "CLIPTextEncode",
+    "inputs": { "text": "__PROMPT__", "clip": ["5", 0] }
+  },
+  "7": {
+    "class_type": "CLIPTextEncode",
+    "inputs": { "text": "__NEGATIVE__", "clip": ["5", 0] }
+  },
+  "8": {
+    "class_type": "LoadImage",
+    "inputs": { "image": "__IMAGE__" }
+  },
+  "9": {
+    "class_type": "VAEEncode",
+    "inputs": { "pixels": ["8", 0], "vae": ["1", 2] }
+  },
+  "10": {
+    "class_type": "KSampler",
+    "inputs": {
+      "seed": "__SEED__", "steps": "__STEPS__", "cfg": "__CFG__",
+      "sampler_name": "__SAMPLER__", "scheduler": "__SCHEDULER__",
+      "denoise": "__DENOISE__",
+      "model": ["4", 0], "positive": ["6", 0], "negative": ["7", 0],
+      "latent_image": ["9", 0]
+    }
+  },
+  "11": {
+    "class_type": "VAEDecode",
+    "inputs": { "samples": ["10", 0], "vae": ["1", 2] }
+  },
+  "12": {
+    "class_type": "UpscaleModelLoader",
+    "inputs": { "model_name": "__UPSCALER__" }
+  },
+  "13": {
+    "class_type": "ImageUpscaleWithModel",
+    "inputs": { "upscale_model": ["12", 0], "image": ["11", 0] }
+  },
+  "14": {
+    "class_type": "ImageScale",
+    "inputs": {
+      "image": ["13", 0], "upscale_method": "lanczos",
+      "width": "__HI_WIDTH__", "height": "__HI_HEIGHT__", "crop": "disabled"
+    }
+  },
+  "15": {
+    "class_type": "VAEEncode",
+    "inputs": { "pixels": ["14", 0], "vae": ["1", 2] }
+  },
+  "16": {
+    "class_type": "KSampler",
+    "inputs": {
+      "seed": "__SEED__", "steps": "__HI_STEPS__", "cfg": "__CFG__",
+      "sampler_name": "__SAMPLER__", "scheduler": "__SCHEDULER__",
+      "denoise": "__HI_DENOISE__",
+      "model": ["4", 0], "positive": ["6", 0], "negative": ["7", 0],
+      "latent_image": ["15", 0]
+    }
+  },
+  "17": {
+    "class_type": "VAEDecode",
+    "inputs": { "samples": ["16", 0], "vae": ["1", 2] }
+  },
+  "18": {
+    "class_type": "SaveImage",
+    "inputs": { "images": ["17", 0], "filename_prefix": "qqbot" }
+  }
+}

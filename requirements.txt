@@ -1,0 +1,66 @@
+nonebot2[websockets,fastapi]
+nonebot-adapter-onebot
+httpx
+aiofiles
+dashscope
+boto3
+botocore
+aioboto3
+python-multipart
+nonebot_plugin_apscheduler
+aiohttp>=3.9.0
+async-timeout>=4.0.3
+# ⚠️ 必须 <10.0.0：nonebot-plugin-imageutils（petpet 依赖）**所有已发布版本**都要求
+#    Pillow<10.0.0,>=9.0.0，写 >=10 会直接 ResolutionImpossible 把 build 卡死。
+#    下限 9.1.0：Image.Resampling / Image.Transpose 是 9.1 才引入的枚举（新写法）。
+#    顺带一提，降到 9.x 反而对 petpet 更安全 —— 它用的 Image.FLIP_LEFT_RIGHT
+#    在 Pillow 10 里被移除了（10 要求写 Image.Transpose.FLIP_LEFT_RIGHT）。
+#
+# ⚠️ 这条约束同时锁死了基础镜像：必须 Python 3.11，不能用 3.12。
+#    Pillow 9.5.0 发布于 2023-04，Python 3.12 是 2023-10 才发布 →
+#    Pillow 9.x 没有 cp312 wheel，3.12 上只能源码编译，而镜像里没有 gcc。
+#    改 Dockerfile 的 FROM 之前，先确认这一条还成不成立。
+Pillow>=9.1.0,<10.0.0
+
+# ==================== 第三方插件（plugins/third/）依赖 ====================
+# pixivrank_search（P 站排行/搜图）
+nonebot-plugin-alconna>=0.45
+nonebot-plugin-localstore
+feedparser
+beautifulsoup4
+lxml
+# petpet（头像表情包）
+nonebot-plugin-imageutils
+# ⚠️ 必须显式锁 opencv 版本，否则 pip 会**回溯**：
+#    imageutils 声明 opencv-python-headless>=4.0.0,<5.0.0，范围太宽 →
+#    pip 会逐个下载 60MB 的不同 opencv 版本去试兼容性（实测 4.13.0.92 60.4MB、
+#    4.13.0.90 62.5MB…），在 204kB/s 的阿里云源上每个版本要 5 分钟，
+#    实测 pip 层卡 1474s 还没结束。锁一个版本，pip 只下一个就完事。
+#    4.10.0.84 是 cp37-abi3 wheel，numpy 1.x/2.x 都兼容，不需要源码编译。
+opencv-python-headless==4.10.0.84
+PyYAML
+# BitTorrents（磁力搜索）
+# beautifulsoup4 / lxml 上面已列
+# girls_2d（美少女图）用 httpx + Pillow，上面都有
+# jinriyunshi（今日运势）的图片去重原本用 imagehash，已改成 Pillow 自实现（average_hash）。
+# 不引入 imagehash 的原因：连带 numpy+scipy+PyWavelets 约 80MB，且阿里云镜像拉它经常 ReadTimeout。
+requests
+# ---- 下面两个只有真要出图才需要，会显著增大镜像 ----
+# steam_judger（Steam 毒舌点评）要把 HTML 渲染成图片，靠 selenium 驱动 Chromium。
+# Chromium 和 chromedriver 由 Dockerfile 的 apt 装（/usr/bin/chromium、/usr/bin/chromedriver），
+# 这里只装 python 侧的绑定。不装的话插件会退回纯文本，出不了卡片图。
+selenium>=4.20,<5
+# gspanel（原神面板截图）：htmlrender + playwright。
+# ⚠️ 锁 0.6.7：0.7/0.8 换成了 render_template 新 API，没有 gspanel 用的 template_to_pic。
+# playwright 的 chromium 由 Dockerfile 里 `playwright install chromium` 预装（约 +180MB）。
+nonebot-plugin-htmlrender==0.6.7
+playwright>=1.40,<2
+# ---- RollPig Plus（今日小猪 / 烤群友，plugins/third/nonebot_plugin_rollpig_plus/）----
+# roast_manager.py 顶层 `from openai import AsyncOpenAI`，AI 烤猪即使不开启也必须装 openai。
+openai>=1.0.0
+# 卡片渲染用 pilmoji 画彩色 emoji，缺了插件 import 直接失败。
+pilmoji>=2.0.5,<3.0.0
+# ⚠️ RollPig 上游声明 Pillow>=12.2.0，但我们锁 Pillow<10（petpet 的 imageutils 要求）。
+#    实际代码用的都是 Pillow 9 就有的 API（Resampling.LANCZOS / textbbox / getlength /
+#    textbbox(stroke_width=...) —— stroke_width 需要 9.4+，pip 会装 9.5.0 满足）。
+#    所以不升 Pillow，先用 9.5 跑；如果出图报 Pillow 相关 TypeError 再回来评估。

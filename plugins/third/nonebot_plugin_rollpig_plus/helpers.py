@@ -1,0 +1,525 @@
+from __future__ import annotations
+
+import random
+import time
+import uuid
+from dataclasses import dataclass
+from functools import wraps
+from typing import Any, Awaitable, Callable
+
+from nonebot import get_driver
+from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent, Message, MessageSegment
+from nonebot.log import logger
+from nonebot.log import logger as nonebot_logger
+from nonebot.params import CommandArg, CommandWhitespace
+
+from .card_renderer import render_pig_card_image
+from .data_manager import LocalStoreUnavailableError
+from .resource_manager import pig_resource_manager
+from .runtime import is_group_rollpig_enabled, rollpig_date_str
+from .reservation_delivery import schedule_opportunistic_delivery
+from .store import store
+from .store.cloud import CloudProtectionUnsupportedError, CloudStoreError
+from .store.models import DailyFeedResult, RoastEvent
+from .texts import DAILY_FEED_ROAST_TEXTS
+
+
+# ================================ 命令参数边界 ================================ #
+# NoneBot 的 on_command 默认按前缀命中；这些规则只收紧参数边界，不改变命令前缀与别名。
+
+
+def command_has_no_argument(command_arg: Message | None = CommandArg()) -> bool:
+    """仅允许完整的无参数命令；纯尾随空白由 NoneBot 归一化为空参数。
+
+    2026-11-16 适配：无参数命令时 NoneBot 新版会把 CommandArg() 解析成 None，
+    旧写法 `Message = CommandArg()` 会被 pydantic v2 判 TypeMisMatch（value=None）。
+    改成 `Message | None` 让 None 合法通过，函数内 `not command_arg` 语义不变。
+    """
+
+    return not command_arg
+
+
+def roast_command_has_valid_boundary(
+    command_arg: Message | None = CommandArg(),
+    command_whitespace: str | None = CommandWhitespace(),
+) -> bool:
+    """允许完整命令、空白参数或直接 At，拒绝与命令黏连的文本。"""
+
+    if not command_arg or command_whitespace is not None:
+        return True
+
+    # QQ 输入框常把“命令 + At”编码成相邻消息段；At 本身已经是明确边界。
+    return command_arg[0].type == "at"
+
+
+# ================================ 前置 At 命令入口 ================================ #
+
+
+def leading_at_roast_has_valid_command(event: GroupMessageEvent) -> bool:
+    """只匹配前置 At 加完整普通烤群友命令，不修改消息或接管关群聊天。"""
+
+    if not isinstance(event, GroupMessageEvent) or not is_group_rollpig_enabled(str(event.group_id)):
+        return False
+
+    segments = list(event.get_message())
+    while segments and segments[0].type == "text" and not str(segments[0].data.get("text", "")).strip():
+        segments.pop(0)
+    if not segments or segments[0].type != "at":
+        return False
+
+    # At 是文本边界，不能把“烤 @另一人 群友”拼成合法命令；多个完整 At
+    # 留给统一目标校验提示，避免在 matcher 阶段静默忽略明显的用法错误。
+    text_chunks: list[str] = []
+    current_text = ""
+    for segment in segments:
+        if segment.type == "text":
+            current_text += str(segment.data.get("text", ""))
+        elif segment.type == "at":
+            if current_text.strip():
+                text_chunks.append(current_text.strip())
+            current_text = ""
+        else:
+            return False
+    if current_text.strip():
+        text_chunks.append(current_text.strip())
+
+    if len(text_chunks) != 1:
+        return False
+    command_starts = get_driver().config.command_start
+    return text_chunks[0] in {f"{prefix}烤群友" for prefix in command_starts}
+
+
+# ================================ 事件身份与群成员工具 ================================ #
+# 本板块只做事件对象解析和群成员候选筛选，不注册 matcher，也不直接承载业务判定。
+
+
+def get_event_group_id(event: Event | None) -> str:
+    """从事件中提取群号；私聊或未知事件返回空字符串。"""
+
+    return str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
+
+
+def get_event_user_name(event: Event) -> str:
+    """按群名片、昵称、用户 ID 的优先级取用户展示名。"""
+
+    sender = getattr(event, "sender", None)
+    if sender:
+        return getattr(sender, "card", "") or getattr(sender, "nickname", "") or str(getattr(event, "user_id", ""))
+    return str(getattr(event, "user_id", ""))
+
+
+def is_superuser_user(user_id: str) -> bool:
+    """兼容 NoneBot superusers 里可能出现的 adapter:user_id 写法。"""
+
+    superusers = {str(x) for x in getattr(get_driver().config, "superusers", set())}
+    if user_id in superusers:
+        return True
+    return any(s.endswith(f":{user_id}") for s in superusers)
+
+
+@dataclass(frozen=True)
+class RoastTarget:
+    """烤群友目标解析结果；target_id 为空表示用户没有指定目标。"""
+
+    target_id: str | None
+    target_name: str
+    is_group_member: bool = False
+
+
+class GroupMemberLookupError(RuntimeError):
+    """当前群成员名单无法可靠读取。"""
+
+
+class RoastTargetInputError(ValueError):
+    """明确指令包含无效或多个目标，必须在任何账本写入前结束。"""
+
+
+# ================================ 显式目标与回复兼容 ================================ #
+
+
+def _has_explicit_bot_target(event: GroupMessageEvent) -> bool:
+    """恢复适配器消费的 @Bot；不把回复附带的自动 @ 当成显式目标。"""
+
+    original = list(getattr(event, "original_message", None) or event.message)
+    if event.reply:
+        for index, segment in enumerate(original):
+            if segment.type != "reply" or str(segment.data.get("id")) != str(event.reply.message_id):
+                continue
+            original.pop(index)
+            # 与 OneBot 适配器一致，仅清除紧邻回复段、指向原作者的自动 @。
+            # 在副本上操作，不能破坏其他插件看到的原始消息。
+            if index < len(original) and original[index].type == "at" and (
+                str(original[index].data.get("qq")) == str(event.reply.sender.user_id)
+            ):
+                original.pop(index)
+            break
+    return any(
+        segment.type == "at" and str(segment.data.get("qq")) == str(event.self_id)
+        for segment in original
+    )
+
+
+def _explicit_roast_target_id(event: GroupMessageEvent) -> str | None:
+    """优先使用框架处理后的 @；多个不同目标或 @全体不自动猜测。"""
+
+    target_ids: set[str] = set()
+    for segment in event.message:
+        if segment.type != "at":
+            continue
+        user_id = str(segment.data.get("qq") or "")
+        if not user_id.isascii() or not user_id.isdecimal() or int(user_id) <= 0:
+            raise RoastTargetInputError("请 @ 一位具体群友，不能烤全体成员。")
+        target_ids.add(user_id)
+    if len(target_ids) > 1:
+        raise RoastTargetInputError("请只 @ 一位要烤的群友。")
+    if target_ids:
+        return next(iter(target_ids))
+    # @Bot 常用于唤醒命令；若框架处理后还留下其他目标，应沿用那个目标。
+    # 只有没有其他 @ 时恢复 Bot 身份，避免回复对象盖过明确的 @Bot。
+    return str(event.self_id) if _has_explicit_bot_target(event) else None
+
+
+async def resolve_roast_target(bot: Bot, event: GroupMessageEvent) -> RoastTarget:
+    """按显式 @、回复、to_me 顺序解析唯一目标，并尽量补齐群名片。"""
+
+    target_id = _explicit_roast_target_id(event)
+    target_name = "群友"
+    is_group_member = False
+
+    if target_id:
+        target_name = "对方"
+    elif event.reply:
+        target_id = str(event.reply.sender.user_id)
+        target_name = event.reply.sender.card or event.reply.sender.nickname
+
+    # @Bot 时框架可能已经把 at 消费成 to_me，这里补一个 Bot 自身目标。
+    if not target_id and event.to_me:
+        target_id = str(event.self_id)
+
+    if target_id:
+        try:
+            member_info = await bot.get_group_member_info(group_id=event.group_id, user_id=int(target_id))
+            target_name = member_info.get("card") or member_info.get("nickname") or target_name
+            is_group_member = True
+        except Exception as error:
+            logger.debug(f"获取群成员信息失败: group={event.group_id} user={target_id} error={error}")
+
+    return RoastTarget(
+        target_id=target_id,
+        target_name=target_name,
+        is_group_member=is_group_member,
+    )
+
+
+async def get_group_member_display_name(bot: Bot, group_id: int, user_id: str, default: str = "群友") -> str:
+    """按群名片优先获取成员展示名；接口失败时返回默认值，避免随机烤猪中断。"""
+
+    try:
+        member_info = await bot.get_group_member_info(group_id=group_id, user_id=int(user_id))
+        return member_info.get("card") or member_info.get("nickname") or default
+    except Exception:
+        return default
+
+
+async def get_group_roll_candidates(bot: Bot, group_id: int, exclude_ids: set[str]) -> list[str]:
+    """按当前群成员范围筛候选；名单不可用时拒绝使用可能已过期的群记录。"""
+
+    today = rollpig_date_str()
+    today_rolls = await store.get_daily_rolls(today)
+
+    try:
+        response = await bot.call_api("get_group_member_list", group_id=group_id)
+        members = response.get("data") if isinstance(response, dict) else response
+        if not isinstance(members, list):
+            raise ValueError("get_group_member_list 返回格式无效")
+        member_ids = {
+            str(member.get("user_id"))
+            for member in members
+            if isinstance(member, dict) and member.get("user_id") is not None
+        }
+        return [uid for uid in today_rolls if uid in member_ids and uid not in exclude_ids]
+    except Exception as error:
+        logger.debug(f"获取群成员列表失败: group={group_id} error={error}")
+        raise GroupMemberLookupError(str(error)) from error
+
+
+# ================================ 命令守卫 ================================ #
+# 守卫只负责入口拦截和统一错误兜底，不承载具体业务逻辑。
+
+
+def _find_event(args: tuple, kwargs: dict) -> Event | None:
+    """从 matcher handler 的位置参数和关键字参数中寻找 OneBot 事件对象。"""
+
+    event = kwargs.get("event")
+    if isinstance(event, Event):
+        return event
+    for arg in args:
+        if isinstance(arg, Event):
+            return arg
+    return None
+
+
+def guard_group_enabled(matcher):
+    """统一拦截未启用 RollPig 的群聊指令；私聊默认放行。"""
+
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            event = _find_event(args, kwargs)
+            group_id = get_event_group_id(event)
+            if group_id and not is_group_rollpig_enabled(group_id):
+                logger.debug(f"rollpig 群功能未启用，跳过处理: group={group_id}")
+                await matcher.finish()
+            if event is not None:
+                # 有效群指令可以提前解除该群的本地关群退避；私聊仍作为普通
+                # Owner 检查机会，但不会影响任何群级暂缓。
+                schedule_opportunistic_delivery(
+                    str(getattr(event, "self_id", "")),
+                    active_group_id=group_id,
+                )
+
+            return await func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def guard_store_errors(matcher, message: str = "猪圈云账本暂时离线，请稍后再试。"):
+    """把已知账本不可用异常转换为用户提示，普通编程错误继续向外抛出。"""
+
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            event = _find_event(args, kwargs)
+            try:
+                return await func(*args, **kwargs)
+            except LocalStoreUnavailableError as error:
+                logger.error(f"rollpig local store unavailable: {error}")
+                local_message = "猪圈本地账本读取失败，已进入写保护，请联系管理员恢复数据。"
+                if event is not None:
+                    await matcher.finish(MessageSegment.reply(event.message_id) + local_message)
+                await matcher.finish(local_message)
+            except CloudProtectionUnsupportedError:
+                upgrade_message = "聚众烤猪需要 RollPig Cloud 0.10.0+，请先升级 Cloud。"
+                if event is not None:
+                    await matcher.finish(MessageSegment.reply(event.message_id) + upgrade_message)
+                await matcher.finish(upgrade_message)
+            except CloudStoreError as error:
+                logger.warning(f"rollpig cloud store unavailable: {error}")
+                if event is not None:
+                    await matcher.finish(MessageSegment.reply(event.message_id) + message)
+                await matcher.finish(message)
+
+        return wrapper
+
+    return decorator
+
+
+# ================================ 性能日志 ================================ #
+
+
+def log_perf(message: str) -> None:
+    """输出性能埋点；logger 本身异常时退回 warning，避免诊断日志影响业务。"""
+
+    try:
+        nonebot_logger.info(message)
+    except Exception:
+        nonebot_logger.warning(message)
+
+
+# ================================ 小猪卡片发送 ================================ #
+# 命令层只决定“要发哪只猪”；渲染、性能埋点和烤群友结果落库统一在这里。
+
+
+async def send_rendered_pig(
+    matcher,
+    event: Event,
+    pig_data: dict,
+    extra_text: str = "",
+    trailing_text: str = "",
+    *,
+    cache_final_card: bool = True,
+    ex_level: int = 0,
+    after_send: Callable[[], Awaitable[None]] | None = None,
+    bot: Bot | None = None,
+) -> None:
+    """渲染并发送卡片；固定卡缓存成品，烤猪动态文案只复用 GIF 源帧。
+
+    2026-11-16：新增 bot 参数。LLM function 工具直接调用时没有 matcher，
+    传 bot 后改用 bot.send 发消息；不传 bot 时保持原 matcher.finish/send 行为。
+    """
+
+    started_at = time.perf_counter()
+    pig_id = str(pig_data.get("id", ""))
+    appearance = pig_resource_manager.resolve_pig_appearance(pig_data, ex_level)
+    render_data = appearance.pig_data
+    avatar_file = appearance.image_path
+    uses_variant_image = (
+        avatar_file is not None
+        and avatar_file != appearance.base_image_path
+    )
+    name = render_data.get("name", "未知小猪")
+    variant_fallback = False
+    payload_ready_at = time.perf_counter()
+
+    try:
+        render_started_at = time.perf_counter()
+        render_result = await render_pig_card_image(
+            render_data,
+            avatar_file,
+            cache_final_card=cache_final_card,
+            require_avatar=uses_variant_image,
+        )
+        render_finished_at = time.perf_counter()
+    except Exception as error:
+        if appearance.applied_level <= 0:
+            logger.error(f"图片渲染失败: pig_id={pig_id}, renderer=pillow, error={error}")
+            if bot is not None:
+                await bot.send(event=event, message="图片生成失败。")
+            else:
+                await matcher.finish("图片生成失败。")
+            return
+
+        # 差分是可选增强。文件在激活后损坏或被手动删除时，必须重试基础资源，
+        # 不能让一张坏差分拖垮“今日小猪”本身。
+        variant_fallback = True
+        logger.warning(
+            "rollpig EX 差分渲染失败，已回退基础资源: "
+            f"pig_id={pig_id} requested={appearance.requested_level} "
+            f"applied={appearance.applied_level} error={error}"
+        )
+        try:
+            render_result = await render_pig_card_image(
+                dict(pig_data),
+                appearance.base_image_path,
+                cache_final_card=cache_final_card,
+                require_avatar=False,
+            )
+            render_finished_at = time.perf_counter()
+        except Exception as fallback_error:
+            logger.error(
+                "图片渲染失败: "
+                f"pig_id={pig_id}, renderer=pillow, variant_error={error}, "
+                f"fallback_error={fallback_error}"
+            )
+            if bot is not None:
+                await bot.send(event=event, message="图片生成失败。")
+            else:
+                await matcher.finish("图片生成失败。")
+            return
+
+    # 差分图片存在但无法解码时，卡片已经回退到基础图片和基础文案；继续发送
+    # “新外观/新介绍”成长提示会与实际成品矛盾，因此本次只发送可用的基础卡。
+    if variant_fallback:
+        extra_text = ""
+
+    msg = MessageSegment.reply(event.message_id)
+    # 部分 QQ 客户端会把图片两侧的显式换行渲染成整行留白；文字与图片直接
+    # 使用相邻消息段，纯文本内部原有的换行仍保持不变。
+    if extra_text:
+        msg += extra_text.rstrip("\r\n")
+    msg += MessageSegment.image(render_result.data)
+    if trailing_text:
+        msg += trailing_text.lstrip("\r\n")
+    ready_to_send_at = time.perf_counter()
+
+    log_perf(
+        f"rollpig card rendered: renderer={render_result.renderer} "
+        f"format={render_result.image_format} pig_id={pig_id} name={name} "
+        f"image_found={avatar_file is not None} "
+        f"payload={payload_ready_at - started_at:.2f}s "
+        f"render={render_finished_at - render_started_at:.2f}s "
+        f"message={ready_to_send_at - render_finished_at:.2f}s "
+        f"total_before_send={ready_to_send_at - started_at:.2f}s "
+        f"bytes={len(render_result.data)} "
+        f"analysis_font={render_result.analysis_font_size} "
+        f"analysis_lines={render_result.analysis_lines} "
+        f"emoji={render_result.emoji_enabled} extra={bool(extra_text)} "
+        f"trailing={bool(trailing_text)} "
+        f"card_cache={'final-disk' if cache_final_card else 'dynamic'} "
+        f"requested_ex={appearance.requested_level} applied_ex={appearance.applied_level} "
+        f"variant_fallback={variant_fallback}"
+    )
+    if after_send is None:
+        if bot is not None:
+            await bot.send(event=event, message=msg)
+        else:
+            await matcher.finish(msg)
+        return
+
+    # 首次抽猪需要严格保证“先展示自己的今日卡，再发送预约结算”。使用 send 而非
+    # finish 后执行回调，避免 matcher 结束异常让预约永远没有机会投递。
+    if bot is not None:
+        await bot.send(event=event, message=msg)
+        await after_send()
+        return
+    await matcher.send(msg)
+    await after_send()
+    await matcher.finish()
+
+
+async def finish_roast_outcome(
+    matcher,
+    event: Event,
+    outcome: Any,
+    *,
+    attacker_id: str,
+    attacker_name: str,
+    target_id: str,
+    target_name: str,
+    group_id: str,
+    daily_feed_eligible: bool = False,
+    force_mode: str | None = None,
+) -> None:
+    """落库并发送烤群友结果；outcome 使用 Any 避免与 roast_flow 形成循环 import。"""
+
+    roast_event = RoastEvent(
+        event_type=outcome.event_type,
+        attacker_id=attacker_id,
+        target_id=target_id,
+        attacker_name=attacker_name,
+        target_name=target_name,
+        food=outcome.food_name,
+        group_id=group_id,
+        event_id=uuid.uuid4().hex,
+        force_mode=force_mode or "",
+        backfire_victim_id=outcome.backfire_victim_id,
+        backfire_victim_name=outcome.backfire_victim_name,
+        backfire_victim_ids=outcome.backfire_victim_ids,
+        backfire_victim_names=outcome.backfire_victim_names,
+    )
+    feed_result = await store.append_roast_event(
+        roast_event,
+        settle_daily_feed=(daily_feed_eligible and outcome.event_type == "success"),
+    )
+    feed_text = build_daily_feed_roast_text(feed_result)
+    if outcome.render_data:
+        # 烤猪分析文案会随对象和结果变化；缓存最终成品会迅速挤满，故只复用 GIF 源帧。
+        await send_rendered_pig(
+            matcher,
+            event,
+            outcome.render_data,
+            extra_text=outcome.extra_text,
+            trailing_text=feed_text,
+            cache_final_card=False,
+        )
+        return
+    text = outcome.plain_text
+    if feed_text:
+        text += "\n" + feed_text
+    await matcher.finish(MessageSegment.reply(event.message_id) + text)
+
+
+def build_daily_feed_roast_text(result: DailyFeedResult | None) -> str:
+    """只为实际成长追加一行加餐结果；旧 Cloud 和无效果判定保持静默。"""
+
+    if result is None or result.status != "fed" or result.new_level <= result.previous_level:
+        return ""
+    pig = pig_resource_manager.pig_map.get(result.pig_id)
+    pig_name = str(pig.get("name") or result.pig_id) if pig else result.pig_id
+    return random.choice(DAILY_FEED_ROAST_TEXTS).format(
+        pig=pig_name or "今日小猪",
+        old_level=result.previous_level,
+        new_level=result.new_level,
+    )

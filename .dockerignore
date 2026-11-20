@@ -1,0 +1,87 @@
+# ============================================================
+# 构建上下文排除表
+#
+# 为什么必须有这个文件：
+#   Dockerfile 里是 `COPY . .`，没有 .dockerignore 的话会把整个目录
+#   （含 napcat 的 QQ 客户端数据库 1.4GB、data 110MB、venv 44MB）
+#   全部塞进镜像 → 构建时 "no space left on device"。
+#
+# 而且 docker-compose.yml 里这些目录都是 bind mount：
+#   ./plugins ./services ./bot.py ./.env ./data ./napcat/qq
+#   运行时会被挂载覆盖，打进镜像纯属浪费空间。
+# ============================================================
+
+# ---- 密钥：绝不能进镜像（运行时由 env_file + bind mount 提供）----
+.env
+.env.*
+!.env.example
+
+# ---- NapCat / QQ 客户端数据（最大的一块，绝对不能进镜像）----
+napcat/
+.config/
+
+# ---- 运行时数据：记忆、表情、语音、临时文件（compose 里已挂载）----
+data/
+
+# ---- Python 虚拟环境 ----
+venv/
+.venv/
+env/
+
+# ---- 版本控制 / 编辑器 ----
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# ---- Python 缓存 ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# ---- 备份 / 旧版本文件 ----
+plugins_backup/
+*.bak
+*.working
+*.old
+*.orig
+
+# ---- AI 助手的本地数据 ----
+.codebuddy/
+.workbuddy/
+
+# ---- 日志 / 临时 / 压缩包 ----
+*.log
+*.zip
+*.tar
+*.tar.gz
+*.7z
+*.part
+*.tmp
+out.txt
+o2.txt
+o3.txt
+out2.txt
+e1.txt
+e2.txt
+e3.txt
+_deploy/
+_deploy_server/
+
+# ---- 与运行无关的文档 / 脚本 ----
+jy.tex
+test.py
+node.py
+help.txt
+README.md
+*.md
+!requirements.txt
+
+# ---- 本地开发脚本（服务器上不需要）----
+scripts/selftest.py
+scripts/_*.py

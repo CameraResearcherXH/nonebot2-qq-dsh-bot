@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Syntax check
+        run: python -m compileall -q core services plugins scripts bot.py
+      - name: Dependency direction
+        run: python scripts/check_deps.py --strict
+      - name: Feature wiring audit
+        run: python scripts/audit_features.py --strict
+      - name: Third-party audit
+        run: python scripts/plugin_cli.py doctor
