@@ -114,8 +114,7 @@ scope = ["group", "private"]
 
 ## 致谢
 
-- 用户对话学习：参考 **maimai** 的思路（独立实现）
-- 人设 / 记忆 / 关系分层：参考 **MaiBot** 的思路（独立实现；MaiBot 为 GPL-3.0）
+- 用户对话学习：参考 **MaiBot** 的思路（独立实现；MaiBot 为 GPL-3.0）
 - 群聊规则 / 档案卡 / World Info / 人格卡字段：参考 **SillyTavern（AI 酒馆）** 的思路
   （独立实现；SillyTavern 为 AGPL-3.0）
 - 详见 [docs/CREDITS.md](docs/CREDITS.md) 与 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
