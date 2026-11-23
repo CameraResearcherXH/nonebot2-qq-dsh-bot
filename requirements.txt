@@ -1,6 +1,9 @@
 nonebot2[websockets,fastapi]
 nonebot-adapter-onebot
 httpx
+httpx2>=2.13.1
+pyquery>=2.1.0
+typing_extensions
 aiofiles
 dashscope
 boto3

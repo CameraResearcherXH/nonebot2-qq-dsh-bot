@@ -100,6 +100,9 @@ DEFAULTS = {
     # ---------- 回复 / 限流 / 主动插话 ----------
     'BURST_MSG_COUNT': 4,
     'BURST_WINDOW_SEC': 30.0,
+    # 戳一戳屏蔽：同一个人 POKE_WINDOW_HOURS 内戳超过 POKE_MAX_PER_WINDOW 次就不回
+    'POKE_MAX_PER_WINDOW': 3,
+    'POKE_WINDOW_HOURS': 2.0,
 
     # ---------- 模型调用 ----------
     'CHAT_HISTORY_TURNS': 6,
@@ -177,6 +180,11 @@ DEFAULTS = {
     'GROUP_SEND_LIMIT': 9,
     'GROUP_SEND_MAX_WAIT': 15.0,
 
+    # ---------- 白月光模式 ----------
+    'WHITE_MOON_MIN_SCORE': 3,
+    'WHITE_MOON_STYLE_ITEMS': 3,
+    'WHITE_MOON_STYLE_TTL': 21600.0,
+
     # ---------- 工具分发 ----------
     'HEARTBEAT_TIMEOUT_SEC': 90,
     'HISTORY_MAX': 20,
@@ -233,6 +241,11 @@ DEFAULTS = {
 
     # ---------- 回复 / 限流 / 主动插话 ----------
     'MERGE_WINDOW': 0.6,
+    # 群聊分段：一段话说完（安静 N 秒）再交给她，别一条一回
+    'SEGMENT_WAIT_SEC': 6.0,
+    'SEGMENT_MAX_SEC': 30.0,
+    'SEGMENT_MAX_MSGS': 40,
+    'SEGMENT_HISTORY_KEEP': 24,
 
     # ---------- 心情判读 / 好感 ----------
     'MOOD_GLOBAL_SHARE': 0.35,
@@ -243,12 +256,15 @@ DEFAULTS = {
     'MOOD_PEAK_WINDOW_SEC': 7200.0,
     # 太小的波动不进峰值候选（否则一堆 ±0.02 的闲聊会顶掉真正的大事）
     'MOOD_PEAK_MIN_DELTA': 0.03,
-    'MOOD_JUDGE_CTX': 20,
+    'MOOD_JUDGE_CTX': 8,
     'MOOD_JUDGE_FRESH_SEC': 600.0,
     'MOOD_JUDGE_MIN_INTERVAL': 60.0,
     'MOOD_JUDGE_REFRESH': 300.0,
     'MOOD_JUDGE_SMOOTH': 0.35,
     'MOOD_MAX_STEP': 0.3,
+    # 单次涨幅上限（设计 §13.1 = 0.50，只是防模型一次给极端值的护栏）。
+    # ⚠️ 不要靠调小它来「防一边倒」：0.2 会让 §13.3 的 0.10/0.25/0.50
+    #    刻痕阈值永远到不了 💥💥/💥💥💥。真正的收紧在 Δ 入口的噪音丢弃。
     'MOOD_MAX_DELTA': 0.5,
     'MOOD_LABEL_STEP': 0.2,
     'MOOD_JUDGE_TIMEOUT': 12.0,
@@ -256,6 +272,18 @@ DEFAULTS = {
     'MOOD_LABEL_TTL_HOURS': 12.0,
     'MOOD_MAX_SESSIONS': 50,
     'MOOD_THINK_KEEP': 30,
+    # 心情回到 0 的半衰期（小时）。12h 太慢：群里一直有负向小 Δ 时，
+    # 数值会钉死在 -1（用户 2026-11-22：「明明是正负 1，结果被击穿」）。
+    'MOOD_HALF_LIFE_HOURS': 12.0,
+    # ---- Δ 入口护栏（2026-11-22：这才是「防一边倒」的正确位置）----
+    # 噪音丢弃：|Δ| 小于这个值 → 当成 0，不动数值/好感/刻痕/群心情
+    'MOOD_NOISE_DELTA': 0.03,
+    # 她没说话（被动观察）时，最多按 ±0.03 记 —— 旁观刷图不该把心情拉下去
+    'MOOD_PASSIVE_MAX_DELTA': 0.03,
+    # 不是冲她来（别人之间 / 群气氛）且没被叫 → 最多 ±0.05
+    'MOOD_ENV_MAX_DELTA': 0.05,
+    # 记忆刻痕 / 档案只收「明显动过」的事：|Δ| 低于这个值不进刻痕
+    'MEMORY_EMOTION_MIN_DELTA': 0.10,
 
     # ---------- 回复 / 限流 / 主动插话 ----------
     'MOOD_WATCH_SEC': 60.0,
@@ -329,6 +357,8 @@ DEFAULTS = {
     'GROUP_MOOD_MIN_PEOPLE': 3,
     # 小于这个 |Δ| 的闲聊不进群心情（防噪声）
     'GROUP_MOOD_MIN_DELTA': 0.03,
+    # 单条群心情事件的上限：一次判读最多按 ±0.2 记，防止小事先刷满 -1
+    'GROUP_MOOD_MAX_DELTA': 0.2,
     # 一个人净 Δ 达到多少算「喜欢 / 讨厌」（算人数和比例用）
     'GROUP_MOOD_LIKE_MIN': 0.05,
     # 每个群最多留多少条事件（5 小时窗口内够用）
@@ -473,6 +503,8 @@ DOCS = {
     'BOND_TTL_DAYS': '相处印象（档案）保留天数',
     'BURST_MSG_COUNT': '窗口内多少条算刷屏',
     'BURST_WINDOW_SEC': '高刷检测窗口（秒）',
+    'POKE_MAX_PER_WINDOW': '戳一戳屏蔽：窗口内最多回几次（超过就不回）',
+    'POKE_WINDOW_HOURS': '戳一戳屏蔽的统计窗口（小时）',
     'CHAT_HISTORY_TURNS': '对话历史轮数',
     'CHAT_OFF_MAX_HOURS': '安静最长持续小时数（超时自动解除）',
     'CONV_STATE_MAX_CHARS': '对话状态摘要最大字数',
@@ -517,6 +549,9 @@ DOCS = {
     'GROUP_MUTE_SEC': '被群友嫌弃后静默多少秒',
     'GROUP_SEND_LIMIT': '群发配额：每窗口最多几条',
     'GROUP_SEND_MAX_WAIT': '配额不足时最多等多久（秒）',
+    'WHITE_MOON_MIN_SCORE': '白月光：至少多少分才算「最吃这个人的说话方式」',
+    'WHITE_MOON_STYLE_ITEMS': '白月光：注入几条学到的说法',
+    'WHITE_MOON_STYLE_TTL': '白月光：说话方式多久重学一次（秒）',
     'HEARTBEAT_TIMEOUT_SEC': '工具分发心跳超时（秒）',
     'HISTORY_MAX': '模型侧历史消息条数',
     'HIST_LINE_BASE': '历史里短消息给多少字',
@@ -544,25 +579,34 @@ DOCS = {
     'MEMORY_REVISIT_AGE_DAYS': '回访记忆：至少多少天前的事',
     'MEMORY_REVISIT_IDLE_DAYS': '回访记忆：至少多久没提过',
     'MERGE_WINDOW': '合并转发判定窗口（秒）',
+    'SEGMENT_WAIT_SEC': '群聊分段：安静多少秒算「这一段说完了」（默认 6）',
+    'SEGMENT_MAX_SEC': '群聊分段：最长攒多久必须处理（默认 30 秒）',
+    'SEGMENT_MAX_MSGS': '群聊分段：最多攒多少条（防刷屏）',
+    'SEGMENT_HISTORY_KEEP': '保留多少个「处理过的段」给上下文/翻历史',
     'MOOD_GLOBAL_SHARE': '全局心情占会话心情的权重（0~1）',
     'MOOD_IDLE_AFTER': '空闲多少秒后心情开始衰减（默认 300 = 5 分钟；之后每 5 分钟向 0 走一步）',
     'MOOD_IDLE_STEP': '每步走多少点（内部 -100~100 口径，1.0 ≈ 外口径 0.01）',
     'MOOD_IDLE_TICK': '衰减步长（秒）：每这么久向 0 走一步（默认 300 = 5 分钟走 0.01）',
     'MOOD_PEAK_WINDOW_SEC': '心情峰值事件的保质期（秒，默认 7200 = 2 小时；每件事最多挂 2 小时）',
     'MOOD_PEAK_MIN_DELTA': '进入「峰值事件」候选的最小 |Δ|（0.03，防小事顶掉大事）',
-    'MOOD_JUDGE_CTX': '判读时带多少条上下文',
+    'MOOD_JUDGE_CTX': '判读时带多少条上下文（8 = 5~8 条，和主模型上下文同源同条数）',
     'MOOD_JUDGE_FRESH_SEC': '判读结果有效期（秒），过期不当「现在」',
     'MOOD_JUDGE_MIN_INTERVAL': '两次判读的最小间隔（秒），防刷屏时来回震荡',
     'MOOD_JUDGE_REFRESH': '她没主动写心情时，多久用群聊重新判一次（秒）。0 = 只在她说的时候判',
     'MOOD_JUDGE_SMOOTH': '判读值平滑系数（0.35 = 每次只走 35% 的差，给心情惯性）',
     'MOOD_MAX_STEP': '单次判读最多改变多少心情（外口径，0.30 = 30 点），防一句话翻脸',
-    'MOOD_MAX_DELTA': '单次「涨幅」上限（0.50）：判读报的涨/跌最多按这个算',
+    'MOOD_MAX_DELTA': '单次「涨幅」上限（设计 0.50，只是护栏；防一边倒靠噪音丢弃）',
     'MOOD_LABEL_STEP': '心情名词的分档步长（0.2 = 每 0.2 一个名词）',
     'MOOD_JUDGE_TIMEOUT': '判读调用超时（秒）',
     'MOOD_LABEL_MAX': '心情词最多保留多少个',
     'MOOD_LABEL_TTL_HOURS': '心情词的有效期（小时），过期不再当「现在」',
     'MOOD_MAX_SESSIONS': '最多保留多少个会话的心情（防字典无限长）',
     'MOOD_THINK_KEEP': '判读心理活动保留多少条',
+    'MOOD_HALF_LIFE_HOURS': '心情回到 0 的半衰期（小时，设计默认 12）',
+    'MOOD_NOISE_DELTA': 'Δ 噪音门槛：|Δ| 小于它视为 0（0.03，不动数值/好感/刻痕）',
+    'MOOD_PASSIVE_MAX_DELTA': '她没说话（被动观察）时单次 Δ 上限（0.03，旁观不背锅）',
+    'MOOD_ENV_MAX_DELTA': '不是冲她来（别人之间/群气氛）时单次 Δ 上限（0.05）',
+    'MEMORY_EMOTION_MIN_DELTA': '记忆刻痕门槛：|Δ| 达到多少才算（0.10 = 设计里的 💥 档）',
     'MOOD_WATCH_SEC': '被动心情观察的最小间隔（秒）',
     'NAPCAT_APPROVE_TTL': '待批准请求有效期（秒）',
     'NAPCAT_TOOL_MAX_PER_MIN': 'NapCat 工具每分钟最多调用次数',
@@ -604,6 +648,7 @@ DOCS = {
     'GROUP_MOOD_GROUP_DROP': '整个群净掉多少 → 判定群聊不愉快（0.7）',
     'GROUP_MOOD_MIN_PEOPLE': '至少几个不同的人让心情掉，才算「群聊导致」（3）',
     'GROUP_MOOD_MIN_DELTA': '进群心情的最小 |Δ|（0.03，防小事噪声）',
+    'GROUP_MOOD_MAX_DELTA': '单条群心情事件上限（0.20，防小事刷满）',
     'GROUP_MOOD_LIKE_MIN': '净 Δ 达到多少算喜欢/讨厌（0.05，算人数和比例用）',
     'GROUP_MOOD_MAX_EVENTS': '每个群最多保留多少条心情事件',
     'GROUP_MOOD_CHAT_MIN': '群心情最差时「愿不愿意多说话」的乘数下限（0.55）',
@@ -707,6 +752,8 @@ FILES = {
     'BOND_TTL_DAYS': 'services/profiles.py',
     'BURST_MSG_COUNT': 'plugins/chat/__init__.py',
     'BURST_WINDOW_SEC': 'plugins/chat/__init__.py',
+    'POKE_MAX_PER_WINDOW': 'services/poke_guard.py',
+    'POKE_WINDOW_HOURS': 'services/poke_guard.py',
     'CHAT_HISTORY_TURNS': 'services/llm.py',
     'CHAT_OFF_MAX_HOURS': 'services/chat_switch.py',
     'CONV_STATE_MAX_CHARS': 'services/conv_state.py',
@@ -751,6 +798,9 @@ FILES = {
     'GROUP_MUTE_SEC': 'plugins/chat/__init__.py',
     'GROUP_SEND_LIMIT': 'plugins/chat/__init__.py',
     'GROUP_SEND_MAX_WAIT': 'plugins/chat/__init__.py',
+    'WHITE_MOON_MIN_SCORE': 'services/white_moon.py',
+    'WHITE_MOON_STYLE_ITEMS': 'services/white_moon.py',
+    'WHITE_MOON_STYLE_TTL': 'services/white_moon.py',
     'HEARTBEAT_TIMEOUT_SEC': 'plugins/tool_dispatcher/__init__.py',
     'HISTORY_MAX': 'services/napcat_tools.py',
     'HIST_LINE_BASE': 'services/llm.py',
@@ -778,6 +828,10 @@ FILES = {
     'MEMORY_REVISIT_AGE_DAYS': 'services/memory_v2.py',
     'MEMORY_REVISIT_IDLE_DAYS': 'services/memory_v2.py',
     'MERGE_WINDOW': 'plugins/chat/__init__.py',
+    'SEGMENT_WAIT_SEC': 'services/segments.py',
+    'SEGMENT_MAX_SEC': 'services/segments.py',
+    'SEGMENT_MAX_MSGS': 'services/segments.py',
+    'SEGMENT_HISTORY_KEEP': 'services/segments.py',
     'MOOD_GLOBAL_SHARE': 'services/mood.py',
     'MOOD_IDLE_AFTER': 'services/mood.py',
     'MOOD_IDLE_STEP': 'services/mood.py',
@@ -797,6 +851,11 @@ FILES = {
     'MOOD_LABEL_TTL_HOURS': 'services/mood.py',
     'MOOD_MAX_SESSIONS': 'services/mood.py',
     'MOOD_THINK_KEEP': 'services/mood_judge.py',
+    'MOOD_HALF_LIFE_HOURS': 'services/mood.py',
+    'MOOD_NOISE_DELTA': 'services/mood_judge.py',
+    'MOOD_PASSIVE_MAX_DELTA': 'services/mood_judge.py',
+    'MOOD_ENV_MAX_DELTA': 'services/mood_judge.py',
+    'MEMORY_EMOTION_MIN_DELTA': 'plugins/chat/__init__.py',
     'MOOD_WATCH_SEC': 'plugins/chat/__init__.py',
     'NAPCAT_APPROVE_TTL': 'services/napcat_tools.py',
     'NAPCAT_TOOL_MAX_PER_MIN': 'services/napcat_tools.py',
@@ -838,6 +897,7 @@ FILES = {
     'GROUP_MOOD_GROUP_DROP': 'services/group_mood.py',
     'GROUP_MOOD_MIN_PEOPLE': 'services/group_mood.py',
     'GROUP_MOOD_MIN_DELTA': 'services/group_mood.py',
+    'GROUP_MOOD_MAX_DELTA': 'services/group_mood.py',
     'GROUP_MOOD_LIKE_MIN': 'services/group_mood.py',
     'GROUP_MOOD_MAX_EVENTS': 'services/group_mood.py',
     'GROUP_MOOD_CHAT_MIN': 'services/mood.py',

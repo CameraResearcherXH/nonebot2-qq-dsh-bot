@@ -143,17 +143,33 @@ def _rows(days: int = 1):
     return rows
 
 
-def report_text(days: int = 1) -> str:
+def snapshot(days: int = 1) -> dict:
+    """聚合一次，文本报表和图表共用，避免两套口径。"""
     rows = _rows(days)
-    if not rows:
-        return "最近 %d 天没有用量记录。" % days
     agg = {}
+    models = {}
     for r in rows:
         d = agg.setdefault(r["purpose"], {"n": 0, "p": 0, "c": 0, "h": 0, "lat": []})
         d["n"] += r["n"]; d["p"] += r["p"] or 0; d["c"] += r["c"] or 0
         d["h"] += r["h"] or 0; d["lat"].append(r["lat"] or 0)
+        m = str(r["model"] or "?")
+        md = models.setdefault(m, {"n": 0, "p": 0, "c": 0, "purposes": {}})
+        md["n"] += r["n"]; md["p"] += r["p"] or 0; md["c"] += r["c"] or 0
+        md["purposes"][r["purpose"]] = md["purposes"].get(r["purpose"], 0) + (r["p"] or 0) + (r["c"] or 0)
     total = sum(d["p"] + d["c"] for d in agg.values()) or 1
     order = sorted(agg.items(), key=lambda kv: -(kv[1]["p"] + kv[1]["c"]))
+    return {"rows": rows, "agg": agg, "models": models,
+            "total": total, "order": order}
+
+
+def report_text(days: int = 1) -> str:
+    snap = snapshot(days)
+    rows = snap["rows"]
+    if not rows:
+        return "最近 %d 天没有用量记录。" % days
+    models = snap["models"]
+    total = snap["total"]
+    order = snap["order"]
     lines = ["▍token 用量（最近 %d 天）" % days,
              "总 token：%d" % total]
     for purpose, d in order:
@@ -164,6 +180,13 @@ def report_text(days: int = 1) -> str:
                      "｜缓存命中 %.0f%%｜平均 %.0fms"
                      % (purpose, tok, pct, d["p"], d["c"], cache,
                         sum(d["lat"]) / max(1, len(d["lat"]))))
+    # 按模型拆开：三方判读 / 审核用的是独立模型，只看 purpose 会以为「没记到」
+    if models:
+        lines.append("按模型：")
+        for m, d in sorted(models.items(), key=lambda kv: -(kv[1]["p"] + kv[1]["c"]))[:8]:
+            tops = "、".join("%s:%d" % (k, v) for k, v in
+                             sorted(d["purposes"].items(), key=lambda kv: -kv[1])[:3])
+            lines.append("  · %-22s %7d（%s）" % (m[:22], d["p"] + d["c"], tops))
     top = order[:5]
     bottom = order[-5:][::-1]
     lines.append("最贵 Top5：" + "、".join(

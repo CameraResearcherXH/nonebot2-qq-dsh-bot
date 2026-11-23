@@ -25,7 +25,7 @@ diag_conversation.py —— 群聊「她到底有没有被接话」体检（只�
     # 容器内（推荐）
     docker exec qq-grok-bot python scripts/diag_conversation.py
     docker exec qq-grok-bot python scripts/diag_conversation.py --days 7 --top 12
-    docker exec qq-grok-bot python scripts/diag_conversation.py --gid 936601568 --samples 8
+    docker exec qq-grok-bot python scripts/diag_conversation.py --gid 100000021 --samples 8
     docker exec qq-grok-bot python scripts/diag_conversation.py --include-private
 
     # A/B 用：只看改动之后的几个小时（避开旧数据污染）

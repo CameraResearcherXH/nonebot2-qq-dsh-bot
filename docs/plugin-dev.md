@@ -33,13 +33,19 @@ description = "示例插件"
 name = "hello_world"
 description = "说一句 hello"
 level = "safe"                 # safe | confirm | owner
-handler = "plugins.third.hello:hello_world"
+handler = "services.hello_tool:hello_world"
 scope = ["group", "private"]
 hold = true                    # true = 工具不许自己发，交给模型决定
 parameters = { type = "object", properties = {} }
 ```
 
 `handler` 指向一个 `async def fn(args: dict) -> str`。
+
+> ⚠️ **不要**把 handler 指向 `plugins.third.*`。
+> `register_all()` 在 chat 插件 import 时就会解析 handler，等于抢在 nonebot 之前
+> 导入这个包；随后 `nonebot.load_plugins("plugins/third")` 会抛
+> `RuntimeError: Module plugins.third.xxx is not loaded as a plugin!`（2026-11-22 真机事故）。
+> 正确做法：实现放 `services/xxx_tool.py`，`plugins/third/xxx/__init__.py` 只留元数据。
 
 ## 3. 权限分级
 

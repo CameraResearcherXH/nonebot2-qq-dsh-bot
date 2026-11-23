@@ -33,11 +33,19 @@ services:
       #    镜像里没有这个目录（镜像是加 core 之前构建的），不挂载的话
       #    `from core import tuning` 会直接 ImportError → 容器起不来。
       - ./core:/app/core
+      # ⚠️ 2026-11-22：vendored 第三方库（PicImageSearch）。
+      #    services 要 import 它，而 services 不能依赖 plugins，所以放根目录。
+      - ./vendor:/app/vendor
       - ./bot.py:/app/bot.py         # 👈 新增：映射主入口
       - ./.env:/app/.env
       - ./data:/app/data
       - ./napcat/qq:/app/.config/QQ
       - ./scripts:/app/scripts        # 👈 排查脚本，改完不用再 docker cp
+      # ⚠️ 2026-11-22：容器内自检要读文档 / 编排文件：
+      #   · audit_third_party 会写 docs/third-party-audit.md
+      #   · check_mounts 要读 docker-compose.yml（镜像里那份是旧的，会误报缺挂载）
+      - ./docs:/app/docs
+      - ./docker-compose.yml:/app/docker-compose.yml:ro
 
   # ============================================================
   # RSSHub（已移除，2026-11-13）

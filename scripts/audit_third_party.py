@@ -38,9 +38,35 @@ def main():
         lines.append("| `%s` | %s | %s | %s | %s |" % (
             e["dir"], up[:90], lic,
             "✅" if e["has_upstream"] else "❌ 缺失", risk[:60]))
+    # vendor/ 下的第三方库（services 直接依赖，不在 plugins/third）
+    vdir = ROOT / "vendor"
+    vendored = []
+    if vdir.exists():
+        for d in sorted(vdir.iterdir()):
+            if not d.is_dir() or d.name.startswith(("_", ".")):
+                continue
+            up, lic = "待确认", "待确认"
+            f = d / "UPSTREAM.md"
+            if f.exists():
+                for line in f.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    if line.startswith("upstream:"):
+                        up = line.split(":", 1)[1].strip()
+                    elif line.startswith("license:"):
+                        lic = line.split(":", 1)[1].strip()
+            has_lic = any((d / n).exists() for n in ("LICENSE", "COPYING", "LICENSE.txt"))
+            vendored.append((d.name, up, lic, has_lic))
+    if vendored:
+        lines += ["", "## vendor/（services 直接依赖的第三方库）", "",
+                  "| 目录 | 上游 | 许可证 | LICENSE 文件 |",
+                  "|---|---|---|---|"]
+        for name, up, lic, has_lic in vendored:
+            lines.append("| `%s` | %s | %s | %s |" % (
+                name, up[:90], lic, "✅" if has_lic else "⚠️ 缺失"))
+
     out = ROOT / "docs" / "third-party-audit.md"
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print("已生成：%s（%d 个插件）" % (out, len(rows)))
+    print("已生成：%s（%d 个插件 / %d 个 vendored 库）"
+          % (out, len(rows), len(vendored)))
     return 0
 
 

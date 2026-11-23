@@ -773,6 +773,14 @@ def relation_block(qq: str, gid: str = "", max_len: int = 320) -> str:
     if neg:
         lines.append("· 也记着：%s" % str(neg[0].get("text") or "")[:28])
     lines.append("· 跟他说话时：%s" % tip)
+    # 🌙 白月光：每个人的档案里都标一句「你在这个群最吃谁的说话方式」。
+    try:
+        from . import white_moon
+        _wm_note = white_moon.profile_note(qq, gid)
+        if _wm_note:
+            lines.append(_wm_note)
+    except Exception:
+        pass
     lines.append("（底色决定你愿不愿意理他；此刻心情决定这一句怎么说。"
                  "冲突时以此刻语气为主，但不要因为此刻心情否定底色。）")
     out = "\n".join(lines)

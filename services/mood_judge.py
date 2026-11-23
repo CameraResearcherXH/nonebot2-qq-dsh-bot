@@ -49,6 +49,19 @@ FRESH_SEC = tuning.f("MOOD_JUDGE_FRESH_SEC")
 # 她没写 [[THINK]] 时，后台补一句心里话（保证每条回复都有记录）
 BACKFILL = os.getenv("MOOD_THINK_BACKFILL", "true").lower() in ("1", "true", "yes", "on")
 
+# ---- Δ 入口护栏（2026-11-22）----
+# 用户：「我们不是一直看涨幅加减吗，怎么可能一边倒到 ±1？」
+# 实测根因：40 条判读里 32 条是负的、均值 -0.073，而且全是
+# 「懒得掺和 / 被刷图刷到眼晕 / 旁观」这类**跟她没关系**的事。
+# 设计里刻痕按 |Δ| 阈值（0.10/0.25/0.50）分优先级 —— 前提是 Δ 本身要校准：
+# 旁观就是 0，不是 -0.05。所以在入口做三件事：
+#   1) |Δ| < NOISE → 0（噪音丢弃，不动数值/好感/刻痕/群心情）；
+#   2) 她没说话（passive）→ |Δ| ≤ PASSIVE_MAX（旁观不背锅）；
+#   3) 不是冲她来（cause≠speaker 且没被叫）→ |Δ| ≤ ENV_MAX。
+NOISE_DELTA = tuning.f("MOOD_NOISE_DELTA")
+PASSIVE_MAX_DELTA = tuning.f("MOOD_PASSIVE_MAX_DELTA")
+ENV_MAX_DELTA = tuning.f("MOOD_ENV_MAX_DELTA")
+
 _LAST_AT: dict = {}       # session_key -> 上次判读时间（节流）
 _LAST: dict = {}          # session_key -> 最近一次结果（给 /测函数 用）
 # 每次「尝试」的结果，成功失败都记 —— 用户 2026-11-19：
@@ -188,12 +201,9 @@ def scene_lines(session_key: str, limit: int = 0) -> list:
     if key.startswith("group_"):
         try:
             from . import group_scene
-            for m in group_scene.recent_messages(key[len("group_"):], n):
-                who = "你" if m.get("is_bot") else str(
-                    m.get("name") or m.get("qq") or "?")
-                txt = str(m.get("text") or "").strip()
-                if txt:
-                    out.append(f"{who}: {_slim(txt)}"[:160])
+            # 统一走「处理过的历史」（收发件人标签链路），不再自己拼
+            out = group_scene.history_lines(
+                key[len("group_"):], n, width=150)
         except Exception:
             out = []
     if not out:
@@ -231,6 +241,9 @@ def _build_prompt(words: str, think: str, ctx: list, prev_word: str = "",
     ]
     if hint:
         lines.append(f"【刚刚发生】{str(hint)[:160]}")
+    if not (words or "").strip() and not (think or "").strip():
+        lines.append("【注意】她这次**没有说话**，只是看到群里在聊 —— "
+                     "除非有人明确冲她来，否则 delta 应该是 0.00。")
     if think:
         lines.append(f"【她的心理活动】{think[:200]}")
     if archive:
@@ -241,12 +254,15 @@ def _build_prompt(words: str, think: str, ctx: list, prev_word: str = "",
     if ctx:
         lines.append("")
         lines.append(f"【最近 {len(ctx)} 条群聊（最后一条最新）】")
+        lines.append("格式：`谁 → 收件人：内容`。**`→ 你` 才是对她说的话**；")
+        lines.append("`→ 某人 / → 大家` 是别人之间的对话 —— 别人被冒犯 ≠ 她被冒犯，")
+        lines.append("别把旁人的情绪算到她头上（她可能只是看戏/懒得插嘴）。")
         lines.extend(f"{i}. {x}" for i, x in enumerate(ctx, 1))
     lines += [
         "",
         "判断规则（mind / word / delta / cause / why 五个字段都要有，"
         "档案够详细时再加 bond_word）：",
-        "· mind：**第一人称**的一句心里话，15 字内，像她在心里嘀咕。",
+        "· mind：**第一人称**的一句心里话，20 字内，像她在心里嘀咕。",
         "  不是事件复述，也不是说给别人听的客套话。例：「他夸我，我嘴上不认」「这数字看得我眼晕」。",
         "  哪怕她很平静，也要写一句（例：「就随便看看」）。**这一项不能省**。",
         "· word：一个**具体**的中文词/短语，4~10 字。不要用「开心/难过/生气/平静」这种泛词；",
@@ -255,12 +271,18 @@ def _build_prompt(words: str, think: str, ctx: list, prev_word: str = "",
         "· delta：**-1.00 ~ 1.00，保留两位小数**。这是「这件事让她心情**涨/跌了多少**」，",
         "  **不是她现在的心情值**（当前心情由系统累计，不用你给）。",
         "  正 = 变好（被夸、被逗笑、被哄）｜负 = 变差（被冒犯、被无视、被恶心）。",
-        "· **幅度纪律（很重要，2026-11-20）**：",
-        "  日常闲聊 / 玩笑 / 旁观吐槽 → **±0.05 ~ ±0.15**；",
-        "  「抽象」「无语」「好笑」「嘴硬心痒」这类小情绪 → **±0.05 ~ ±0.10**；",
-        "  被明显戳到 / 被冒犯 / 被认真夸 → **±0.20 ~ ±0.40**；",
-        "  真正的伤害（羞辱、被赶）或大喜（久别重逢）→ **±0.50 以上**，很少见。",
-        "  同一件小事不要反复给大值；平淡的闲聊就给 0.00~±0.05。",
+        "· **幅度纪律（2026-11-22 定稿：先判断「这事跟她有没有关系」）**：",
+        "  ① **跟她没关系 → 必须 0.00**：",
+        "     · 别人之间的对话（→ 某人 / → 大家）；",
+        "     · 群里刷图、刷屏、冷梗、别人吵架、别人被调侃；",
+        "     · 她只是看到、没说话、没被叫；",
+        "     · 「懒得掺和」「旁观」「看戏」「无语」这类**没有指向她**的状态。",
+        "     ⚠️ 这些**不是负分**，是 0.00 —— 旁观不该让她心情变差。",
+        "  ② 冲她来但不大 → **±0.03 ~ ±0.08**（被接话、被轻轻调侃、被忽略一句）；",
+        "  ③ 明确冲她来 → **±0.10 ~ ±0.20**（被认真夸、被冒犯、被哄）；",
+        "  ④ 真正的伤害 / 大喜 → **±0.30 ~ ±0.50**（极少见，一天最多一两次）。",
+        "  同一件小事不要反复给值；**方向要平衡**：她一天里被逗笑和被冷落都有，",
+        "  不要把所有「没什么事」都写成负分。",
         "· bond_word（可选）：参考【她的档案】，给一个 **4~10 字**的描述性说法，",
         "  说明「她现在怎么看他」，例：「又爱又嫌的老熟人」「不想搭理的陌生人」「可以损两句的熟人」。",
         "  档案没提到这个人、或这次没什么变化，就省略这个字段。",
@@ -349,7 +371,7 @@ async def _mind_only(words: str, think: str, ctx: list, word: str) -> str:
         lines.extend(f"- {x}" for x in (ctx or [])[-8:])
     lines += [
         "",
-        "用**第一人称**写一句她此刻的心里话（15 字内，像心里嘀咕，不复述事件、不客套）。",
+        "用**第一人称**写一句她此刻的心里话（20 字内，像心里嘀咕，不复述事件、不客套）。",
         "只输出这句话本身：不要引号、不要解释、不要换行。",
     ]
     payload = {
@@ -371,7 +393,7 @@ async def _mind_only(words: str, think: str, ctx: list, word: str) -> str:
             data = r.json()
             try:
                 from . import llm_usage as _lu
-                _lu.record_from_response(data, purpose="judge")
+                _lu.record_from_response(data, purpose="judge", provider="judge", model=MODEL or "deepseek-chat")
             except Exception:
                 pass
         txt = str(((((data or {}).get("choices") or [{}])[0]
@@ -446,7 +468,7 @@ async def judge(words: str, ctx_lines=None, *, think: str = "",
             data = r.json()
             try:
                 from . import llm_usage as _lu
-                _lu.record_from_response(data, purpose="judge")
+                _lu.record_from_response(data, purpose="judge", provider="judge", model=MODEL or "deepseek-chat")
             except Exception:
                 pass
         content = str((((data or {}).get("choices") or [{}])[0]
@@ -562,7 +584,9 @@ def trace_text(session_key: str, judge: dict = None) -> str:
 async def judge_and_store(session_key: str, words: str, ctx_lines=None, *,
                           think: str = "", force: bool = False,
                           speaker_qq: str = "", hint: str = "",
-                          repair: bool = False, turn_id: str = "") -> dict:
+                          repair: bool = False, turn_id: str = "",
+                          passive: bool = False,
+                          addressed: bool = False) -> dict:
     """
     判读 + 写进 mood（影子字段，不影响老数值）。
 
@@ -633,15 +657,38 @@ async def judge_and_store(session_key: str, words: str, ctx_lines=None, *,
             #   当前心情值 = 把 Δ 累加到一个持续变量上（-1~1），随时增减。
             _delta = round(float(res.get("delta") or 0.0), 4)
             _delta = max(-mood.MOOD_MAX_DELTA, min(mood.MOOD_MAX_DELTA, _delta))
+            _cause = str(res.get("cause") or "speaker")
+            # ---- Δ 入口护栏（设计 §13.3 的前提：Δ 必须校准）----
+            _raw_delta = _delta
+            _guard = ""
+            if abs(_delta) < NOISE_DELTA:
+                if abs(_raw_delta) > 1e-9:
+                    _guard = f"噪音丢弃（|Δ|{abs(_raw_delta):.3f} < {NOISE_DELTA}）"
+                _delta = 0.0
+            elif passive:
+                _delta = max(-PASSIVE_MAX_DELTA, min(PASSIVE_MAX_DELTA, _delta))
+                if abs(_delta) < abs(_raw_delta):
+                    _guard = f"被动观察封顶 ±{PASSIVE_MAX_DELTA}"
+            elif _cause != "speaker" and not addressed:
+                _delta = max(-ENV_MAX_DELTA, min(ENV_MAX_DELTA, _delta))
+                if abs(_delta) < abs(_raw_delta):
+                    _guard = f"非冲她来封顶 ±{ENV_MAX_DELTA}"
+            if _guard:
+                logger.info(f"[MOOD-JUDGE] {key} Δ {_raw_delta:+.2f} → {_delta:+.2f}"
+                            f"（{_guard}）")
+            # 让调用方（日志 / 返回值）也看到**护栏之后**的 Δ，
+            # 否则外面拿 res["delta"] 还会按 -0.07 去算刻痕。
+            res["delta"] = _delta
+            res["delta_raw"] = _raw_delta
+            # salience 按设计 §13.3：min(1, |Δ|/0.5) → 0.10/0.25/0.50 三档刻痕
             _sal = min(1.0, abs(_delta) / 0.5)
             _val = 1.0 if _delta > 0 else (-1.0 if _delta < 0 else 0.0)
-            _cause = str(res.get("cause") or "speaker")
 
             # ⓪ 群心情（独立于整体心情）：这个群最近 5 小时让她涨/跌了多少。
             #    · cause=speaker → 记到这个人头上（单人跌 0.4 就单独不理他）
             #    · cause=other/environment → 只算群环境（3 人以上 + 群跌 0.7 才整群安静）
             #    · cause=self → 她自己的事，不算群环境
-            if key.startswith("group_"):
+            if key.startswith("group_") and abs(_delta) > 1e-9:
                 try:
                     from . import group_mood
                     group_mood.record(
@@ -657,7 +704,10 @@ async def judge_and_store(session_key: str, words: str, ctx_lines=None, *,
             _prev_v = float(prev.get("value") or 0.0)
             _new_v = _prev_v
             try:
-                if getattr(mood, "MOOD_MODE", "delta") == "level":
+                if abs(_delta) < 1e-9:
+                    # Δ=0：只记名词/心里话，不动数值（这才是「旁观不背锅」）
+                    _new_v = float(mood.get_mood(key).get("value") or 0.0) / 100.0
+                elif getattr(mood, "MOOD_MODE", "delta") == "level":
                     _vn = mood.set_value_from_judge(_prev_v + _delta, key,
                                                     word=res["word"],
                                                     why=res.get("why") or "",
@@ -681,8 +731,8 @@ async def judge_and_store(session_key: str, words: str, ctx_lines=None, *,
                            why=res.get("why") or "", src=res.get("src") or "",
                            mind=res.get("mind") or "", delta=_delta)
 
-            # ③ 记忆刻痕
-            if turn_id:
+            # ③ 记忆刻痕（Δ=0 就不刻）
+            if turn_id and abs(_delta) > 1e-9:
                 try:
                     from . import memory_v2
                     memory_v2.patch_turn(

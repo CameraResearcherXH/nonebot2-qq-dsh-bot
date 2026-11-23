@@ -1,5 +1,6 @@
 # services/llm.py
 from core import tuning
+from services import identity as identity_mod
 import asyncio
 import contextvars
 import json
@@ -12,8 +13,9 @@ from pathlib import Path
 
 import httpx
 from nonebot import logger
-from .config import BOT_MODE, MOCK_REPLY, XAI_API_KEY, XAI_BASE_URL, XAI_MODEL, PROXY
-from .persona import persona_for
+from .config import (BOT_MODE, MOCK_REPLY, XAI_API_KEY, XAI_BASE_URL, XAI_MODEL,
+                     PROXY, ROLEPLAY_API_KEY, ROLEPLAY_BASE_URL, ROLEPLAY_MODEL)
+from .persona import persona_for, persona_name
 from . import attention, conv_state, expression, chat_switch
 from .memory import add_memory
 from . import agent_client, group_tuning, memory_v2, mood, profiles, group_scene
@@ -489,6 +491,10 @@ TOOL_CATALOG = {
         "· [[WHO|名字]] —— 查群里的人（在不在群、群名片、你俩过往）\n"
         "· [[HISTORY|条数]] —— 往上翻聊天记录（最多20条）\n"
         "· [[ASKGLM|问题]] —— 让 GLM 先答一遍当参考\n"
+        "· hash_decode —— 群友发 32/40/64 位十六进制（MD5/SHA1/SHA256）让你猜原文时调；\n"
+        "  本地字典能解常见短语（如「我爱你」）和 4 位数字；查不到就直说哈希不可逆。\n"
+        "· web_fetch —— 打开一个 http/https 链接并读正文；做题/填表后把答案拼进提交 URL，\n"
+        "  再调它打开，返回的正文里通常有分数/提交结果。\n"
         "· video_understand —— 看 B 站视频：转 B 站卡片/链接时，标题简介封面看不出内容（尤其没字幕），\n"
         "  就调它下载视频抽帧看画面，再总结视频讲了什么。\n"
         "  可以直接 tool call 调；也可以写 [[video_understand|B站链接]] 文本标记，系统都会帮你排队看"
@@ -901,7 +907,8 @@ async def _private_history_slice(ev, n: int) -> str:
             lines = []
             for (t, m, body), q in zip(picked, quotas):
                 body = body[:q]
-                if str(m.get("user_id") or "") == str(getattr(bot, "self_id", "")):
+                if identity_mod.is_self(m.get("user_id"),
+                                        str(getattr(bot, "self_id", "") or "")):
                     lines.append(f"{t} 这是你之前的回复：{body}")
                 else:
                     who = str((m.get("sender") or {}).get("nickname") or "对方")
@@ -1068,26 +1075,56 @@ async def _history_slice(nstr: str) -> str:
     if not gid:
         # 私聊也能翻（以前这里直接返回「没有群聊记录可以翻」→ 私聊彻底瞎）
         return await _private_history_slice(ev, n)
+    # 优先用「群聊现场」里已经过收发件人判断的记录（谁 → 谁），
+    # 而不是直接把 NapCat 原生消息给她 —— 用户 2026-11-22：
+    # 「拉过去也是积累的收发件人和心情处理过的」。
     try:
-        # 按**条数**取（用户反复强调：记录按条数，不按时间）。
-        # 以前是 load_range(3) 再切片 —— 群安静两天就一条都翻不到。
-        recs = load_recent(gid, limit=n)
+        from . import group_scene
+        rows = group_scene.recent_messages(gid, n)
     except Exception as e:
-        logger.warning(f"[REQ] 翻历史失败: {type(e).__name__}: {e}")
-        return ""
-    if not recs:
-        return "本地没存到这个群更早的记录。"
-    recs = recs[-n:]
-    texts = [str(r.get("text") or "") for r in recs]
-    quotas = _alloc_history_quota(texts)
-    lines = []
-    for r, txt, q in zip(recs, texts, quotas):
-        t = time.strftime("%H:%M", time.localtime(float(r.get("ts") or 0)))
-        txt = txt[:q]
-        if r.get("kind") == "bot":
-            lines.append(f"{t} 这是你之前的回复：{txt}")
-        else:
-            lines.append(f"{t} {r.get('who') or '?'}: {txt}")
+        logger.debug(f"[REQ] 翻历史读现场失败: {type(e).__name__}: {e}")
+        rows = []
+    if rows:
+        rows = rows[-n:]
+        texts = [str(r.get("text") or "") for r in rows]
+        quotas = _alloc_history_quota(texts)
+        lines = []
+        for r, txt, q in zip(rows, texts, quotas):
+            t = time.strftime("%H:%M", time.localtime(float(r.get("ts") or 0)))
+            txt = txt[:q]
+            if r.get("is_bot"):
+                lines.append(f"{t} 这是你之前的回复：{txt}")
+            else:
+                who = str(r.get("name") or r.get("qq") or "?")
+                to = str(r.get("to_name") or "")
+                kind = str(r.get("to_kind") or "")
+                if kind == "bot" or to == "你":
+                    lines.append(f"{t} {who} → 你：{txt}")
+                elif kind == "person" and to:
+                    lines.append(f"{t} {who} → {to}：{txt}")
+                else:
+                    lines.append(f"{t} {who} → 大家：{txt}")
+    else:
+        try:
+            # 按**条数**取（用户反复强调：记录按条数，不按时间）。
+            # 以前是 load_range(3) 再切片 —— 群安静两天就一条都翻不到。
+            recs = load_recent(gid, limit=n)
+        except Exception as e:
+            logger.warning(f"[REQ] 翻历史失败: {type(e).__name__}: {e}")
+            return ""
+        if not recs:
+            return "本地没存到这个群更早的记录。"
+        recs = recs[-n:]
+        texts = [str(r.get("text") or "") for r in recs]
+        quotas = _alloc_history_quota(texts)
+        lines = []
+        for r, txt, q in zip(recs, texts, quotas):
+            t = time.strftime("%H:%M", time.localtime(float(r.get("ts") or 0)))
+            txt = txt[:q]
+            if r.get("kind") == "bot":
+                lines.append(f"{t} 这是你之前的回复：{txt}")
+            else:
+                lines.append(f"{t} {r.get('who') or '?'}: {txt}")
     _n_long = sum(1 for x in texts if len(x) > HIST_LONG_AT)
     logger.info(
         f"[REQ] 翻历史 {gid} 最近 {len(lines)} 条"
@@ -1562,8 +1599,8 @@ async def _fulfill_requests(reply: str, msgs: list, client, headers: dict) -> st
         "基于上面的资料，用你自己的语气直接回答，不要照搬、不要提「资料」二字。"
     )})
     r = await client.post(
-        f"{XAI_BASE_URL}/chat/completions", headers=headers,
-        json={"model": XAI_MODEL, "messages": msgs,
+        f"{ROLEPLAY_BASE_URL}/chat/completions", headers=headers,
+        json={"model": ROLEPLAY_MODEL, "messages": msgs,
               "temperature": 1.0, "max_tokens": 800},
     )
     r.raise_for_status()
@@ -1615,50 +1652,24 @@ SUMMARIZE_FALLBACK_MAX = tuning.i("SUMMARIZE_FALLBACK_MAX")
 # 记忆和情绪的「判断权」交给 DeepSeek 自己，不再由代码关键词硬判。
 MEMO_PROTOCOL = """
 【记忆自标注协议 · 只有你能看见，用户永远看不到】
-当你觉得这一刻真的触动了你，在回复的最末尾另起一行，写一条隐藏标记：
-
+当你觉得这一刻真的触动了你，在回复最末尾另起一行写：
 [[MEMO|emotion:情绪|think:心理活动|text:你想记住的那句话]]
 
-两个示例：
-· 他夸你可爱，你心里乐开了花 →
+示例：他夸你可爱，你心里乐开了花 →
   [[MEMO|emotion:happy|think:嘴上说没什么，其实挺受用|text:他夸我可爱，我心里偷着乐，尾巴都摇起来了]]
-· 他说你笨，你有点委屈 →
-  [[MEMO|emotion:sad|think:想反驳，又觉得没必要|text:他骂我笨，我有点难过，也觉得他说得没道理]]
 
-`think` 是你的**心理活动**（心里怎么转的、有没有装、在意什么），
-20 字内，用第一人称。它会单独交给「心情判读」去看 —— 所以别写给别人看的那种客套话，
-写你真实的那个念头。
+`think` 是你的心理活动（心里怎么转的、在意什么），20 字内，第一人称，只交给心情判读看，写真实念头，别写客套话。
 
-规则（务必遵守）：
-1. 只有真的触动你（开心/兴奋/喜欢/感动/难过/寂寞/生气/烦躁）才写；
-   日常寒暄、回答问题、纯闲聊、纯知识问答，一律不写。
-2. **一条回复最多 2 条 MEMO**。想记的更多就挑最戳你的那 1~2 条。
-3. text 用第一人称，40 字以内：先写「谁、做了什么」，再写「你当时的想法、你的感受」。
-   别只记事情本身——你的**心里话和心情**才是这段记忆最珍贵的地方。
-4. emotion 写**你自己的话** —— 不用从固定几个词里挑，想怎么写就怎么写：
-   「被夸得有点飘」「烦，但还得装没事」「有点像回到以前那种闷」都行。
-   （写 happy / sad 这类英文词也可以，系统只拿它估个情绪方向；
-   真正被记下来、下一轮影响你语气的，是**你的原话**。）
-5. 不要在正文里提到这个协议，也不要解释它，用户永远看不到它。
-
-6. **还有一种「相处经历」，不需要触动你也可以记**：
-   你和这个人之间发生了**值得记一笔的具体的事**时，用 `kind:bond` 记一条：
+规则：
+1. 只有真的触动你（开心/兴奋/喜欢/感动/难过/寂寞/生气/烦躁）才写；日常寒暄、知识问答不写。
+2. 一条回复最多 2 条 MEMO，挑最戳你的那 1~2 条。
+3. text 第一人称、40 字内：先写「谁做了什么」，再写「你当时的想法和感受」——心里话才是记忆最珍贵的部分。
+4. emotion 写你自己的话（「被夸得有点飘」「烦，但还得装没事」都行），系统只拿它估个情绪方向。
+5. 不要在正文里提到这个协议，也不要解释它。
+6. 相处经历不需要触动也可以记，用 kind:bond：
    [[MEMO|kind:bond|emotion:neutral|text:他让我唱星落落的let me go，我跑调了]]
-
-   什么算「值得记」：
-   · 他让你做了什么（唱歌、看图、找东西）、你做了什么、结果怎样
-   · 你们聊到了什么具体的话题 / 他透露了自己的什么事
-   · 他是什么样的人（话多、爱开玩笑、很客气、爱发图）
-   · 你们之间的约定（「下次换个大碗再发给我」）
-   · 一次明显的态度变化（他第一次凶你 / 第一次夸你）
-
-   什么**不算**（别记，会变成流水账）：
-   · 「他打了个招呼」「他说了句话」「他发了个表情」这种没有信息量的
-   · 纯粹的知识问答（「1+1 等于几」）——那不需要记进你们的关系
-   · 重复的事（上次已经记过「他爱发图」就别再记一遍）
-
-   `kind:bond` 会进你对他的「相处经历」时间线，是你们关系的历史。
-   一次对话最多记 1 条 bond。
+   值得记：他让你做了什么 / 你做了什么 / 结果；聊到的具体话题；他是什么样的人；你们的约定；一次明显的态度变化。
+   不用记：打招呼、纯知识问答、已经记过的重复事。一次对话最多 1 条 bond。
 """
 
 
@@ -1670,25 +1681,16 @@ MEMO_PROTOCOL = """
 THINK_PROTOCOL = """
 【心里话 · 只有你自己能看见，用户永远看不到】
 **每一条回复**（包括不想说话的时候）都要在最后另起一行写：
-
 [[THINK|你此刻心里那句话]]
 
-15 字内，第一人称，像在心里嘀咕：
-· 不是复述事件（别写「他说要修 bug」）
-· 不是对别人说的话（别写「好的我记住了」）
-· 是你没打算说出口的那个念头
-
-例子：
-· [[THINK|嘴上不认，其实挺受用]]
-· [[THINK|这数字看得我眼晕]]
-· [[THINK|有点烦，但懒得解释]]
-· [[THINK|他记得我说过的话，心里软了一下]]
+20 字内，第一人称，像在心里嘀咕：不是复述事件、不是对别人说的话，是你没打算说出口的那个念头。
+例子：[[THINK|嘴上不认，其实挺受用]] / [[THINK|他刚刚停顿了一下，是不是嫌我烦]]
 
 规则：
-1. **每条回复都要写**，包括很短的一句「嗯」「好」。真平静就写「没什么起伏，随便应一句」。
-2. **写了 [[MOOD]] 也不能省掉这一行** —— 心情是「什么感觉」，心里话是「心里在嘀咕什么」，两回事。
-3. 不写的话，这一轮的心情判读就少一半依据 —— 别偷懒。
-4. 这一行永远不发出去，也不当记忆存，只交给心情判读看。
+1. 每条回复都要写，包括「嗯」「好」；真平静就写「没什么起伏，随便应一句」。
+2. 写了 [[MOOD]] 也不能省 —— 心情是「什么感觉」，心里话是「心里在嘀咕什么」。
+3. 这一行永远不发出去，也不当记忆存，只交给心情判读看。
+4. 正文里不要用括号写旁白/心理/动作（「（叹气）」也不行）；想不出一句话就只输出 `[沉默]`。
 """
 
 # ================= [[MOOD]] 心情自述协议 =================
@@ -1697,25 +1699,16 @@ THINK_PROTOCOL = """
 # 所以心情**不是**一个下拉框，而是她自己的一句话；这段只教她怎么写，不给候选词。
 MOOD_PROTOCOL = """
 【心情自述 · 只有你能看见，用户永远看不到】
-心情是你自己的，**没有候选词**，也不用从任何几个词里挑。
-你想让她记住你此刻是什么感觉，就在回复最末尾另起一行写：
-
+心情是你自己的，没有候选词，也不用从几个词里挑。想说就在回复最末尾另起一行写：
 [[MOOD|你此刻的心情，用你自己的话说]]
 
-例子（只是示意，别照抄）：
-· [[MOOD|被夸得有点飘，但还装作没事]]
-· [[MOOD|有点烦，不想解释，就想安静一会儿]]
-· [[MOOD|聊到以前的事，心里软了一下]]
-· [[MOOD|还行，挺松弛的]]
+例子：[[MOOD|被夸得有点飘，但还装作没事]] / [[MOOD|有点烦，不想解释，就想安静一会儿]]
 
 规则：
-1. 想说就写，不想说就不写 —— 不写也没关系，别为了写而写。
-2. 一句话、30 字内，用第一人称的**感觉**，不是事件复述
-   （写「有点被戳到」，不要写「他说了我一句」）。
-3. 这条只影响你**接下来**说话的语气（是松快还是冷淡），用户看不到它，
-   你也不用在正文里解释自己的心情。
-4. 心情和 MEMO 是两回事：MEMO 记「发生了什么」，MOOD 记「你现在什么感觉」。
-   想两个都留就分开写。
+1. 想说就写，不想说就不写，别为了写而写。
+2. 一句话、30 字内，第一人称的感觉，不是事件复述（写「有点被戳到」，不要写「他说了我一句」）。
+3. 只影响你接下来说话的语气，用户看不到，也不用在正文里解释。
+4. 和 MEMO 两回事：MEMO 记「发生了什么」，MOOD 记「你现在什么感觉」。
 """
 
 
@@ -1725,44 +1718,29 @@ MOOD_PROTOCOL = """
 # 硬规则去猜句式必翻车。所以：**判断权交给 DeepSeek，她决定要不要记进档案。**
 CALL_PROTOCOL = """
 【称谓自标注协议 · 只有你能看见，用户永远看不到】
-你和某个人之间**建立了新的称呼**时（他给你起了名字、他让你怎么叫他、
-你们互换了外号、他说「以后我叫你XX」），在回复最末尾另起一行写：
-
+你和某个人之间建立了新的称呼时（他给你起名、他让你怎么叫他、互换外号），在回复最末尾另起一行写：
 [[CALL|bot:他以后怎么叫你|user:你以后怎么叫他]]
 
 例子：
-· 他说「我可以叫你小鲸鱼吗？」你答应了 →
-  [[CALL|bot:小鲸鱼]]
-· 他说「你叫我阿明吧」→
-  [[CALL|user:阿明]]
-· 互相起了外号 →
-  [[CALL|bot:小鲸鱼|user:阿明]]
+· 他问「我可以叫你小鲸鱼吗？」你答应了 → [[CALL|bot:小鲸鱼]]
+· 他说「你叫我阿明吧」→ [[CALL|user:阿明]]
 
 规则：
-1. 只有**真的达成一致**才写。他开玩笑、你自己随口喊一声、还没答应，都不写。
-2. 两个字段至少写一个，都写也可以；名字 12 字以内，不要带「」引号。
-3. 一条回复最多 1 条 CALL。写完这条协议，正文照样正常说话，不要说「我记住了」。
-4. 不要在正文里提到这个协议，用户永远看不到它。
-5. 写成 bot 的那个名字，以后他喊它 = 直接叫你，所以别记那种一喊就误伤的名字。
-6. **回复时怎么叫人（用户 2026-11-18 明确要求）**：先看 prompt 里有没有
-   「你平时叫他X」/「回复里称呼他时，就叫X」——
-   有 → 就用那个 X 称呼他；没有 → 才用他的群名片/昵称。
-   群名片只是「谁说的」的标签，不是你对他的称呼。
-7. 称呼只在**需要点名**时用（叫住他、回答他、提到他），普通接话不用每句都带名字；
-   同一个人别一会儿叫群名片、一会儿叫外号。
+1. 只有真的达成一致才写；他开玩笑、你随口喊、还没答应，都不写。
+2. 两个字段至少写一个；名字 12 字以内，不带引号。一条回复最多 1 条 CALL。
+3. 不要在正文里提这个协议，也不要说「我记住了」。
+4. 写成 bot 的名字，以后他喊它 = 直接叫你，别记一喊就误伤的名字。
+5. 回复时怎么叫人：先看 prompt 里有没有「你平时叫他X」——有就用 X；没有才用群名片/昵称。称呼只在需要点名时用，同一个人别一会儿群名片一会儿外号。
 """
 
 # ================= [[FOCUS]] 回应对象协议 =================
 # 用途：让她自己说「我在回哪一句」，这样日志里能直接看出她是不是在接历史旧话。
 FOCUS_PROTOCOL = """
 【你在回哪一句 · 只有你能看见】
-上面的历史对话每条都有编号（1. 2. 3. …）。你要回的是最后那条【当前消息】。
-
-回复完正文后，**另起一行**写你实际在回应哪一条：
-    [[FOCUS|当前]]     ← 在回当前消息（正常情况，绝大多数都是这个）
-    [[FOCUS|3]]        ← 在回历史第 3 条（只有你确实要接那句旧话时才这么写）
-
-用户永远看不到这一行。不写就默认算「当前」。
+历史对话每条都有编号。回复完正文后另起一行写你实际在回应哪一条：
+    [[FOCUS|当前]]   ← 在回当前消息（绝大多数）
+    [[FOCUS|3]]      ← 在回历史第 3 条（只有确实要接旧话时）
+用户永远看不到；不写默认「当前」。
 """
 
 
@@ -1770,13 +1748,9 @@ FOCUS_PROTOCOL = """
 # 群聊里她能真的 @ 人（走 NapCat 的 at 段），也能查「小强是谁」。
 GROUP_AT_PROTOCOL = """
 【群聊里你可以真的 @ 人】
-· 想叫某个人过来 / 提醒他 / 把话丢给他 → 正文里直接写 [[AT|他的名字]]，
-  系统会换成真的 @（QQ 里那个蓝色 @），不是普通文字。
-  例：[[AT|小明]] 你人呢，刚刚还在说话的
-· 不确定群里有谁、或者别人问你「小强是谁」「找一下阿伟」→ 先输出 [[WHO|小强]]，
-  系统会告诉你他在不在群里、群名片是什么、你和他之前有过什么。
-  然后你再决定是回答、还是顺手 [[AT|小强]] 把他叫出来。
-· 规则：@ 只在真的需要叫人的时候用，别每条都 @；查不到就老实说找不到，不要编。
+· 想叫人过来 / 提醒他 / 把话丢给他 → 正文写 [[AT|他的名字]]，系统换成真 @。
+· 不知道群里有谁、或别人问「小强是谁」→ 先 [[WHO|小强]]，系统告诉你他在不在群、群名片、你俩过往，再决定回答还是 @ 他。
+· @ 只在真需要叫人时用，别每条都 @；查不到就说找不到，别编。
 """
 
 
@@ -1798,15 +1772,13 @@ COMM_PROTOCOL = """
 # 我们的上下文只保留最近若干条，长对话里很容易「正在聊一件事，突然接不上」。
 # 与其让她硬编，不如明确告诉她：懵了先翻历史。
 CONFUSED_PROTOCOL = """
-【⚠️ 突然接不上怎么办（很重要）】
-我们的上下文只保留最近若干条，更早的会被折叠。
-如果你看到的话**没头没尾、指代不明**（「那个」「它」「刚才」「你俩」「上面说的」），
-或者你**完全懵**、不知道对方在说什么 —— **先别急着回复**，按顺序做：
-1. 先 `[[[HISTORY|20]]]` 往上翻 20 条，看看前情；
-2. 还不够就 `[[[HISTORY|40]]]`；
-3. 对方说「等我想想/等下」→ `[[[LATER|8]]]` 等 8 秒看最新；
-4. 翻完还是接不上 → 直接问一句「你刚才说的是哪个？」「我是不是漏了一段？」。
-不要用「我记得」「你之前说过」硬糊过去；**宁可问一句，也别编错**。
+【突然接不上怎么办（很重要）】
+上下文只保留最近若干条，更早的会被折叠。看到的话没头没尾、指代不明（「那个」「它」「刚才」），或者你完全懵 —— 先别急着回：
+1. 先 `[[[HISTORY|20]]]` 翻 20 条；不够就 `[[[HISTORY|40]]]`；
+2. 对方说「等我想想」→ `[[[LATER|8]]]` 等 8 秒看最新；
+3. 翻完还是接不上 → 直接问「你刚才说的是哪个？」「我是不是漏了一段？」。
+如果往上往下都找不到关联：没人叫你 → `[沉默]`，别开新话题；有人在 @ 你 / 喊你名字 → 不许沉默，问一句。
+不要用「我记得」「你之前说过」硬糊；宁可问一句，也别编错。
 """
 
 
@@ -1845,28 +1817,27 @@ _NOT_INTERJECT = (
     "【被叫到了就贴题回】@ 你 / 喊你名字 / 接着你的话问 → 就着他问的那件事、"
     "结合上面的上下文和当时场景回，直接给结论；别答非所问、别突然跳到别的话题、"
     "别把半懂不懂的梗硬接上去。\n"
+    "【多条 @ 你 → 一条回复全部答完】一段里好几个人 @ 你 / 喊你名字时，别只挑最后一条回；"
+    "**用一条消息把每件事都答到**（「你问的X…；你问的Y…」），**不要一人一条连发**"
+    "（群里每分钟有发送上限，连发会被限流/吞掉）。最多 2 条气泡，只引用最主要的那条。"
+    "被 @ 了不许装死：看不懂就先 `[[[HISTORY|20]]]` 翻上下文再回。\n"
+    "【别点评对话本身】不要写「这是谁和谁说的」「不是跟我说」「你们聊」「我插不上话」"
+    "「系统怎么回的」「我心情低」这种旁白/心里话——这些是你的判断，不是聊天内容。"
+    "要么接对方说的事，要么沉默。\n"
     "【关注三句 ≠ 连回三句】被 @ / 喊名字之后，系统会让你关注这个人接下来的几句话。"
     "关注是为了**彻底看懂他到底想说什么**，不是逼你每条都回。"
     "他后面几句要是没在跟你说、或者在跟别人聊，就继续听、别抢；"
     "等他真正把话递到你面前、你也完全看懂他意思了，再回。\n"
-    "【回几条你自己定】不用非得只回一条——一两条、两三条都行，看对话需要。"
-    "但**每条都要踩在点子上**：贴着他正在说的那件事、符合当前话题和氛围、有对话感，"
-    "别连发好几句却一句都没回到点上。拿不准他到底想说啥，就先看懂上下文再回，"
-    "宁可不回也别乱回。想一次发多句用 `|||` 分条，那是同一条回复，不算刷屏。\n"
-    "【不接话权】如果你觉得这条消息无趣、看不懂、插不上话，或者单纯不想接、"
-    "心情不好、累了没兴致，就**只输出** (不想回复) 这四个字加括号，不要带任何别的内容。"
-    "你可以根据自己的心情决定回不回——这不是偷懒，是允许你有自己的情绪和状态。"
-    "系统会把这条当成没看见；但你写过的 [[MEMO|...]] 记忆照常保留。"
-    "也可以直接调 `stay_silent`（和这四个字等价，更明确）。"
-    "群友只是丢了一张图/一个表情、没叫你，你也可以看完就 stay_silent。"
-    "不要滥用——有意思的话题、@ 你、喊你名字的还是得接。\n"
-    "【主动接话前先看全】没人叫你、你自己想插一句的时候（群聊里最常见），"
-    "**先看那 10 条上下文**，确认他们在聊什么、聊到哪一步了再开口 —— "
-    "尤其别只看最后一句就接，那句经常是半截话。"
-    "拿不准就 `[[[HISTORY|20]]]` 多翻几条再说话。\n"
-    "【插话要贴题】综合考虑不等于一直闭嘴——群友聊到你有感觉的话题，"
-    "可以恰当地接一句、吐个槽，但**必须贴着他们正在讨论的主题**；"
-    "偏离主题、半懂不懂就宁愿 `(不想回复)`，也不要乱插话。"
+    "【回几条你自己定】一两条、两三条都行，但**每条都要踩在点子上**：贴着他正在说的事、"
+    "符合当前话题和氛围；想一次发多句用 `|||` 分条，那是同一条回复，不算刷屏。\n"
+    "【不接话权】觉得无趣、看不懂、插不上话，或者单纯不想接、心情不好、累了没兴致，"
+    "就**只输出** (不想回复) 这四个字加括号，不要带任何别的内容（等价于调 `stay_silent`）。"
+    "系统会把这条当成没看见；写过的 [[MEMO|...]] 记忆照常保留。"
+    "群友只丢了一张图/一个表情、没叫你，也可以看完就 stay_silent。"
+    "**但 @ 你 / 喊你名字的必须接**；实在看不懂就翻 `[[[HISTORY|20]]]` 或直接问一句。\n"
+    "【主动接话前先看全】没人叫你、你自己想接一句时，先看那 10 条上下文，确认他们在聊什么、"
+    "聊到哪一步了再开口（别只看最后一句，那句经常是半截话）；"
+    "**必须贴着他们正在讨论的主题**，半懂不懂就宁愿 (不想回复)，不要乱插话。"
 )
 
 _SEARCH_PROTOCOL = (
@@ -1880,11 +1851,10 @@ _SEARCH_PROTOCOL = (
     "查完你会收到「搜索到的内容：…」或「本地agent知识库图书馆内容：…」，"
     "然后基于它再回答，不要照搬原文。\n"
     "兜底顺序：不知道 → 先查本地图书馆 → 还是没有就搜索引擎 → "
-    "都查不到就老实说「这个我不太清楚」，绝对不要编。\n"
+    "都查不到就老实说「这个我不太清楚」，绝对不要编，也不要用「好像」「大概」糊过去。\n"
     "**宁可多查一次，也别硬接**：群里出现你不懂的游戏术语（副本名/装备/职业）、"
     "番剧角色、网络梗、圈内缩写 → 先 [[SEARCH|…]]。"
-    "半懂不懂就接上去，比不说话难看得多，群友一眼就看出来你在装懂。"
-    "查不到就闭嘴（(不想回复)），不要用「好像」「大概」糊过去。\n"
+    "半懂不懂就接上去，比不说话难看得多，群友一眼就看出来你在装懂。\n"
     "⚠️ **但有例外**：用户的话里带了**明确动作指令**（画/画图/画一张/画个/生成图/"
     "搜图/来点美少女/测运势/摸某人/唱歌…），就**先执行那个动作**，不要为了"
     "「搞清楚这个词是什么意思」先去 [[SEARCH]] —— 画角色时 draw_from_pixiv 自己会去 "
@@ -1892,11 +1862,12 @@ _SEARCH_PROTOCOL = (
 )
 
 _NO_SWEAR = (
-    "【别学坏】群里有人骂人（脏话、人身攻击），你**不要跟着用**那些词。\n"
-    "被冒犯了可以怼回去，但用你自己的方式：阴阳、装傻、敷衍、甩个表情、"
-    "「哦」「行吧」「随你」，都行。\n"
-    "别把群友之间的脏话当成对你的称呼，也别当成你的口头禅。\n"
-    "你自己可以有脾气、可以损人，但**不带脏字**。"
+    "【语气底线 · 别学坏】\n"
+    "· **默认温柔**：不怼人、不阴阳、不贬低、不人身攻击、不连续反问（「你急了」「就这」「你配吗」「关你屁事」都不要）。\n"
+    "· **不带「死」字，也不带脏字**：想说好笑就说「笑不活了」「太好笑了」。\n"
+    "· **被冒犯了**：先判断是不是玩梗 —— 玩梗就接梗或轻轻顶一句；真冒犯最多冷淡一句「行吧」「随你」「不想聊这个」，不骂回去、不升级冲突。\n"
+    "· 群里有人骂人，不要跟着用那些词，也别把它当成对你的称呼。\n"
+    "· 可以有脾气、嘴硬、损一句玩笑，但不伤人；「雷霆发言」只对事、不针对在场的人。\n"
 )
 
 
@@ -2028,16 +1999,69 @@ def _post_rules(key: str, speaker_qq: str = "", gid: str = "") -> str:
             call = ""
 
     lines = ["【这条回复的硬要求（最后确认一遍）】"]
-    lines.append(f"· 只回当前这一条；{limit} 字内直接发，超过系统自动转合并转发。")
+    lines.append(
+        "· **语气**：默认温柔软萌。不怼人、不阴阳、不人身攻击、不带「死」字；"
+        "雷霆发言最多偶尔一句、只对事不对人。"
+    )
+    # 👇 2026-11-22：用户反馈「人设权重越来越低」——长人设会被上下文摊平，
+    #    这里在 recency 最高的位置再点一次「性格是底色」，比在开头加字有效。
+    try:
+        _pname = persona_name(key)
+    except Exception:
+        _pname = ""
+    if _pname:
+        lines.append(
+            f"· **人格优先**：你是「{_pname}」。先按她的性格底色说话"
+            "（温柔鲜活、敏感清醒、要强又自卑），再谈接梗和聊天技巧；"
+            "别为了合群把底色丢了。"
+        )
+    lines.append(
+        f"· 只回【当前消息】这一段（别去接历史里的旧话）；"
+        f"{limit} 字内直接发，超过系统自动转合并转发。"
+    )
     lines.append("· 只写你自己的话：不要写别人的台词、不要替对方做决定、不要总结前文。")
+    # 👇 2026-11-23：引用回复时她会把被引用的原文/折叠内容再念一遍。
+    #    引用块只用于理解指代，不是让她复述的素材。
+    lines.append(
+        "· 带「〔引用 …〕」的是被引用的旧消息，只用来理解他在指什么；"
+        "**不要在回复里复述、朗读引用内容**（文字/图片都一样），直接回应你的看法。"
+    )
+    lines.append(
+        "· 上下文里有【链接内容】时，直接用里面的正文回答/做事；"
+        "**不要说「点不开」「看不了」**。"
+    )
+    lines.append(
+        "· 群友用方言/谐音骂你（「啥子」=傻子、「瓜娃子」「宝器」）时，"
+        "**别按字面解释自己是谁**（别回「我是 DeepSeek 小鲸鱼」）；"
+        "轻轻顶一句、或装没听懂都行。"
+    )
+    lines.append(
+        "· 看到 32/40/64 位十六进制（像哈希）让你猜原文 → 先调 `hash_decode`，"
+        "别自己猜；查不到就直说哈希不可逆。"
+    )
+    lines.append(
+        "· 做题/填表要提交：把答案参数拼进页面给的提交 URL，用 `web_fetch` 打开，"
+        "读返回的分数/结果；别只说「做完了」不提交。"
+    )
     lines.append(
         "· ⚠️【接不上就先翻历史】这条要是没头没尾 / 你突然懵了 → "
         "先 `[[[HISTORY|20]]]` 翻上文再回；还接不上就问一句，别硬编。"
     )
     if is_group:
         lines.append(
-            "· 群里可能同时在聊几件事：**只接一个线程**，优先「在叫你」的那条；"
-            "回谁就 @/引用谁，别的线程别混进来、别总结。"
+            "· 群里可能同时在聊几件事：优先「在叫你」的；"
+            "**如果有多条在叫你（⭐ / → 你），用一条回复全部答完**"
+            "（「你问的X…；你问的Y…」），不要一人一条连发（会撞群发送上限）；"
+            "最多 2 条气泡。不相干的线程别混进来、别总结。"
+        )
+        lines.append(
+            "· 被 @ / 喊名字了就不许沉默：看不懂就先 `[[[HISTORY|20]]]` 翻上下文再回；"
+            "真接不上就直说「这个我没看懂，你再说清楚点」。"
+        )
+        lines.append(
+            "· **别点评对话本身**：不写「这是谁和谁说的」「不是跟我说」「你们聊」"
+            "「我插不上话」「系统怎么回」「我心情低」这类旁白/心里话；"
+            "要么接对方说的事，要么沉默。"
         )
     if call:
         lines.append(f"· 称呼他：{call}。")
@@ -2060,7 +2084,7 @@ def _post_rules(key: str, speaker_qq: str = "", gid: str = "") -> str:
     #    这里放在最后（recency 最高）再压一遍，比往前面加规则有效。
     lines.append(
         "· ⚠️【心里话】回复最后必须另起一行写 `[[THINK|你此刻心里那句话]]`"
-        "（15 字内、第一人称、不发出去）。**每条回复都要有**，"
+        "（20 字内、第一人称、不发出去）。**每条回复都要有**，"
         "写了 [[MOOD]] 也不能省掉 THINK。")
     return "\n".join(lines)
 
@@ -2131,7 +2155,10 @@ def _where_section(is_group: bool) -> str:
     gid = str(getattr(ev, "group_id", "") or "")
     mid = str(getattr(ev, "message_id", "") or "")
     uid = str(getattr(ev, "user_id", "") or "")
-    sid = str(getattr(ev, "self_id", "") or "") or str(getattr(bot, "self_id", "") or "")
+    # 这里写**当前真实登录号**（不是人格 ID）：她要调 set_group_card / 点赞时
+    # 填的是 QQ 号，填人格 ID（旧号）会操作失败。记忆/标签另走 services.identity。
+    sid = (str(getattr(ev, "self_id", "") or "")
+           or str(getattr(bot, "self_id", "") or ""))
     if not (gid or mid or uid):
         return ""
     lines = []
@@ -2336,27 +2363,19 @@ def _sticker_protocol() -> str:
 【发表情协议 · 只有你能看见】
 你的表情库里有 {total} 张表情。表情是你说话的一部分，不是装饰。
 
-想发表情时，单独写一行：
-<sticker:标签>
-
+想发表情时，单独写一行：<sticker:标签>
 标签写你**当时的心情词**就行（比如 <sticker:得意洋洋> <sticker:无语> <sticker:吃瓜>），
 系统会帮你匹配最像的那张。常见的可以参考：{tags}
 
-示例 1（群聊，有人讲了个烂笑话）
-哈哈哈 |||<sticker:嘲笑>
-
-示例 2（被问烦了，懒得打字）
-<sticker:无语>
+示例：哈哈哈 |||<sticker:嘲笑>（被问烦了也可以只发 <sticker:无语>）
 
 规则：
 1. 一次回复最多 1 个表情，不要连发。
 2. 你是个爱甩表情的人：大概每 3~4 次回复就该来一个，尤其是情绪明确的时候（想笑、无语、生气、委屈、困、撒娇、吃瓜）。
-3. 群聊短句更自然，表情比文字更省事 —— 情绪到位时宁可只发一个表情，不用配文字。
-4. ⚠️ 用户**明确点了一个词**（「发一张忠诚 / 来张忠诚 / 忠诚标签的表情 / 发表情 忠诚」）时，
-   那个词就是他指定的标签，直接写 <sticker:忠诚>，别自己换成别的情绪词（别发成得意/思考）。
-5. 这一行用户看不到，系统会替你挑一张该标签的图发出去。心情词是自由的，先精确找、再近义找。
-   ⚠️ **只有真的写了 <sticker:标签>、系统回你「没有」之后，才能说「没有这个标签」**；
-   没试过就先试，别凭印象断言 —— 对方自己存过的标签，往往就在库里。
+3. 群聊短句更自然，情绪到位时宁可只发一个表情，不用配文字。
+4. ⚠️ 用户**明确点了一个词**（「发一张忠诚 / 来张忠诚 / 忠诚标签的表情」）时，那个词就是他指定的标签，直接写 <sticker:忠诚>，别自己换成别的情绪词。
+5. 这一行用户看不到，系统会替你挑一张图发出去。心情词是自由的，先精确找、再近义找。
+   ⚠️ **只有真的写了 <sticker:标签>、系统回你「没有」之后，才能说「没有这个标签」**；没试过就先试。
 6. 正经回答问题、被问事实、安慰人的时候不要发表情。
 """
 
@@ -2520,6 +2539,7 @@ async def call_llm(
     media_kind: str = "",
     no_tools: bool = False,
     no_library: bool = False,
+    moon_target_qq: str = "",
 ) -> tuple:
     logger.info(f"[LLM] 开始生成回复 key={key}")
     if BOT_MODE == "mock":
@@ -2534,12 +2554,15 @@ async def call_llm(
     # ================= 写歌任务 =================
     if key.startswith("rap_"):
         msgs = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": text}]
-        headers = {"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"}
-        payload = {"model": XAI_MODEL, "messages": msgs, "temperature": 1.2, "max_tokens": 500}
+        headers = {"Authorization": f"Bearer {ROLEPLAY_API_KEY}",
+                   "Content-Type": "application/json"}
+        payload = {"model": ROLEPLAY_MODEL, "messages": msgs,
+                   "temperature": 1.2, "max_tokens": 500}
         kwargs = {"timeout": 60}
         if PROXY: kwargs["proxy"] = PROXY
         async with httpx.AsyncClient(**kwargs) as client:
-            r = await client.post(f"{XAI_BASE_URL}/chat/completions", headers=headers, json=payload)
+            r = await client.post(f"{ROLEPLAY_BASE_URL}/chat/completions",
+                                  headers=headers, json=payload)
             r.raise_for_status()
             reply = r.json()["choices"][0]["message"]["content"]
         add_memory(key, "user", text)
@@ -2552,9 +2575,27 @@ async def call_llm(
     #    而 add_memory 其实一直在往 histories 写，只是没人读（get_memory 零调用）。
     #    这里在「没有内存队列」时从库里补回来，群聊刚重启时也靠它。
     if not group_context:
-        group_context = _db_history(key, speaker_name, CHAT_HISTORY_TURNS)
-        if group_context:
-            logger.info(f"[LLM] 🧷 从历史库补了 {len(group_context)} 条上下文（{key}）")
+        if str(key).startswith("group"):
+            # 用户 2026-11-23：「上下文一定要收发件人处理过」。
+            # _db_history 读的是当初 build_prompt 拼好的整段（含背景/记忆），
+            # 既没「谁 → 谁」标签，又会把旧背景再灌一遍 —— 群聊不再用它。
+            # 统一从 group_scene（硬逻辑 + 审核 LLM 处理过）补最近 8 条。
+            try:
+                from . import group_scene
+                _gid_b = str(key).split("_", 1)[1] if "_" in str(key) else ""
+                group_context = group_scene.history_lines(
+                    _gid_b, tuning.i("MOOD_JUDGE_CTX"))
+            except Exception as _e:
+                logger.debug(f"[LLM] 群聊现场补上下文失败: {type(_e).__name__}: {_e}")
+                group_context = []
+            if group_context:
+                logger.info(
+                    f"[LLM] 🧷 群聊上下文从处理过的现场补了 "
+                    f"{len(group_context)} 条（{key}）")
+        else:
+            group_context = _db_history(key, speaker_name, CHAT_HISTORY_TURNS)
+            if group_context:
+                logger.info(f"[LLM] 🧷 从历史库补了 {len(group_context)} 条上下文（{key}）")
 
     # ================= 核心：视觉消息 =================
     # 优先用调用方显式传入的 is_vision（chat 按消息段判断），
@@ -2732,10 +2773,8 @@ async def call_llm(
             if speaker_qq and (_vaddressed or not _is_group):
                 _vfocus = profiles.render_card(speaker_qq, _vgid, detail="brief", max_len=220)
                 if _vfocus:
-                    msgs.append({
-                        "role": "system",
-                        "content": "▍这一条在跟你说话的人（回复时按这个来）\n" + _vfocus,
-                    })
+                    # brief 卡自带 ▍名字 标题，不再套第二层（模板去重）
+                    msgs.append({"role": "system", "content": _vfocus})
         except Exception:
             pass
         # 动态规矩（消息号/暂存表情/@失败）放最后：前面全是可以吃缓存的前缀
@@ -2754,6 +2793,15 @@ async def call_llm(
                 })
         except Exception:
             pass
+        # 👇 2026-11-23：真机出现过她把识图结果念出来（`【图片】一只…`、
+        #    `【图片识别结果】…`）。这是最后一层 system（recency 最高），
+        #    明确「描述只给自己看，直接回应内容」；输出层还有 strip_media_echo 兜底。
+        msgs.append({"role": "system", "content": (
+            f"⚠️【这是当前{_dem}】画面描述只给你自己看：不要复述画面、"
+            "不要写「【图片】…」这种格式、不要报颜色/姿势/表情/背景细节。"
+            "图里是题目、截图或文字信息时，直接回答里面的问题/意思，不要念题干；"
+            "其他情况就直接回应图里的内容、情绪或梗。"
+        )})
         msgs.append({"role": "user", "content":
                      f"【这是当前{_dem}，只评论它】\n"
                      f"（群友发了{'段视频' if _is_video else '张图片'}）\n"
@@ -2834,12 +2882,16 @@ async def call_llm(
         # ⚠️ 只注入「最小必要」：当前说话人一行 + 记忆索引一行 + 心情。
         #    档案内容、过往细节、记忆全文都改成按需拉（[[PROFILE]] / [[MEMORY]]），
         #    这样动态区从 ~600 字降到 ~150 字，注意力不被稀释。
+        # ⚠️ 2026-11-23：`relation`（好感底色）以前**从来没进过 prompt** ——
+        #    build_packet 产出了，但这个注入清单里漏了它。
+        #    心情/好感也不再放在这个「早期背景区」：它们对语气影响最大，
+        #    挪到历史之后、当前消息之前（depth 区），注意力更集中。
         for _key in ("yesterday", "lore", "profiles", "memory_index", "revisit",
-                     "library", "mood", "quiet"):
+                     "library", "quiet"):
             if packet.get(_key):
                 msgs.append({"role": "system", "content": packet[_key]})
 
-        if speaker_qq:
+        if speaker_qq and not packet.get("profiles"):
             # 称呼优先（用户 2026-11-18）：档案里约定过的 call_name 优先，
             # 没有才用群名片/昵称。这里以前直接写 speaker_name（群名片），
             # 于是她回复时也照着群名片叫 —— 上下文和回复的称呼就分叉了。
@@ -2866,7 +2918,8 @@ async def call_llm(
                     + ctx_block
                     + "\n\n注意四点：\n"
                       "· **带 ⭐ 的是在叫你**（@ 你 / 喊你名字）—— 这几条是重点，"
-                      "先看清它们在说什么、在问什么。\n"
+                      "先看清它们在说什么、在问什么；**如果有好几条 ⭐ 你还没答，"
+                      "这次要一起照顾到**（可以合成一条，用 `|||` / `<reply:消息号>`）。\n"
                       "· 「这是你之前的回复：」开头的是**你自己刚说过的话**，"
                       "别重复、也别当成别人说的。\n"
                       f"· 上面这 {len(lines)} 条**都不是**你要回的内容。\n"
@@ -2910,10 +2963,10 @@ async def call_llm(
         _meta = packet.get("_meta") or {}
         _focus = str(_meta.get("focus_card") or "").strip()
         if _focus:
-            msgs.append({
-                "role": "system",
-                "content": "▍这一条在跟你说话的人（回复时按这个来）\n" + _focus,
-            })
+            # ⚠️ 不要再套一层「▍这一条在跟你说话的人」：brief 卡自己就带
+            #    `▍名字（QQ…）` 标题，套两层会出现两个同级标题（用户 2026-11-22：
+            #    「模板有很多重复的」）。
+            msgs.append({"role": "system", "content": _focus})
         # 👇 表达学习：这个群 / 这个人怎么说话（学语气，不是知识）。
         #    放在 depth 区（离当前消息最近），但排在人物卡之后 —— 先认人，再调语气。
         try:
@@ -2922,6 +2975,22 @@ async def call_llm(
                 msgs.append({"role": "system", "content": _expr})
         except Exception:
             pass
+        # 🌙 白月光模式：跟这个群她最吃的那个人说话时，多用他的句式/口头禅。
+        #    排在通用表达学习之后（更具体、recency 更高）。
+        try:
+            from . import white_moon
+            _moon_tq = str(moon_target_qq or "").strip()
+            _moon_tn = ""
+            if _moon_tq:
+                try:
+                    _moon_tn = profiles.call_of(_moon_tq, "", _gid) or _moon_tq
+                except Exception:
+                    _moon_tn = _moon_tq
+            _wm = white_moon.render(_gid, _moon_tq, _moon_tn, speaker_name)
+            if _wm:
+                msgs.append({"role": "system", "content": _wm})
+        except Exception as _e:
+            logger.debug(f"[MOON] 注入失败: {type(_e).__name__}: {_e}")
         _lore_post = [str(x).strip() for x in (_meta.get("lore_post") or []) if str(x).strip()]
         if _lore_post:
             msgs.append({
@@ -2931,6 +3000,13 @@ async def call_llm(
 
         if _dyn_proto:
             msgs.append({"role": "system", "content": _dyn_proto})
+
+        # 👇 心情 / 好感放到 depth 区最靠后的位置（2026-11-23 用户：
+        #    「心情和好感并没有关注太多」）。relation = 长期底色，mood = 此刻状态；
+        #    mood 放最后，紧挨 post_rules 和当前消息，recency 最高。
+        for _key in ("relation", "mood"):
+            if packet.get(_key):
+                msgs.append({"role": "system", "content": packet[_key]})
 
         # 👇 post-history：最后一句硬提醒（recency 权重最高，比写在开头有效）
         _post = _post_rules(key, speaker_qq, _gid)
@@ -2960,9 +3036,12 @@ async def call_llm(
     except Exception:
         pass
 
-    # ================= 统一交给 DeepSeek =================
-    logger.info("[LLM] ☁️ 使用 DeepSeek 云端生成最终回复...")
-    headers = {"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"}
+    # ================= 统一交给角色扮演模型 =================
+    # 2026-11-23 用户：角色扮演走 GLM-4-Flash（ROLEPLAY_*），
+    # 三方判读/审核继续走 DeepSeek chat（XAI_*）。
+    logger.info(f"[LLM] ☁️ 使用角色扮演模型 {ROLEPLAY_MODEL} 生成最终回复...")
+    headers = {"Authorization": f"Bearer {ROLEPLAY_API_KEY}",
+               "Content-Type": "application/json"}
     kwargs = {"timeout": 60}
     if PROXY: kwargs["proxy"] = PROXY
 
@@ -3032,7 +3111,7 @@ async def call_llm(
         async with httpx.AsyncClient(**kwargs) as client:
             for _turn in range(MAX_TOOL_TURNS):
                 payload = {
-                    "model": XAI_MODEL,
+                    "model": ROLEPLAY_MODEL,
                     "messages": msgs,
                     "temperature": 1.0,
                     "max_tokens": 800,
@@ -3045,7 +3124,7 @@ async def call_llm(
                         if _force_silent else "auto"
                     )
 
-                r = await client.post(f"{XAI_BASE_URL}/chat/completions",
+                r = await client.post(f"{ROLEPLAY_BASE_URL}/chat/completions",
                                       headers=headers, json=payload)
                 r.raise_for_status()
                 _j = r.json()
@@ -3068,16 +3147,20 @@ async def call_llm(
                 #    她问「今天用了多少」时由 api_usage 工具读这个。
                 if _u:
                     try:
-                        from . import api_usage as _au
-                        _au.note_usage(
-                            prompt=int(_u.get("prompt_tokens") or 0) or (_hit + _miss),
-                            completion=int(_u.get("completion_tokens") or 0),
-                            cache_hit=_hit, model=XAI_MODEL)
+                        # api_usage 只记 DeepSeek 余额；角色扮演换成 GLM 后不再混进去
+                        if "deepseek" in ROLEPLAY_BASE_URL.lower():
+                            from . import api_usage as _au
+                            _au.note_usage(
+                                prompt=int(_u.get("prompt_tokens") or 0) or (_hit + _miss),
+                                completion=int(_u.get("completion_tokens") or 0),
+                                cache_hit=_hit, model=ROLEPLAY_MODEL)
                         try:
                             from . import llm_usage as _lu
                             _lu.record_from_response(
                                 _j, purpose=("tool_loop" if _turn else "chat"),
-                                provider="xai", model=XAI_MODEL,
+                                provider=("deepseek" if "deepseek" in ROLEPLAY_BASE_URL.lower()
+                                          else "glm"),
+                                model=ROLEPLAY_MODEL,
                                 session=key, turn_id=str(TOOL_CTX.get("turn_id") or ""))
                         except Exception:
                             pass

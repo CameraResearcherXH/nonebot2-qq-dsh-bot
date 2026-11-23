@@ -1,0 +1,148 @@
+from json import loads as json_loads
+from pathlib import Path
+from typing import Any
+
+from typing_extensions import override
+
+from ..constants import COPYSEEKER_CONSTANTS
+from ..model import CopyseekerResponse
+from ..utils import read_file
+from .base import BaseSearchEngine
+
+COPYSEEKER_SEARCH_ENDPOINT = "reverse-image-search"
+
+
+def _parse_action_response(response_text: str) -> dict[str, Any]:
+    """Extract the first JSON payload from a Next.js action response."""
+    for line in response_text.splitlines():
+        line = line.strip()
+        if line.startswith("1:{"):
+            return json_loads(line[2:])
+
+    return {}
+
+
+class Copyseeker(BaseSearchEngine[CopyseekerResponse]):
+    """API client for the Copyseeker image search engine.
+
+    Used for performing reverse image searches using Copyseeker service.
+
+    Attributes:
+        base_url (str): The base URL for Copyseeker searches.
+    """
+
+    def __init__(self, base_url: str = "https://copyseeker.net", **request_kwargs: Any):
+        """Initializes a Copyseeker API client.
+
+        Args:
+            base_url (str): The base URL for Copyseeker searches.
+            **request_kwargs (Any): Additional arguments for network requests.
+        """
+        super().__init__(base_url, **request_kwargs)
+
+    async def _get_discovery_id(self, url: str | None = None, file: str | bytes | Path | None = None) -> str | None:
+        """Retrieves a discovery ID from Copyseeker for image search.
+
+        This method handles two search scenarios:
+            1. Search by image URL
+            2. Search by uploading a local image file
+
+        Args:
+            url (Optional[str]): URL of the image to search.
+            file (Union[str, bytes, Path, None]): Local image file, can be a path string, bytes data, or Path object.
+
+        Returns:
+            Optional[str]: The discovery ID if successful, None otherwise.
+
+        Note:
+            - The discovery ID is required for retrieving search results.
+        """
+
+        headers = {"content-type": "text/plain;charset=UTF-8", "next-action": COPYSEEKER_CONSTANTS["SET_COOKIE_TOKEN"]}
+
+        # Set cookie token
+        await self._send_request(
+            method="post",
+            endpoint=COPYSEEKER_SEARCH_ENDPOINT,
+            headers=headers,
+            data="[]",
+        )
+
+        if url:
+            data = [{"discoveryType": "ReverseImageSearch", "imageUrl": url}]
+            headers = {"next-action": COPYSEEKER_CONSTANTS["URL_SEARCH_TOKEN"]}
+            resp = await self._send_request(
+                method="post",
+                endpoint=COPYSEEKER_SEARCH_ENDPOINT,
+                headers=headers,
+                json=data,
+            )
+        elif file:
+            files = {
+                "_1_file": ("image.jpg", read_file(file), "image/jpeg"),
+                "_1_discoveryType": (None, "ReverseImageSearch"),
+                "0": (None, '["$K1"]'),
+            }
+            headers = {"next-action": COPYSEEKER_CONSTANTS["FILE_UPLOAD_TOKEN"]}
+            resp = await self._send_request(
+                method="post",
+                endpoint=COPYSEEKER_SEARCH_ENDPOINT,
+                headers=headers,
+                files=files,
+            )
+        else:
+            return None
+
+        return _parse_action_response(resp.text).get("discoveryId")
+
+    @override
+    async def search(
+        self,
+        url: str | None = None,
+        file: str | bytes | Path | None = None,
+        **kwargs: Any,
+    ) -> CopyseekerResponse:
+        """Performs a reverse image search on Copyseeker.
+
+        This method supports two ways of searching:
+            1. Search by image URL
+            2. Search by uploading a local image file
+
+        The search process involves two steps:
+            1. Obtaining a discovery ID
+            2. Retrieving search results using the discovery ID
+
+        Args:
+            url (Optional[str]): URL of the image to search.
+            file (Union[str, bytes, Path, None]): Local image file, can be a path string, bytes data, or Path object.
+            **kwargs (Any): Additional arguments passed to the parent class.
+
+        Returns:
+            CopyseekerResponse: An object containing search results and metadata.
+                Returns an empty response if discovery ID cannot be obtained.
+
+        Raises:
+            ValueError: If neither `url` nor `file` is provided.
+
+        Note:
+            - Only one of `url` or `file` should be provided.
+            - The search process involves multiple HTTP requests to Copyseeker's API.
+        """
+        if not url and not file:
+            raise ValueError("Either 'url' or 'file' must be provided")
+
+        discovery_id = await self._get_discovery_id(url, file)
+        if discovery_id is None:
+            return CopyseekerResponse({}, "")
+
+        data = [{"discoveryId": discovery_id, "hasBlocker": False}]
+        headers = {"next-action": COPYSEEKER_CONSTANTS["GET_RESULTS_TOKEN"]}
+
+        resp = await self._send_request(
+            method="post",
+            endpoint="discovery",
+            headers=headers,
+            json=data,
+        )
+
+        return CopyseekerResponse(_parse_action_response(resp.text), resp.url)

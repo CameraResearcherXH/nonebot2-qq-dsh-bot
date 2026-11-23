@@ -79,6 +79,13 @@ def note_message(gid: str, qq: str) -> bool:
     qq = str(qq or "").strip()
     if not gid or not qq.isdigit():
         return False
+    # 她自己的号（当前号 / 历史号）不建档案：换号后旧号不该变成「陌生群友」
+    try:
+        from services import identity as _identity
+        if _identity.is_self(qq):
+            return False
+    except Exception:
+        pass
     d = _load()
     g = d.setdefault(gid, {})
     rec = g.setdefault(qq, {"n": 0, "at": 0})

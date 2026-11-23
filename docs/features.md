@@ -206,3 +206,44 @@
 python3 scripts/check_tuning.py --strict
 python3 scripts/dump_tuning.py --write   # 重新生成 docs/tuning.md
 ```
+
+---
+
+## 12. 白月光（2026-11-23 新增）
+
+- **是什么**：统计**群友之间**「谁最常 @ / 引用 / 接谁的话」，得到每个人的白月光 + 群白月光；
+  她回某个人时借那个人的句式/口头禅，回大家时用群白月光。
+- **怎么用**：自动；`/测函数 白月光 [群号]` 查看。
+- **代码**：`services/white_moon.py`、`services/llm.py`（`white_moon.render`）
+- **配置**：`WHITE_MOON_MODE`、`WHITE_MOON_MIN_SCORE`、`WHITE_MOON_STYLE_ITEMS`、`WHITE_MOON_STYLE_TTL`
+- **说明**：[whitemoon.md](whitemoon.md)
+
+## 13. 用量查看与 prompt 体检（2026-11-23 增强）
+
+- **是什么**：按用途拆 token、缓存命中率、Top/Bottom，并出横向柱状 + 扇形图；
+  `/测函数 prompt` 给出 prompt 各段占比、块内位置、缓存报告。
+- **怎么用**：`/用量`（带图）、`/用量 文字`、`/测函数 用量`、`/测函数 prompt [文字]`。
+- **代码**：`services/llm_usage.py`、`services/usage_chart.py`、`services/prompt_report.py`
+- **说明**：[usage-report.md](usage-report.md)
+
+## 14. 以图搜源（三方插件，2026-11-22）
+
+- **是什么**：给一张图片链接，聚合 TraceMoe / SauceNAO / Ascii2D / IQDB 查出处。
+- **怎么用**：模型自动调 `picsearch` 工具；也可以 `/以图搜源 <图片>`。
+- **代码**：`plugins/third/picsearch/`、`vendor/PicImageSearch/`、`services/picsearch_tool.py`
+- **接入方式**：`plugin.toml` 声明 `[[tools]]`（详见 [third-party-integration.md](third-party-integration.md)）
+
+## 15. 人格 ID：换号不丢记忆（2026-11-23 新增）
+
+- **是什么**：`SELF_ID` 固定「她是谁」，`NAPCAT_ACCOUNT` 是当前登录号，
+  `SELF_ALIASES` 是历史号；旧号说过的话、@ 旧号的记录仍算「她」。
+- **怎么用**：换号只改 `NAPCAT_ACCOUNT`，**不要改 `SELF_ID`**；旧号追加到 `SELF_ALIASES`。
+- **代码**：`services/identity.py`
+- **说明**：[memory-profile-design.md](memory-profile-design.md#21-人格-id换号不丢记忆)
+
+## 16. 戳一戳次数屏蔽（2026-11-23 新增）
+
+- **是什么**：同一个人 2 小时内戳超过 3 次 → 第 4 次起不回、也不戳回，只记上下文；
+  滑动窗口，2 小时后自动恢复。
+- **怎么用**：自动；阈值 `POKE_MAX_PER_WINDOW` / `POKE_WINDOW_HOURS`。
+- **代码**：`services/poke_guard.py`、`plugins/chat/__init__.py`

@@ -279,8 +279,8 @@ SCENE 12、PROACTIVE 11、STICKER 9、GROUP 8、TRACE 8、PEER 8、SELF 8、GLM 
 data/mood.json
 ├─ global: {value -100..100, label, judge{word,value,mind,affinity,why}}
 └─ sessions: {
-     "group_[REDACTED_NUMBER]": {value, label, judge, updated_at},   ← 一个群一个心情
-     "private_[REDACTED_NUMBER]": {value, label, judge, updated_at}  ← 一个人一个心情
+     "group_100000017": {value, label, judge, updated_at},   ← 一个群一个心情
+     "private_100000003": {value, label, judge, updated_at}  ← 一个人一个心情
    }
    半衰期 12h；GLOBAL_SHARE=0.35（会话值向全局混合）
 

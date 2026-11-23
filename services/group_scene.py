@@ -23,6 +23,8 @@ import re
 import time
 from collections import OrderedDict
 
+from services import identity as _identity
+
 try:
     from nonebot import logger
 except Exception:  # pragma: no cover
@@ -63,8 +65,40 @@ _NAMES: dict = {}         # gid -> (ts, {name: qq})
 _SUMMARY: dict = {}       # gid -> {text, at, until_mid}（审核 LLM 给的滚动总结）
 _SEEDED: dict = {}        # gid -> 上次尝试补现场的时间（失败也限流，别每次都读盘）
 _SEED_N: dict = {}        # gid -> 上一次补回来几条（卡片/自检要显示）
-_BOT_QQ: dict = {}        # gid -> 她自己的 QQ（补现场时判「这句是不是她说的」）
+_BOT_QQ: dict = {}        # gid -> 她当前登录的 QQ（历史号见 services.identity.accounts）
 _SEQ = 0
+
+
+def _is_bot_qq(qq, bot_qq: str = "") -> bool:
+    """这个 QQ 是不是她自己。
+
+    2026-11-23 换号后：只认「当前登录号」不够 —— 旧号 100000018 的发言
+    还在现场/日志里，会被当成陌生群友。所以任何登录过的号都算
+    （services.identity 维护 accounts 别名表）。
+    """
+    q = str(qq or "").strip()
+    if not q:
+        return False
+    if bot_qq and q == str(bot_qq):
+        return True
+    try:
+        return _identity.is_self(q)
+    except Exception:
+        return False
+
+
+def _self_id() -> str:
+    try:
+        return _identity.canonical()
+    except Exception:
+        return ""
+
+
+def _to_is_bot(m: dict, bot_qq: str = "") -> bool:
+    """这条消息的收件人是不是她（当前号 + 历史号都算）。"""
+    if str((m or {}).get("to_kind") or "") == "bot":
+        return True
+    return _is_bot_qq((m or {}).get("to_qq"), bot_qq)
 
 
 def _now() -> float:
@@ -238,7 +272,7 @@ SCENE_WINDOW = tuning.i("SCENE_WINDOW_MSGS")
 
 # 冲人短句（「找打了」「欠揍」「你完了」）：在群里通常不是回上一句，
 # 而是冲**最近被提到 / 被吐槽的那个人**。用户 2026-11-19 真机：
-# 肥舞「找打了」其实是对「肥鱼」说的，硬逻辑和审核都判成了紧挨着的上一句。
+# 老王「找打了」其实是对「肥鱼」说的，硬逻辑和审核都判成了紧挨着的上一句。
 _SHORT_JAB_MAX = 12
 
 
@@ -257,7 +291,7 @@ def _recent_mentioned(gid: str, qq: str, nmap: dict, bot_qq: str = "",
             continue
         q, n = _guess_addressee(str(m.get("text") or ""),
                                 str(m.get("qq") or ""), nmap)
-        if q and q not in (str(bot_qq), str(qq)):
+        if q and not _is_bot_qq(q, bot_qq) and q != str(qq):
             return q, n
     return "", ""
 
@@ -359,9 +393,11 @@ def _infer_addressee(gid: str, qq: str, text: str, prev: dict,
     """
     explicit_qq = str(explicit_qq or "")
     if explicit_qq:
-        if bot_qq and explicit_qq == str(bot_qq):
-            return {"to_qq": explicit_qq, "to_name": "你", "to_kind": "bot",
-                    "to_conf": 0.99, "to_reason": explicit_reason or "at"}
+        if _is_bot_qq(explicit_qq, bot_qq):
+            # 不管 @ 的是当前号还是历史号，收件人统一记成人格 ID
+            return {"to_qq": _self_id() or explicit_qq, "to_name": "你",
+                    "to_kind": "bot", "to_conf": 0.99,
+                    "to_reason": explicit_reason or "at"}
         nm = ""
         for _nm, _q in nmap.items():
             if str(_q) == explicit_qq:
@@ -453,7 +489,7 @@ def _weak_candidates(gid: str, qq: str, text: str) -> list:
             s += min(0.35, ov * 0.8)
             reasons.append("topic")
         # 这条线程的上一句就是群里最后一句 → 大概率在接它。
-        # 交错发言时这是最可靠的信号（用户 2026-11-19：夹竹桃连说几句，
+        # 交错发言时这是最可靠的信号（用户 2026-11-19：阿明连说几句，
         # 喵插一句「好噢~」，光看字面重合度判不出来）
         if _gap_since(gid, t) == 0:
             # 0.5：单独就够到「接这条线」的门槛。交错发言时它比字面重合度可靠得多
@@ -491,6 +527,12 @@ def observe(gid: str, *, mid: str = "", qq: str = "", name: str = "",
         remember_bot(gid, bot_qq)
     ts = float(ts or 0) or _now()
     qq = str(qq or "")
+    # 她自己说的话：不管来自哪个登录号，统一记成人格 ID（换号后日志能连上）
+    if is_bot:
+        qq = _identity.canon(qq) or qq
+    elif qq and _is_bot_qq(qq, bot_qq):
+        is_bot = True
+        qq = _identity.canon(qq) or qq
     name = str(name or qq)
     text = str(text or "").strip()
     # 有些适配器/回显事件没有 message_id；没有 id 审核结果就映射不回来。
@@ -532,7 +574,7 @@ def observe(gid: str, *, mid: str = "", qq: str = "", name: str = "",
             # ② 先看「是不是在接着自己上一条说」：
             #    同一个人的连续发言，不该被算成在回别人
             # ⚠️ 必须「自己那条就是群里最后一条」才算自我延续。
-            #    以前用「60 秒内」判断：夹竹桃连说 5 句、喵插一句「好噢~」，
+            #    以前用「60 秒内」判断：阿明连说 5 句、喵插一句「好噢~」，
             #    因为整段才 20 秒，喵被判定成「接着自己上一条说」，
             #    结果同一场对话被拆成两条线程（用户 2026-11-19 实测）。
             own_last = [
@@ -628,7 +670,7 @@ def observe(gid: str, *, mid: str = "", qq: str = "", name: str = "",
         to_conf = 0.0
     to_reason = str(inf.get("to_reason") or "")
     if to_qq and not to_name:
-        if bot_qq and str(to_qq) == str(bot_qq):
+        if _is_bot_qq(to_qq, bot_qq):
             to_name = "你"
         else:
             for _nm, _q in nmap.items():
@@ -695,6 +737,37 @@ def observe(gid: str, *, mid: str = "", qq: str = "", name: str = "",
 
 def last(gid: str) -> dict:
     return dict(_LAST.get(str(gid)) or {})
+
+
+def find_by_mid(gid: str, mid: str) -> dict:
+    """按消息号找现场里的那条（白月光统计：她引用的是谁）。"""
+    mid = str(mid or "").strip()
+    if not mid:
+        return {}
+    for t in _THREADS.get(str(gid), []):
+        for m in (t.get("msgs") or []):
+            if str(m.get("mid") or "") == mid:
+                return dict(m)
+    return {}
+
+
+def qq_of_name(gid: str, name: str) -> str:
+    """名字 / 群名片 → QQ（白月光统计：她 @ 的是谁）。"""
+    name = str(name or "").strip()
+    if not name:
+        return ""
+    _, mp = _NAMES.get(str(gid), (0.0, {}))
+    if not mp:
+        return ""
+    if name in mp:
+        return str(mp[name])
+    # 「老大(9746)」vs「老大」：允许前缀/后缀匹配，取最长的那个
+    best = ""
+    for n, q in mp.items():
+        if n and (n.startswith(name) or name.startswith(n)):
+            if len(n) > len(best):
+                best = n
+    return str(mp.get(best) or "")
 
 
 def replay(gid: str, rows, *, bot_qq: str = "", names=None,
@@ -813,7 +886,7 @@ def snapshot(gid: str, *, bot_qq: str = "", my_names=None,
                 conf = float(m.get("to_conf") or 0)
             except Exception:
                 conf = 0.0
-            if kind == "bot" or (bot_qq and m.get("to_qq") == bot_qq):
+            if _to_is_bot(m, bot_qq):
                 to = "你"
             elif kind == "person" and to:
                 # 推断出来的收件人标「推断」，别让模型当成确定事实
@@ -828,7 +901,7 @@ def snapshot(gid: str, *, bot_qq: str = "", my_names=None,
             body = str(m.get("text") or "").strip()
             if body:
                 lines.append(f"  {who}{arrow}：{body[:70]}")
-            if (kind == "bot" or (bot_qq and m.get("to_qq") == bot_qq)) or (
+            if _to_is_bot(m, bot_qq) or (
                 not m.get("is_bot") and any(n and n in body for n in names)
             ):
                 to_bot.append({
@@ -892,9 +965,12 @@ def format_block(snap: dict, *, limit_threads: int = 3) -> str:
         for x in to_bot:
             lines.append(f"  · {x.get('ago')} {x.get('name')}：{x.get('text')}")
     lines.append(
-        "（只接**一个**线程：优先「在叫你」；其次最近有人提问/有情绪的线程。"
-        "没点名的消息先看【上一句】是不是在接它 —— 标了「推断」的收件人不是确定的，"
-        "拿不准就当对大家说。回的时候说清你在回谁；别的线程别混进来、别总结。）"
+        "（优先接「在叫你」；**如果【在叫你】里有多条，每一条都要回应**——"
+        "可以合成一条回复，用 `|||` 分条、每条用 `<reply:消息号>` 引对应那句，"
+        "别只挑最后一条。"
+        "其次接最近有人提问/有情绪的线程；没点名的消息先看【上一句】是不是在接它 —— "
+        "标了「推断」的收件人不是确定的，拿不准就当对大家说。"
+        "回的时候说清你在回谁；不相干的线程别混进来、别总结。）"
     )
     sm = snap.get("summary") or {}
     if sm.get("text"):
@@ -916,7 +992,7 @@ def addressee_line(gid: str, bot_qq: str = "") -> str:
         conf = float(m.get("to_conf") or 0)
     except Exception:
         conf = 0.0
-    if kind == "bot" or (to_qq and to_qq == str(bot_qq)):
+    if kind == "bot" or _is_bot_qq(to_qq, bot_qq):
         s = f"· 这条是 {who} → 你（在跟你说话）"
     elif kind == "person" and to_qq:
         if conf >= 0.8:
@@ -961,10 +1037,18 @@ def clear(gid: str) -> None:
 
 # ============================ 重启补现场（读盘） ============================ #
 def remember_bot(gid: str, bot_qq: str) -> None:
-    """记住「她在这个群的 QQ」，补现场时才知道哪句是她自己说的。"""
+    """记住「她在这个群的 QQ」，补现场时才知道哪句是她自己说的。
+
+    2026-11-23：顺手把这个号登记进人格别名表 —— 换号后旧号的发言
+    仍然算「她说的」，不会被当成陌生群友建档案/算白月光。
+    """
     gid, bot_qq = str(gid or "").strip(), str(bot_qq or "").strip()
     if gid and bot_qq:
         _BOT_QQ[gid] = bot_qq
+        try:
+            _identity.note_account(bot_qq)
+        except Exception:
+            pass
 
 
 def _drop_threads(gid: str) -> None:
@@ -1044,7 +1128,8 @@ def seed_from_log(gid: str, *, bot_qq: str = "", limit: int = 0,
         mid = f"log-{int(ts * 1000)}-{qq}-{_i}"
         if _find_by_mid(gid, mid) is not None:      # 同一条已经在现场里了
             continue
-        is_bot = str(r.get("kind") or "") == "bot"
+        is_bot = (str(r.get("kind") or "") == "bot"
+                  or _is_bot_qq(qq, bot_qq))
         # 日志里的 who 是「阿明(1135)」这种带 QQ 尾巴的标签，卡片/审核都得去掉
         name = "你" if is_bot else re.sub(
             r"[（(]\d{2,}[)）]\s*$", "", str(r.get("who") or "")).strip()
@@ -1163,7 +1248,7 @@ def image_target(gid: str, sender_qq: str, at_qqs=None, bot_qq: str = "",
     gid = str(gid or "")
     at = [str(x) for x in (at_qqs or []) if str(x)]
     nm = names or {}
-    if bot_qq and bot_qq in at:
+    if any(_is_bot_qq(x, bot_qq) for x in at):
         return "bot", "你", "这条 @ 了你"
     if at:
         who = str(nm.get(at[0]) or at[0])
@@ -1192,6 +1277,66 @@ def recent_messages(gid: str, limit: int = 20, window: float = 0.0) -> list:
     """
     _ensure_seeded(gid)
     return _rows(gid, limit, window)
+
+
+def history_lines(gid: str, n: int = 8, *, width: int = 160,
+                  exclude_mids=(), exclude_texts=()) -> list:
+    """**处理过的历史**：带收发件人的最近 n 条（判心情 / 角色扮演 / 翻历史 共用）。
+
+    用户 2026-11-22：
+      「收发标签处理消息后给 LLM 判心情顺便给 LLM 做上下文……
+        上下文不用直接从 napcat 拉了。包括拉过去未来也是标签处理过的历史。
+        等于 pending + 上下文 + 拉取前后文消息合为一个块，前置链路是收发件人标签链路。」
+
+    所以这里是唯一出口：现场里的每条消息都已经过硬逻辑 + 审核 LLM 的「谁 → 谁」，
+    谁要用历史（主模型上下文、三方判心情、HISTORY 工具、/测函数 分段）都读它，
+    不再各自去 recent_group_msgs / dialogue_log / napcat 各拉一份。
+    """
+    gid = str(gid or "").strip()
+    if not gid:
+        return []
+    _ex = {str(x) for x in (exclude_mids or ()) if str(x or "").strip()}
+    # 兜底：有些适配器事件没有 message_id（mid 为空）→ 再按 (qq, 文本前缀) 排除，
+    # 否则「当前这一段」会在历史块里再出现一遍（用户 2026-11-22：模板重复）。
+    _ex_txt = {str(x) for x in (exclude_texts or ()) if str(x or "").strip()}
+    try:
+        # 多取一些，过滤掉「当前这一段」后仍然凑够 n 条
+        rows = recent_messages(gid, max(1, int(n)) + len(_ex) + len(_ex_txt))
+    except Exception:
+        return []
+    out = []
+    for m in rows:
+        txt = re.sub(r"\s+", " ", str(m.get("text") or "")).strip()
+        if not txt:
+            continue
+        if m.get("is_bot"):
+            out.append(f"你 → 大家: {txt[:width]}")
+            continue
+        _mid = str(m.get("mid") or "")
+        _key = f"{m.get('qq') or ''}|{str(m.get('text') or '')[:40]}"
+        if (_ex and _mid and _mid in _ex) or (_ex_txt and _key in _ex_txt):
+            # 已经在「当前这一段」里了 → 历史里不要再出现一遍
+            continue
+        who = str(m.get("name") or m.get("qq") or "?")
+        kind = str(m.get("to_kind") or "").strip().lower()
+        nm = re.sub(r"[(（]\s*\d{3,}\s*[)）]$", "", str(m.get("to_name") or "")).strip()
+        try:
+            conf = float(m.get("to_conf") or 0.0)
+        except Exception:
+            conf = 0.0
+        if kind == "bot":
+            to = "你"
+        elif kind == "person" and nm:
+            to = nm if conf >= 0.5 else f"大概{nm}"
+        elif kind == "unknown" and nm:
+            to = f"{nm}?"
+        else:
+            to = "大家"
+        # ⭐ 和 prompt 里「带 ⭐ 的是在叫你」对齐（2026-11-23）：
+        # 以前只写「→ 你」不打 ⭐，而规矩让模型找 ⭐ → 她根本找不到重点。
+        _star = "⭐" if to == "你" else ""
+        out.append(f"{_star}{who} → {to}: {txt[:width]}")
+    return out[-max(1, int(n)):]
 
 
 def needs_audit(gid: str, limit: int = 20) -> list:
@@ -1316,7 +1461,10 @@ def apply_audit(gid: str, results, names: dict = None, bot_qq: str = "",
                 m["audit_note"] = f"llm:{to}（对不上人）"
                 notes.append(f"「{to}」对不上人")
                 continue
-            kind = "bot" if (bot_qq and qq == str(bot_qq)) else "person"
+            if _is_bot_qq(qq, bot_qq):
+                kind, qq = "bot", _self_id() or qq
+            else:
+                kind = "person"
             name, conf = to, 0.85
 
         # 强证据（@/引用）不推翻

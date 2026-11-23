@@ -36,7 +36,8 @@ CORE_SKILLS = frozenset({
 # 分组：/技能 关 搜索  → 关掉整组
 # ⚠️ 名字必须和 register_tool 里的 "name" 完全一致，否则关了没效果。
 SKILL_GROUPS = {
-    "search": {"web_search", "bilibili_search", "pixiv_search", "trace_moe"},
+    "search": {"web_search", "bilibili_search", "pixiv_search", "trace_moe",
+               "hash_decode", "web_fetch"},
     "draw": {"draw_image", "draw_from_pixiv", "draw", "comfy_workflow"},
     "media": {"sing", "video_understand", "tts", "song", "cover", "rvc",
               "audio_split"},

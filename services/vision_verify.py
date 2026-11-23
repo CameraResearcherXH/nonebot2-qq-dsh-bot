@@ -38,6 +38,33 @@ VERIFY_SEARCH_CHARS = 1500                                     # 喂给裁决的
 # ---- trace.moe：动漫截图「以图搜番」，免费、免 key ----
 # 这是「直接对上人物」的唯一可靠办法：VLM 只能猜，它是拿画面去比对帧库。
 TRACE_MOE = os.getenv("TRACE_MOE", "true").lower() == "true"
+# 👇 2026-11-22：识图除了 trace.moe，还要给角色扮演模型一份「搜图源」证据
+#    （SauceNAO / Ascii2D / IQDB）。用户的设计：
+#    「看到图 → 同时给搜图源和识图 LLM → 两边的结果（画面描述 + 出处/角色）一起总结回复」。
+#    和视觉模型并行跑，不额外等；失败/超时静默跳过。
+EXTRA_SEARCH = os.getenv("VISION_EXTRA_SEARCH", "true").lower() == "true"
+
+
+# 默认只跑快的两个：SauceNAO（插画/网图，最好配 key）+ Ascii2D。
+# ⚠️ IQDB 实测一次要 40s+，会拖住图片回复 —— 想用就自己加：
+#      VISION_EXTRA_ENGINES=saucenao,ascii2d,iqdb
+EXTRA_ENGINES = tuple(
+    x.strip().lower() for x in
+    (os.getenv("VISION_EXTRA_ENGINES", "saucenao,ascii2d") or "").split(",")
+    if x.strip())
+
+
+async def _extra_sources(image_bytes: bytes, timeout: float = 8.0) -> list:
+    """SauceNAO / Ascii2D 并行搜（trace.moe 已经单独跑过，不重复）。"""
+    if not EXTRA_ENGINES:
+        return []
+    try:
+        from . import image_search
+        return await image_search.search(
+            image_bytes, engines=EXTRA_ENGINES, timeout=timeout) or []
+    except Exception as e:
+        logger.debug(f"[VISION] 多源搜图失败（忽略）: {type(e).__name__}: {e}")
+        return []
 # ⚠️ 2026-11-19 放宽（用户：「用了一个月没有一次认出一张图」）：
 #    旧规则是「相似度 ≥0.85 + 前 8 条里同一部 ≥3 票且占比 ≥60%」，
 #    两条同时满足才算命中。实测一张 B 站截图（带字幕/弹幕/边框）：
@@ -494,24 +521,14 @@ async def trace_moe(image_bytes: bytes, timeout: float = 25) -> dict:
     if not _allow_trace():
         return {}
     try:
-        import httpx
-        async with httpx.AsyncClient(timeout=timeout) as c:
-            r = await c.post(
-                TRACE_MOE_URL,
-                params={"anilistInfo": "true", "cutBorders": "true"},
-                files={"image": ("frame.jpg", image_bytes, "image/jpeg")},
-            )
-        if r.status_code != 200:
-            logger.warning(f"[VISION] trace.moe HTTP {r.status_code}: {r.text[:120]}")
-            return {}
-        data = r.json()
-        try:
-            from . import llm_usage as _lu
-            _lu.record_from_response(data, purpose="vision")
-        except Exception:
-            pass
+        # 2026-11-22：统一走 PicImageSearch 的 TraceMoe，不再自己拼 HTTP。
+        # 以后要加 SauceNAO / ascii2d 综合搜，也只需要改 services/image_search.py。
+        from . import image_search
+        data = await image_search.trace_moe_raw(image_bytes, timeout=timeout)
     except Exception as e:
         logger.warning(f"[VISION] trace.moe 异常: {type(e).__name__}: {e}")
+        return {}
+    if not data:
         return {}
 
     if data.get("error"):
@@ -1017,6 +1034,15 @@ async def recognize(image_bytes: bytes, vl_call, *, url: str = "", hint: str = "
     if hint:
         prompt += f"\n\n（发送者发这张图时说的话，可能相关也可能无关，仅供线索：{hint[:120]}）"
 
+    # 👇 多源搜图和视觉模型**并行**：不额外等，失败也不影响识图
+    _extra_task = None
+    if EXTRA_SEARCH:
+        try:
+            import asyncio as _aio
+            _extra_task = _aio.create_task(_extra_sources(image_bytes))
+        except Exception:
+            _extra_task = None
+
     qwen_raw = ""
     try:
         # max_tokens 220 → 400：多了「类型」「文字」两行，文字行最多 150 字，
@@ -1063,6 +1089,17 @@ async def recognize(image_bytes: bytes, vl_call, *, url: str = "", hint: str = "
                     qwen["scene"] = _sum
                 if isinstance(glm_parsed, dict) and glm_parsed:
                     glm_parsed["scene"] = _sum
+
+    extra = []
+    if _extra_task is not None:
+        try:
+            import asyncio as _aio
+            extra = await _aio.wait_for(_extra_task, timeout=10)
+        except Exception as e:
+            logger.debug(f"[VISION] 多源搜图超时/失败（忽略）: {type(e).__name__}: {e}")
+            extra = []
+    if extra:
+        sources["picsearch"] = extra
 
     if qwen:
         sources["qwen"] = qwen
@@ -1175,6 +1212,21 @@ async def recognize(image_bytes: bytes, vl_call, *, url: str = "", hint: str = "
         )
     elif TRACE_MOE:
         lines.append("trace.moe：没有可靠命中（不是动漫截图，或结果太分散）")
+    if extra:
+        _es = []
+        for _r in extra[:4]:
+            _bits = [f"[{_r.get('engine')}]", str(_r.get("title") or "（无标题）")]
+            _sim = _r.get("similarity") or 0
+            if _sim:
+                _bits.append(f"相似度 {float(_sim):.0f}%")
+            if _r.get("author"):
+                _bits.append(f"作者 {_r['author']}")
+            if (_r.get("extra") or {}).get("episode"):
+                _bits.append(f"第 {_r['extra']['episode']} 集")
+            _es.append("- " + "｜".join(_bits))
+        lines.append("搜图源（SauceNAO / Ascii2D / IQDB）：\n" + "\n".join(_es)
+                     + "\n（和画面描述冲突时**以画面为准**；相似度低就只当线索，"
+                       "别当事实讲。）")
     if v:
         lines.append(
             f"联网核验：{v.get('verdict') or '未核验'}"

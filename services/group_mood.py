@@ -35,6 +35,8 @@ PERSON_DROP = tuning.f("GROUP_MOOD_PERSON_DROP")
 GROUP_DROP = tuning.f("GROUP_MOOD_GROUP_DROP")
 MIN_PEOPLE = tuning.i("GROUP_MOOD_MIN_PEOPLE")
 MIN_DELTA = tuning.f("GROUP_MOOD_MIN_DELTA")
+# 单条事件上限：一次判读最多按 ±0.2 记（否则十句无聊吐槽就能把 5 小时净变化刷到 -2）
+MAX_DELTA = tuning.f("GROUP_MOOD_MAX_DELTA")
 LIKE_MIN = tuning.f("GROUP_MOOD_LIKE_MIN")
 MAX_EVENTS = tuning.i("GROUP_MOOD_MAX_EVENTS")
 CHAT_MIN = tuning.f("GROUP_MOOD_CHAT_MIN")
@@ -122,6 +124,8 @@ def record(session_key: str, delta: float, *, about_qq: str = "",
         return {}
     if not gid or abs(d) < MIN_DELTA:
         return {}
+    # 单条事件夹在 ±MAX_DELTA：判读给多大都只按这个上限记
+    d = max(-MAX_DELTA, min(MAX_DELTA, d))
     cause = str(cause or "").strip().lower()
     if cause == "self":
         return {}
@@ -214,12 +218,18 @@ def snapshot(session_key: str, *, window_sec: float = 0) -> dict:
         else:
             p["neg"] += d
 
+    # ⚠️ 2026-11-22：净变化必须封顶在 ±1（和「心情是 -1~1」同一口径）。
+    #   以前是纯求和 → 5 小时能到 -2.28，阈值（0.7）就永远满足，
+    #   整群判定/多说话乘数全被拉到底。原始值另存 raw_* 给诊断看。
+    net_raw = net
     for p in people.values():
-        p["net"] = round(p["net"], 3)
+        p["net_raw"] = round(p["net"], 3)
         p["pos"] = round(p["pos"], 3)
         p["neg"] = round(p["neg"], 3)
+        p["net"] = round(max(-1.0, min(1.0, p["net"])), 3)
         p["drop"] = round(max(0.0, -p["net"]), 3)
         p["name"] = _name_of(p["qq"])
+    net = max(-1.0, min(1.0, net))
 
     likes = [p for p in people.values() if p["net"] >= LIKE_MIN]
     dislikes = [p for p in people.values() if p["net"] <= -LIKE_MIN]
@@ -233,7 +243,8 @@ def snapshot(session_key: str, *, window_sec: float = 0) -> dict:
     group_quiet = bool(group_drop >= GROUP_DROP and len(dislikes) >= MIN_PEOPLE)
 
     out.update({
-        "net": round(net, 3), "pos": round(pos, 3), "neg": round(neg, 3),
+        "net": round(net, 3), "net_raw": round(net_raw, 3),
+        "pos": round(pos, 3), "neg": round(neg, 3),
         "drop": round(group_drop, 3), "up": round(max(0.0, net), 3),
         "n": len(events), "people": people,
         "likes": len(likes), "dislikes": len(dislikes),
@@ -245,7 +256,10 @@ def snapshot(session_key: str, *, window_sec: float = 0) -> dict:
     })
     bits = []
     if events:
-        bits.append(f"5 小时净 {net:+.2f}（+{pos:.2f}/-{abs(neg):.2f}）")
+        _raw = ""
+        if abs(net_raw) > 1.0001:
+            _raw = f"，原始求和 {net_raw:+.2f}（已封顶 ±1）"
+        bits.append(f"5 小时净 {net:+.2f}（+{pos:.2f}/-{abs(neg):.2f}）{_raw}")
     if total:
         bits.append(f"{len(likes)} 人让你舒服 / {len(dislikes)} 人让你不舒服"
                     f"（喜欢比例 {ratio:.0%}）")
@@ -256,6 +270,21 @@ def snapshot(session_key: str, *, window_sec: float = 0) -> dict:
         bits.append(f"单独让你难受的人：{names}")
     out["why"] = "；".join(bits)
     return out
+
+
+def reset(session_key: str) -> int:
+    """清空这个群的群心情事件（清理历史误判留下的 -2.0）。返回清掉几条。"""
+    gid = _gid(session_key)
+    if not gid:
+        return 0
+    with _LOCK:
+        st = _load()
+        rec = (st.get("groups") or {}).get(gid) or {}
+        n = len(rec.get("events") or [])
+        if gid in (st.get("groups") or {}):
+            st["groups"].pop(gid, None)
+            _save(st)
+        return n
 
 
 def person_of(session_key: str, qq: str) -> dict:
@@ -294,7 +323,8 @@ def status_text(session_key: str) -> str:
     if not s.get("n"):
         return "\n".join(lines + ["· 还没有群心情记录"])
     lines.append(f"· 净变化 {s['net']:+.2f}（涨 {s['pos']:.2f} / 跌 {abs(s['neg']):.2f}）"
-                 f"｜跌 {s['drop']:.2f}｜回暖 {s['up']:.2f}")
+                 f"｜跌 {s['drop']:.2f}｜回暖 {s['up']:.2f}"
+                 f"｜原始求和 {s.get('net_raw', s['net']):+.2f}（决策按 ±1 封顶）")
     lines.append(f"· 喜欢/讨厌：{s['likes']} 人 / {s['dislikes']} 人"
                  f"（喜欢比例 {s['ratio']:.0%}）")
     if s.get("top_liker"):

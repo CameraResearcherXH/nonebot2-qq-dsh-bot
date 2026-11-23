@@ -13,6 +13,8 @@ from nonebot.log import logger
 from nonebot.log import logger as nonebot_logger
 from nonebot.params import CommandArg, CommandWhitespace
 
+from services import identity as _identity
+
 from .card_renderer import render_pig_card_image
 from .data_manager import LocalStoreUnavailableError
 from .resource_manager import pig_resource_manager
@@ -153,8 +155,10 @@ def _has_explicit_bot_target(event: GroupMessageEvent) -> bool:
             ):
                 original.pop(index)
             break
+    _sid = str(event.self_id)
     return any(
-        segment.type == "at" and str(segment.data.get("qq")) == str(event.self_id)
+        segment.type == "at"
+        and _identity.is_self(segment.data.get("qq"), _sid)
         for segment in original
     )
 

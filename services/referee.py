@@ -39,7 +39,7 @@ except Exception:  # pragma: no cover
     logger = logging.getLogger(__name__)
 
 REFEREE_ENABLED = os.getenv("REFEREE_ENABLED", "true").lower() == "true"
-PEER_GROUPS = {g.strip() for g in os.getenv("PEER_GROUPS", "822659531").split(",") if g.strip()}
+PEER_GROUPS = {g.strip() for g in os.getenv("PEER_GROUPS", "100000017").split(",") if g.strip()}
 PEER_QQS = {q.strip() for q in os.getenv("PEER_QQS", "2267107632").split(",") if q.strip()}
 
 PEER_WAIT = tuning.f("PEER_WAIT")          # 我们答完等鱼多久（秒）
@@ -60,7 +60,8 @@ PEER_MERGE_MAX = tuning.f("PEER_MERGE_MAX")
 #   我们回复**之前**先让 GLM 拿同一份模板答一遍 → 塞进 DeepSeek 的 prompt →
 #   DeepSeek 看到两个版本，自己决定采信哪些名词。
 # 代价：每轮多 1~3 秒（GLM 调用）。短寒暄跳过，别让「哈哈」也等 3 秒。
-PREFLIGHT_ENABLED = os.getenv("REFEREE_PREFLIGHT", "true").lower() == "true"
+# 2026-11-23 用户：GLM 只做视觉，不再跑文本参考1。
+PREFLIGHT_ENABLED = os.getenv("REFEREE_PREFLIGHT", "false").lower() == "true"
 PREFLIGHT_MIN_CHARS = tuning.i("PREFLIGHT_MIN_CHARS")
 # ⚠️ preflight 是串行挡在回复前面的，GLM 慢就直接拖慢聊天。
 #    超时就不等了，用没有参考的版本照常回复（宁可少一层参考，别让人等）。

@@ -1,6 +1,6 @@
 # plugins/chat/__init__.py
 from core import tuning
-import os, re, asyncio, time, random, base64
+import os, re, asyncio, time, random, base64, json
 from collections import OrderedDict, defaultdict, deque
 from pathlib import Path
 from nonebot import on_message, on_command, on_notice, logger, get_driver, get_bot
@@ -31,6 +31,7 @@ from services.sticker_library import sticker_lib
 
 from services.aura_logic import (
     parse_reply, has_mention, expand_mentions, wants_voice, bubble_delay,
+    strip_protocol_residue, clean_voice_text,
 )
 
 from services.access import is_owner, display_name, nickname_variants
@@ -38,7 +39,9 @@ from services import (profiles, memory_v2, mood, group_roster, referee,
                        dialogue_log, group_scene, scene_auditor, conv_state)
 from services import view_frequency as vf_mod
 from services import (attention, expression, chat_switch, proactive, mood_judge,
-                      profile_miner, quiet_advisor, skill_switch)
+                      profile_miner, quiet_advisor, skill_switch, segments,
+                      poke_guard)
+from services import identity as identity_mod
 from services.prompt_builder import build_prompt
 
 # ================= 环境 =================
@@ -94,7 +97,7 @@ RANDOM_CHAT_PROB = tuning.f("RANDOM_CHAT_PROB")
 
 # ---- 单群插话频率覆盖（用户 2026-11-18：测试群要 1 分钟一次）----
 # 格式：`群号:冷却秒:插话概率:每小时上限:最少几条消息`，多个群用逗号分隔，后面几项可省略。
-#   例 `936601568:60:0.9:60:2`
+#   例 `100000021:60:0.9:60:2`
 #   = 这个群每 60 秒最多接一次、每次 90% 概率接、每小时最多 60 次、
 #     群里有 2 条真人消息就考虑。
 # ⚠️ 有覆盖的群默认**关掉关键词相关度门槛**（minRelevance=0 / interests 清空）：
@@ -310,7 +313,9 @@ async def speak_voice(bot: Bot, event: MessageEvent, text: str) -> bool:
     之前群聊主动插话（_random_chat_loop）直接调 send_voice（云端），
     所以群里永远听不到她自己的声音，只有私聊才是 indextts —— 就是那个 bug。
     """
-    text = str(text or "").strip()
+    # 语音朗读前最后一道清洗：`stick:开心` / `<sticker:开心>` / `[[THINK|…]]`
+    # 都不能念出来（用户 2026-11-23）。
+    text = clean_voice_text(text)
     if not text:
         return False
     sent = False
@@ -582,13 +587,56 @@ def _bot_name(gid: str = "", self_id: str = "") -> str:
     return nm or "小鲸鱼"
 
 
+# ==================== 她是谁：人格 ID（2026-11-23）====================
+# 用户：「标签自己的话全部改成 NAPCAT_ACCOUNT……让她认为我就是 NAPCAT_ACCOUNT，
+#       要不然 QQ 被封一个记忆就不能复用了？」
+# 所以：写日志 / 判收件人 / 记忆 一律用 services.identity 里**落盘固定**的人格 ID；
+# 实际登录过的号都是别名（旧号的历史发言也还是「她」）。
+def _self_id(event=None, bot=None) -> str:
+    """她的人格 ID（换号不变；没配 NAPCAT_ACCOUNT 时退回真实 self_id）。"""
+    real = str(getattr(event, "self_id", "") or "") if event is not None else ""
+    if not real and bot is not None:
+        real = str(getattr(bot, "self_id", "") or "")
+    try:
+        if real:
+            identity_mod.note_account(real)
+        return identity_mod.canonical(real) or real
+    except Exception:
+        return real
+
+
+def _is_self_qq(qq, event=None) -> bool:
+    """这个 QQ 是不是她自己（当前号 + 所有历史登录号）。"""
+    real = str(getattr(event, "self_id", "") or "") if event is not None else ""
+    try:
+        return identity_mod.is_self(qq, real)
+    except Exception:
+        return bool(qq) and str(qq) == real
+
+
+def _canon_at(at_qqs) -> list:
+    """@ 列表：历史号/当前号统一成人格 ID（去重保序）。"""
+    out = []
+    for q in at_qqs or []:
+        q = str(q or "")
+        if not q:
+            continue
+        try:
+            q = identity_mod.canon(q) or q
+        except Exception:
+            pass
+        if q not in out:
+            out.append(q)
+    return out
+
+
 def _scene_names(gid: str) -> dict:
     """
     给 group_scene / 审核 LLM 的「名字 → QQ」表。
 
     ⚠️ 第一优先是**现场里真实用过的名字**（group_scene 记的 name，也就是 prompt
     里显示的那个名字）。以前只从档案里取，结果群里大部分人是没档案的裸号：
-    审核 LLM 看到「夹竹桃: 可以打扰一下测个东西吗」，返回 "to":"夹竹桃"，
+    审核 LLM 看到「阿明: 可以打扰一下测个东西吗」，返回 "to":"阿明"，
     我们这边对不上 QQ → 只能丢掉。用户 2026-11-19 现场全「审：未审核」就是这个。
     """
     out = {}
@@ -699,6 +747,16 @@ GROUP_SEND_MAX_WAIT = tuning.f("GROUP_SEND_MAX_WAIT")
 _group_send_times: dict = {}          # gid -> deque[ts]
 
 
+def _msg_has_media(msg) -> bool:
+    """这条消息里有没有图片/语音/视频（决定超时后要不要重试）。"""
+    try:
+        segs = list(msg) if isinstance(msg, Message) else [msg]
+        return any(getattr(s, "type", "") in ("image", "record", "video")
+                   for s in segs)
+    except Exception:
+        return False
+
+
 async def _safe_send(bot, ev, msg, *, retries: int = 1, delay: float = 1.5) -> bool:
     """
     发一条消息，失败不抛异常。
@@ -717,10 +775,18 @@ async def _safe_send(bot, ev, msg, *, retries: int = 1, delay: float = 1.5) -> b
         except Exception as e:
             txt = f"{type(e).__name__}: {e}"
             _is_timeout = ("Timeout" in txt) or ("NTEvent" in txt)
-            if _is_timeout and i < retries:
-                logger.warning(f"[SEND] QQ 协议层超时，{delay:.1f}s 后重试一次")
-                await asyncio.sleep(delay)
-                continue
+            if _is_timeout:
+                # ⚠️ 2026-11-23 重复消息根因：QQ 协议层超时后重试，第一次其实
+                #    已经发出去了 → 群里看到两条一模一样的（连引用都相同）。
+                #    文本一律不重试；只有图片/语音/视频才值得重试（上传超时常见）。
+                if _msg_has_media(msg) and i < retries:
+                    logger.warning(
+                        f"[SEND] 媒体上传超时，{delay:.1f}s 后重试一次")
+                    await asyncio.sleep(delay)
+                    continue
+                logger.warning(
+                    "[SEND] QQ 协议层超时：按已送达处理，不重试（防重复消息）")
+                return True
             logger.warning(f"[SEND] 这条发不出去，跳过（不影响后面）: {txt[:160]}")
             return False
     return False
@@ -909,14 +975,16 @@ def _maybe_mood_watch(session_key: str, gid: str, text: str,
     #    判读仍然以最后 2~3 条为主，偶尔归错人影响也只是一次 ±0.10。
     _spawn_mood_judge(key, "", ctx, "",
                       src=f"{name}: {text}".strip(": "), reply="",
-                      speaker_qq=str(speaker_qq or ""), passive=True)
+                      speaker_qq=str(speaker_qq or ""), passive=True,
+                      addressed=False,
+                      hint="她这次没说话，只是看到群里在聊")
 
 
 def _spawn_mood_judge(session_key: str, label: str, ctx_lines, think: str = "",
                       src: str = "", reply: str = "", speaker_qq: str = "",
                       passive: bool = False, hint: str = "",
                       repair: bool = False, force: bool = False,
-                      turn_id: str = "") -> None:
+                      turn_id: str = "", addressed: bool = False) -> None:
     """
     后台跑心情判读（影子）。异常自己吞掉，别让 create_task 冒「never retrieved」。
 
@@ -952,7 +1020,11 @@ def _spawn_mood_judge(session_key: str, label: str, ctx_lines, think: str = "",
                 session_key, label, ctx_lines,
                 think=think, speaker_qq=speaker_qq,
                 hint=hint, repair=repair, force=force,
-                turn_id=turn_id) or {}
+                turn_id=turn_id,
+                # 👇 这两项决定 Δ 会不会被压小（2026-11-22）：
+                #    passive  = 她没说话，只是看到 → 旁观不该背锅
+                #    addressed = 这条是不是在叫她 → 不是冲她来的最多 ±0.05
+                passive=bool(passive), addressed=bool(addressed)) or {}
             # 被动观察：把判读出来的 mind 也当成「她心里的活动」落一条，
             # 这样「没说话但心里有想法」也能在 /测函数 心情 里看到。
             if passive and _res.get("ok") and _res.get("mind"):
@@ -1345,6 +1417,10 @@ def _quote_from_msg(d, max_chars: int) -> str:
                         body.append("[卡片] " + " ".join(x for x in _p if x).strip())
                 except Exception:
                     pass
+            elif st == "reply":
+                # ⚠️ 不递归展开被引用消息里的「引用」段：
+                #    多层引用时会把折叠的旧消息一层层读出来（用户 2026-11-23）。
+                continue
     except Exception:
         pass
     txt = "".join(body).strip() or str(d.get("raw_message") or "").strip()
@@ -1354,7 +1430,9 @@ def _quote_from_msg(d, max_chars: int) -> str:
     if len(txt) > max_chars:
         txt = txt[:max_chars] + "…"
     who = name + (f"({uid[-4:]})" if len(uid) >= 4 else "")
-    return f"〔引用 {who}{(' ' + hhmm) if hhmm else ''} 的消息：{txt}〕"
+    # 只作指代，不是让她复述的素材（用户 2026-11-23）。
+    return (f"〔引用 {who}{(' ' + hhmm) if hhmm else ''} 的消息"
+            f"（只作指代，回复时不要复述原文）：{txt}〕")
 
 
 async def _reply_quote(event: MessageEvent, max_chars: int | None = None) -> str:
@@ -1377,7 +1455,14 @@ async def _reply_quote(event: MessageEvent, max_chars: int | None = None) -> str
                 rid = str((seg.data or {}).get("id") or "").strip()
                 break
     except Exception:
-        return ""
+        rid = ""
+    # 有些适配器不把 reply 放进 message 段，只在 event.reply 上给 message_id。
+    if not rid:
+        try:
+            rid = str(getattr(getattr(event, "reply", None),
+                              "message_id", "") or "").strip()
+        except Exception:
+            rid = ""
     if not rid:
         return ""
 
@@ -1388,7 +1473,11 @@ async def _reply_quote(event: MessageEvent, max_chars: int | None = None) -> str
 
     out = ""
     try:
-        d = await get_bot().call_api("get_msg", message_id=int(rid))
+        try:
+            _mid = int(rid)
+        except (TypeError, ValueError):
+            _mid = rid          # 少数适配器的 message_id 是字符串
+        d = await get_bot().call_api("get_msg", message_id=_mid)
         out = _quote_from_msg(d, max_chars or QUOTE_MAX_CHARS)
     except Exception as e:
         # 消息太旧被删 / 权限不够 / 号不对 —— 都不该影响主流程
@@ -1433,6 +1522,14 @@ async def _enrich_text(event: MessageEvent) -> str:
         _q = await _reply_quote(event)
         if _q:
             t = f"{t} {_q}".strip() if t else _q
+            # 把被引用的原文单独存一份：回复里如果原样照抄开头，输出层要剥掉。
+            try:
+                _qm = re.search(
+                    r"消息（只作指代，回复时不要复述原文）：(.+)〕\s*$", _q, re.S)
+                if _qm:
+                    setattr(event, "_quote_text", _qm.group(1).strip())
+            except Exception:
+                pass
             logger.info(f"[QUOTE] 展开引用：{_q[:60]}")
     except Exception as e:
         logger.debug(f"[QUOTE] 展开失败: {type(e).__name__}: {e}")
@@ -1473,6 +1570,38 @@ async def _enrich_text(event: MessageEvent) -> str:
                 t = (f"{t}\n{card}" if t else card)[:1200]
     except Exception as e:
         logger.debug(f"[LINK] 卡片预览失败: {type(e).__name__}: {e}")
+
+    # ④ 普通网页链接：私聊 / 叫了她 / 明确让看时，抓正文喂给她。
+    #    以前只有 B 站卡片预览，普通链接她只能回「我点不开」（用户 2026-11-23）。
+    try:
+        from services import web_page as _wp
+        _urls = [u for u in _wp.find_urls(t) if not _wp.should_skip(u)]
+        if _urls:
+            # 只给「允许的私聊 / 叫了她 / 主人明确让看」抓，别让群里每个带链接的
+            # 闲聊都触发一次外部请求。
+            _is_private = (isinstance(event, PrivateMessageEvent)
+                           and str(event.user_id) in ALLOWED_PRIVATE)
+            try:
+                _called = bool(event.is_tome())
+            except Exception:
+                _called = False
+            _asks = bool(re.search(
+                r"看|读|打开|做一下|做题|这个链接|网页|文章|链接|内容", t))
+            _owner_asks = _asks and is_owner(str(event.user_id))
+            if _is_private or _called or _owner_asks:
+                _pg = await _wp.fetch_page(_urls[0])
+                if _pg.get("text"):
+                    t = (f"{t}\n\n【链接内容 · {_pg.get('title') or _urls[0]}】\n"
+                         f"{_pg['text']}\n"
+                         f"（这是系统帮你抓到的网页正文，直接根据它回答/做事；"
+                         f"不要说「点不开」「看不了」。）")
+                    logger.info(
+                        f"[WEB] 已抓取网页正文 {len(_pg['text'])} 字：{_urls[0][:80]}")
+                elif _pg.get("error"):
+                    logger.info(
+                        f"[WEB] 链接没抓到正文：{_urls[0][:80]} → {_pg['error']}")
+    except Exception as e:
+        logger.debug(f"[WEB] 网页读取失败: {type(e).__name__}: {e}")
 
     try:
         setattr(event, "_enriched_text", t)
@@ -1544,12 +1673,17 @@ def _looks_like_command(text: str) -> bool:
 #   ① 叫名字 / 空 @ 的补话（结构信号，不是猜语义）  → 回
 #   ② @ 了别人 / 引用回复别人（看消息结构）          → 不回（扣 1 条额度）
 #   ③ 刚被 @ 完的第一条后续                        → 回（"叫完她接着说"最常见）
-#   ④ 其余全部交给模型，三档：是 / 否 / 不确定 → **只有明确「否」才不回**
+#   ④ 其余全部交给模型，三档：是 / 否 / 不确定 → **只有明确「是」才回**
 #   ⑤ 每判一次否扣 1 条额度；连续否 N 次直接结束关注
+#
+# ⚠️ 2026-11-23 用户：「收件人不是大家、是一个群友的情况下他也回复，接的词不达意」。
+#    以前默认「不确定 → 回 / 宁可多回一句」，结果关注期里别人互相聊天她也接。
+#    现在反过来：**不确定 = 不回**；收件人明确是别人（→ 某人，置信 ≥0.5）也不回。
+#    @ 她 / 喊名字仍然必回（那条不走关注判定，直接 True）。
 _FOCUS_JUDGE_ENABLED = os.getenv("FOCUS_JUDGE_ENABLED", "true").lower() == "true"
 _FOCUS_JUDGE_TIMEOUT = tuning.f("FOCUS_JUDGE_TIMEOUT")
-# 刚被 @ 完的第一条后续默认回（关掉=每条都要过模型判）
-_FOCUS_FIRST_FOLLOW_ALWAYS = os.getenv("FOCUS_FIRST_FOLLOW_ALWAYS", "true").lower() == "true"
+# 刚被 @ 完的第一条后续是否无条件回。默认关（交给模型判），避免她接别人之间的第一句。
+_FOCUS_FIRST_FOLLOW_ALWAYS = os.getenv("FOCUS_FIRST_FOLLOW_ALWAYS", "false").lower() == "true"
 # 连续判否几次就结束关注（防"一直跟着讲"）
 _FOCUS_NEG_STREAK_STOP = tuning.i("FOCUS_NEG_STREAK_STOP")
 
@@ -1591,7 +1725,8 @@ def _reply_to_other(event, self_id: str) -> bool:
         if rp is None:
             return False
         uid = str(getattr(getattr(rp, "sender", None), "user_id", "") or "")
-        return bool(uid) and uid != str(self_id)
+        # 引用的可能是旧号（换号前的她）→ 也算「不是别人」
+        return bool(uid) and not _is_self_qq(uid, event)
     except Exception:
         return False
 
@@ -1599,7 +1734,7 @@ def _reply_to_other(event, self_id: str) -> bool:
 def _addressed_elsewhere(event, self_id: str) -> str:
     """明显在找别人：@ 了别人 / @全体 / 引用回复别人。返回原因（空串 = 没有）。"""
     try:
-        others = {x for x in _at_targets(event) if str(x) != str(self_id)}
+        others = {x for x in _at_targets(event) if not _is_self_qq(x, event)}
         if others:
             return "@了别人"
     except Exception:
@@ -1639,11 +1774,32 @@ async def _judge_focus_follow(text: str, gid: str, speaker_qq: str, event=None) 
 
     # ③ 强否定：@ 了别人 / 引用回复别人 → 不回（这种"跟着回"才是真的烦人）
     if event is not None:
-        _why = _addressed_elsewhere(event, getattr(event, "self_id", ""))
+        _why = _addressed_elsewhere(event, _self_id(event))
         if _why:
             logger.info(f"[FOCUS] 「{t[:20]}」{_why} → 不回")
             _focus_penalize(key, sq)
             return False
+
+    # ③b 收发件人明确是别人 → 不回（用户 2026-11-23）。
+    #     「收件人不是大家、是一个群友的情况下他也回复」——群友之间没 @ 也会聊，
+    #     光看 @/引用 判不出来；这里直接用 group_scene 已经判好的「谁 → 谁」。
+    try:
+        _lm = group_scene.last(gid)
+        if _lm and not _lm.get("is_bot"):
+            _lk = str(_lm.get("to_kind") or "").strip().lower()
+            _lq = str(_lm.get("to_qq") or "")
+            try:
+                _lc = float(_lm.get("to_conf") or 0.0)
+            except Exception:
+                _lc = 0.0
+            if (_lk == "person" and _lq and _lc >= 0.5
+                    and not _is_self_qq(_lq, event)):
+                _ln = str(_lm.get("to_name") or _lq)
+                logger.info(f"[FOCUS] 「{t[:20]}」收件人是 {_ln}（不是你）→ 不回")
+                _focus_penalize(key, sq)
+                return False
+    except Exception as e:
+        logger.debug(f"[FOCUS] 收件人检查失败: {type(e).__name__}: {e}")
 
     # ④ 刚被 @ 完的第一条后续 → 回（"叫完她接着说"最常见）
     if (_FOCUS_FIRST_FOLLOW_ALWAYS and _f
@@ -1687,8 +1843,9 @@ async def _judge_focus_follow(text: str, gid: str, speaker_qq: str, event=None) 
                       "temperature": 0.0, "max_tokens": 8},
             )
         if r.status_code != 200:
-            logger.warning(f"[FOCUS] 关注判断 HTTP {r.status_code} → 按不确定处理（回）")
-            return True
+            logger.warning(f"[FOCUS] 关注判断 HTTP {r.status_code} → 按不回处理")
+            _focus_penalize(key, sq)
+            return False
         ans = str(r.json()["choices"][0]["message"].get("content") or "").strip()
         if ans.startswith("否"):
             logger.info(f"[FOCUS] 关注期间判断「{t[:30]}」→ 否（不回，扣 1 条）")
@@ -1698,13 +1855,16 @@ async def _judge_focus_follow(text: str, gid: str, speaker_qq: str, event=None) 
             logger.info(f"[FOCUS] 关注期间判断「{t[:30]}」→ 是（回）")
             _focus_mark_yes(key, sq)
             return True
-        # 不确定 / 乱答 → 回（宁可多回一句，也别漏掉找她的）
-        logger.info(f"[FOCUS] 关注期间判断「{t[:30]}」→ 不确定（{ans[:8]}）→ 按回处理")
-        return True
+        # 不确定 / 乱答 → **不回**（2026-11-23 用户：别人互相聊天别接）。
+        # 直接 @ / 喊名字的必回，不依赖这条判定，所以这里保守不会漏。
+        logger.info(f"[FOCUS] 关注期间判断「{t[:30]}」→ 不确定（{ans[:8]}）→ 不回")
+        _focus_penalize(key, sq)
+        return False
     except Exception as e:
         logger.warning(
-            f"[FOCUS] 关注判断失败（按不确定处理：回）: {type(e).__name__}: {e}")
-        return True
+            f"[FOCUS] 关注判断失败（按不回处理）: {type(e).__name__}: {e}")
+        _focus_penalize(key, sq)
+        return False
 
 
 def _is_sticker_msg(event) -> bool:
@@ -1869,11 +2029,25 @@ async def _early_observe(event: MessageEvent) -> None:
     # 这样任何 priority<10 && block=True 的插件都不会让它丢上下文。
     try:
         _t = await _enrich_text(event)
-        _self = str(getattr(event, "self_id", "") or "")
+        _self = _self_id(event)
         if isinstance(event, GroupMessageEvent):
             _gid = str(event.group_id)
             _uid = str(event.user_id)
-            if _gid in ALLOWED_GROUPS and _uid != _self:
+            if _gid in ALLOWED_GROUPS and not _is_self_qq(_uid, event):
+                # 👇 群聊分段：每条先记进当前段，worker 等这一段说完再一起处理。
+                #    这样不会「高频率提问时一条一回」，心情/收发件人也按整段判。
+                try:
+                    segments.push(
+                        f"group_{_gid}", event, _t,
+                        name=display_name(event), uid=_uid,
+                        mentioned=bool(getattr(event, "is_tome", lambda: False)()),
+                        reply_id=str(getattr(event, "reply", None) or ""),
+                        gid=_gid,
+                        # mid 用来回填「谁 → 谁」：这里还拿不到收发件人，
+                        # `_need_reply` 里 group_scene.observe 之后会 set_addressee
+                        mid=str(getattr(event, "message_id", "") or ""))
+                except Exception as _se:
+                    logger.debug(f"[SEGMENT] 入段失败: {type(_se).__name__}: {_se}")
                 dialogue_log.log_msg(
                     _gid, _msg_label(event), _uid, _t,
                     kind="peer" if _uid in referee.PEER_QQS else "user")
@@ -1887,7 +2061,7 @@ async def _early_observe(event: MessageEvent) -> None:
                     logger.debug(f"[PROFILE-MINE] 触发失败: {type(e).__name__}: {e}")
         elif isinstance(event, PrivateMessageEvent):
             _uid = str(event.user_id)
-            if _uid in ALLOWED_PRIVATE and _uid != _self:
+            if _uid in ALLOWED_PRIVATE and not _is_self_qq(_uid, event):
                 dialogue_log.log_msg(f"private_{_uid}", _msg_label(event),
                                      _uid, _t, kind="user")
     except Exception as e:
@@ -1929,10 +2103,10 @@ async def _need_reply(event: MessageEvent) -> bool:
                 if isinstance(event, GroupMessageEvent):
                     _cg = str(event.group_id)
                     _cuid = str(event.user_id)
-                    _self_id = str(getattr(event, "self_id", "") or "")
                     # 主人自己的诊断指令不进上下文（/全量测试、/测函数 会刷屏）
                     _diag = text.startswith(("/全量测试", "/测函数", "/接入自检", "/自检"))
-                    if _cg in ALLOWED_GROUPS and _cuid != _self_id and not _diag:
+                    if (_cg in ALLOWED_GROUPS and not _diag
+                            and not _is_self_qq(_cuid, event)):
                         recent_group_msgs[_cg].append(
                             f"{_ts_tag(time.time())}{_msg_label(event)}: "
                             f"【用了功能】{text[:40]}")
@@ -1961,10 +2135,10 @@ async def _need_reply(event: MessageEvent) -> bool:
             #    no_audit=True：占位没有字可判收件人，不浪费一次审核调用。
             try:
                 _mgid = str(getattr(event, "group_id", "") or "")
-                _self_m = str(getattr(event, "self_id", "") or "")
+                _self_m = _self_id(event)
                 # 她自己发出去的图（NapCat 回显）不算「群友发了张图」
                 if (_mgid and _mgid in ALLOWED_GROUPS
-                        and str(event.user_id) != _self_m):
+                        and not _is_self_qq(str(event.user_id), event)):
                     _rp_m = getattr(event, "reply", None)
                     group_scene.observe(
                         _mgid,
@@ -1989,7 +2163,7 @@ async def _need_reply(event: MessageEvent) -> bool:
         uid = str(event.user_id)
         # NapCat 会把她自己发的消息也回显成事件 —— 那条不能算进高刷计数，
         # 否则她自己连回几句就把群判成「刷屏」了。
-        _is_self = uid == str(getattr(event, "self_id", ""))
+        _is_self = _is_self_qq(uid, event)
         # 👇 重启后的第一条消息：先把最近 N 条从对话日志补回现场，**再**记这一条。
         #    顺序反了的话，补回来的历史是拿「未来消息」推线程的，会多出一条假线程
         #    （用户 2026-11-19：重启后 /测函数 现场 只有「窗口 1 条」）。
@@ -2032,11 +2206,13 @@ async def _need_reply(event: MessageEvent) -> bool:
                 _append_self_line(gid, _t_self, time.time())
             try:
                 _brp = getattr(event, "reply", None)
+                # 她自己的话统一记成人格 ID（换号后日志/现场仍能连上）
+                _me = _self_id(event)
                 group_scene.observe(
                     gid, mid=str(getattr(event, "message_id", "") or ""),
-                    qq=uid, name="你", text=_t_self, is_bot=True,
+                    qq=_me or uid, name="你", text=_t_self, is_bot=True,
                     reply_mid=str(getattr(_brp, "message_id", "") or ""),
-                    bot_qq=uid, names=_scene_names(gid),
+                    bot_qq=_me or uid, names=_scene_names(gid),
                 )
             except Exception:
                 pass
@@ -2052,11 +2228,14 @@ async def _need_reply(event: MessageEvent) -> bool:
                 _rp = getattr(event, "reply", None)
                 _rq = str(getattr(getattr(_rp, "sender", None), "user_id", "") or "")
                 _rmid = str(getattr(_rp, "message_id", "") or "")
-                _atq = [q for q in _at_targets(event) if q not in ("all", "everyone")]
-                _self_id = str(getattr(event, "self_id", "") or "")
+                _atq = _canon_at([q for q in _at_targets(event)
+                                  if q not in ("all", "everyone")])
+                _me = _self_id(event)
                 if event.is_tome():
-                    _atq = [_self_id] + [q for q in _atq if q != _self_id]
-                group_scene.observe(
+                    _atq = [_me] + [q for q in _atq if q != _me]
+                if _rq and _is_self_qq(_rq, event):
+                    _rq = _me
+                _scene_meta = group_scene.observe(
                     gid,
                     mid=str(getattr(event, "message_id", "") or ""),
                     qq=uid,
@@ -2066,9 +2245,51 @@ async def _need_reply(event: MessageEvent) -> bool:
                     to_reason=("at" if _atq else ("reply" if _rq else "")),
                     reply_mid=_rmid,
                     is_bot=False,
-                    bot_qq=_self_id,
+                    bot_qq=_me,
                     names=_scene_names(gid),
                 )
+                # 👇 回填分段的「谁 → 谁」：分段在 priority=1 就入 buffer 了，
+                #    那时候收发件人还没算出来（用户 2026-11-22：
+                #    「三方判心情 / 上下文分段都没用上收发件人标签」）。
+                try:
+                    segments.set_addressee(
+                        f"group_{gid}",
+                        str(getattr(event, "message_id", "") or ""),
+                        to_kind=str((_scene_meta or {}).get("to_kind") or ""),
+                        to_name=str((_scene_meta or {}).get("to_name") or ""),
+                        to_qq=str((_scene_meta or {}).get("to_qq") or ""),
+                        to_conf=float((_scene_meta or {}).get("to_conf") or 0.0))
+                except Exception:
+                    pass
+                # 🌙 白月光统计（群友之间，不是她自己）：
+                #    A @ 了谁 / 引用回复了谁 / 没 @ 但在接谁的话。
+                try:
+                    from services import white_moon as _wm
+                    _from_name = (profiles.call_of(uid, display_name(event), gid)
+                                  or _label)
+                    _to_qqs = [q for q in (_atq or [])
+                               if q and not _is_self_qq(q, event)]
+                    for _tq in _to_qqs:
+                        _tn = profiles.call_of(str(_tq), "", gid) or str(_tq)
+                        _wm.note_incoming(
+                            gid, uid, _from_name, str(_tq), _tn,
+                            kind="at", self_qq=_me)
+                    if _rq and not _is_self_qq(_rq, event):
+                        _tn = profiles.call_of(str(_rq), "", gid) or str(_rq)
+                        _wm.note_incoming(
+                            gid, uid, _from_name, str(_rq), _tn,
+                            kind="quote", self_qq=_me)
+                    _mk = str((_scene_meta or {}).get("to_kind") or "")
+                    _mq = str((_scene_meta or {}).get("to_qq") or "")
+                    if (_mk == "person" and _mq and _mq not in _to_qqs
+                            and _mq != str(_rq or "")
+                            and not _is_self_qq(_mq, event)):
+                        _mn = str((_scene_meta or {}).get("to_name") or _mq)
+                        _wm.note_incoming(
+                            gid, uid, _from_name, _mq, _mn,
+                            kind="addressed", self_qq=_me)
+                except Exception as _e:
+                    logger.debug(f"[MOON] 统计失败: {type(_e).__name__}: {_e}")
             except Exception:
                 pass
             # 👇 表达学习：每攒够 N 条真人消息，后台挖一次「这个群 / 这个人怎么说话」。
@@ -2232,7 +2453,7 @@ async def _need_reply(event: MessageEvent) -> bool:
         if str(event.user_id) in ALLOWED_PRIVATE:
             # 私聊也单独算高刷（同一个人连发 4 条，队列同样会堆），
             # 但只影响这一个私聊会话，跟任何群、任何人无关。
-            if str(event.user_id) != str(getattr(event, "self_id", "")):
+            if not _is_self_qq(str(event.user_id), event):
                 burst_msg_ts[f"private_{event.user_id}"].append(time.time())
                 # 私聊原文落盘 / mood.touch 已移到 _early_observe（D1）
             # 安静闸门（私聊）：照记上下文，但不入队、不调模型。
@@ -2296,7 +2517,7 @@ def _has_mface(event) -> bool:
 
 def _sticker_collect_rule(event) -> bool:
     # 别收自己发出去的表情（NapCat 会把 bot 自己的消息回显成事件）
-    if str(getattr(event, "user_id", "") or "") == str(getattr(event, "self_id", "") or ""):
+    if _is_self_qq(getattr(event, "user_id", ""), event):
         return False
     if not (_can_collect_here(event) and _has_collectible_sticker(event)):
         return False
@@ -2510,10 +2731,20 @@ usage_cmd = on_command("用量", aliases={"token", "费用"}, priority=1, block=
 async def _usage_cmd(event: MessageEvent, arg=CommandArg()):
     if not is_owner(str(event.user_id)):
         await usage_cmd.finish("这个只有主人能看。")
-    from services import llm_usage
+    from services import llm_usage, usage_chart
     raw = str(arg or "").strip().lower()
     days = 7 if raw in ("7", "周", "week", "7天") else 1
-    await usage_cmd.finish(llm_usage.report_text(days))
+    text = llm_usage.report_text(days)
+    # `/用量 文字` 只看数字，不拉图（图床挂了也不影响查账）
+    if any(w in raw for w in ("文字", "text", "nochart")):
+        await usage_cmd.finish(text)
+    paths = await usage_chart.download_charts(days)
+    if not paths:
+        await usage_cmd.finish(text)
+    msg = Message(text)
+    for p in paths:
+        msg += MessageSegment.image(f"file://{Path(p).resolve()}")
+    await usage_cmd.finish(msg)
 
 
 # 调参表（2026-11-20）：所有阈值的当前生效值都在 core/tuning.py
@@ -2574,7 +2805,7 @@ def _minutes_of(raw: str, default: float = 60) -> float:
 
 
 def _split_quiet_args(raw: str) -> tuple[str, str]:
-    """把 '822659531 1小时' 拆成 (群号/QQ, '1小时')。第一个 5~12 位数字当目标。"""
+    """把 '100000017 1小时' 拆成 (群号/QQ, '1小时')。第一个 5~12 位数字当目标。"""
     t = str(raw or "").strip()
     m = re.search(r"(?<!\d)(\d{5,12})(?!\d)", t)
     if not m:
@@ -2587,7 +2818,7 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
     if not is_owner(str(event.user_id)):
         await silence_cmd.finish("只有主人能让我安静。")
     raw = args.extract_plain_text().strip()
-    # 支持私聊里指定群：/安静 822659531 1小时
+    # 支持私聊里指定群：/安静 100000017 1小时
     _tgt, _rest = _split_quiet_args(raw)
     minutes = int(max(1, min(72 * 60, _minutes_of(_rest, 60))))
     gid = _tgt or str(getattr(event, "group_id", "") or "")
@@ -3705,8 +3936,9 @@ def _mute_note(gid: str) -> str:
     return (
         "▍群里的气氛 · 注意\n"
         f"刚才有人说「{info.get('text', '')}」——他们嫌你吵了。\n"
-        "接下来：只在明确叫你（@ 你、喊你名字）的时候才开口；别人闲聊别插嘴；"
-        "真要说就一句短的，别贫、别追问、别解释。"
+        "接下来：只在明确叫你（@ 你、喊你名字）的时候才开口；别人闲聊别插嘴。\n"
+        "⚠️ 如果是明确叫你做事（答题、看链接、帮忙、回答问题），**正常做完**，"
+        "别用「等会」「选完给你」敷衍；只有纯闲聊才一句短的，别贫、别追问、别解释。"
     )
 
 
@@ -3924,34 +4156,116 @@ async def _session_worker(bot: Bot, session_key: str):
         if wait > 0:
             await asyncio.sleep(wait)
 
-        # ---- 合并连发：同一用户快速连发多条 → 合成一条回复（用户 2026-11-16）----
-        # 等一小会儿让「几乎同时发」的消息也进队列，再把队列里**连续同用户**的捞出来合并。
-        # 等多久按情况算（防抖表）：裸图要等图下载完，在叫她要快，换人要快。
-        _dw, _dwhy = _debounce_wait(session_key, item[0], str(item[1] or ""))
-        if _dw > 0:
-            logger.debug(f"[DEBOUNCE] {session_key} 等 {_dw:.1f}s（{_dwhy}）")
-            await asyncio.sleep(_dw)
-        _batch = [item]
-        _uid = getattr(item[0], "user_id", None)
-        _dq = getattr(queue, "_queue", None)
-        while _dq:
-            _nxt = _dq[0]
-            if _uid is not None and getattr(_nxt[0], "user_id", None) == _uid:
-                _batch.append(queue.get_nowait())
+        # ---- 群聊分段：等这一段说完再回（用户 2026-11-22）----
+        # 以前只合并「同一用户连续几条」，群里多人高频率提问时仍会一条一回，
+        # 队列越堆越长。现在：所有群消息先进入 segments 的 buffer，worker 被触发后
+        # 等「安静 SEGMENT_WAIT_SEC 秒」或「攒满 SEGMENT_MAX_SEC 秒」，
+        # 把整段一起取走 —— 回复、心情判读、收发件人判断都用这一段。
+        _seg_records = []
+        _seg_addressed = None
+        if session_key.startswith("group_"):
+            _seg_records = await segments.wait_close(session_key)
+            if _seg_records:
+                # ⚠️ 2026-11-23 串线根因：一段 3 条消息被整段处理了一次，
+                #    但队列里还留着这 3 条各自的 item → 本轮结束后它们会被
+                #    当成「新消息」再单独回一遍（实测同两条回了三次）。
+                #    整段取走后，把段内每条 mid 都登记为已处理，后续队列项直接 DEDUP。
+                for _r in _seg_records:
+                    _rm = str(_r.get("mid") or "")
+                    if _rm:
+                        _already_replied(session_key, _rm)
+                ev = _seg_records[-1].get("ev") or item[0]
+                text = segments.format(_seg_records)
+                _gid_s = str(getattr(ev, "group_id", "") or "")
+                # 👇 上下文和判心情**同源同条数**（用户 2026-11-22）：
+                #    都读 group_scene 里「收发件人标签处理过的历史」，
+                #    不再一边用 recent_group_msgs、一边让判读自己拉 20 条。
+                _seg_mids = {str(r.get("mid") or "") for r in _seg_records
+                             if str(r.get("mid") or "")}
+                # mid 缺失时按 (qq|文本前缀) 兜底排除
+                _seg_txts = {f"{r.get('uid') or ''}|{str(r.get('text') or '')[:40]}"
+                             for r in _seg_records if str(r.get("text") or "")}
+                # 只用「处理过的历史」；现场没料就空着，绝不再退回未处理的
+                # recent_group_msgs（用户 2026-11-23：「上下文一定要收发件人处理过」）。
+                ctx = group_scene.history_lines(
+                    _gid_s, mood_judge.CTX_LINES,
+                    exclude_mids=_seg_mids, exclude_texts=_seg_txts)
+                # 整段里只要有一条 @ 了她 / 被判定为对她说 / 喊了她名字，就算在叫她。
+                # ⚠️ 不能只看 mentioned：喊名字（「小鲸鱼你觉得呢」）没有 at 段，
+                #    以前会被 _seg_addressed=False 覆盖掉 → 被叫了也不回。
+                _seg_addressed = any(
+                    segments.is_addressed(r)
+                    or _calls_me_by_name(
+                        str(r.get("text") or ""), session_key,
+                        str(r.get("uid") or ""))
+                    for r in _seg_records
+                )
+                logger.info(f"[SEGMENT] {session_key} 这一段 {len(_seg_records)} 条，一起处理")
             else:
-                break
-
-        if len(_batch) > 1:
-            ev = _batch[0][0]
-            ctx = _batch[0][2]
-            _texts = [str(t).strip() for (_, t, _) in _batch if str(t).strip()]
-            text = ("（对方连发了几条，综合考虑一起回，别逐条回）\n"
-                    + "\n".join(f"{i}. {t}" for i, t in enumerate(_texts, 1)))
-            logger.info(f"[MERGE] {session_key} 合并了 {len(_batch)} 条连发消息")
+                ev, text, ctx = item
         else:
-            ev, text, ctx = item
+            # 私聊保持原样：同一用户快速连发多条 → 合成一条回复
+            _dw, _dwhy = _debounce_wait(session_key, item[0], str(item[1] or ""))
+            if _dw > 0:
+                logger.debug(f"[DEBOUNCE] {session_key} 等 {_dw:.1f}s（{_dwhy}）")
+                await asyncio.sleep(_dw)
+            _batch = [item]
+            _uid = getattr(item[0], "user_id", None)
+            _dq = getattr(queue, "_queue", None)
+            while _dq:
+                _nxt = _dq[0]
+                if _uid is not None and getattr(_nxt[0], "user_id", None) == _uid:
+                    _batch.append(queue.get_nowait())
+                else:
+                    break
+            if len(_batch) > 1:
+                ev = _batch[0][0]
+                ctx = _batch[0][2]
+                _texts = [str(t).strip() for (_, t, _) in _batch if str(t).strip()]
+                text = ("（对方连发了几条，综合考虑一起回，别逐条回）\n"
+                        + "\n".join(f"{i}. {t}" for i, t in enumerate(_texts, 1)))
+                logger.info(f"[MERGE] {session_key} 合并了 {len(_batch)} 条连发消息")
+            else:
+                ev, text, ctx = item
+        # 分段为空（例如刚重启、buffer 被取走 / 高刷清队）也走同一条链路：
+        # 群聊上下文统一用「收发件人处理过的历史」，不再用 recent_group_msgs 原串。
+        # ⚠️ 2026-11-23：这段原来缩进在「私聊 else」里面 → 群聊根本没执行到，
+        #    分段为空时又把未处理的 recent_group_msgs 塞给模型。
+        if session_key.startswith("group_") and not _seg_records:
+            _gid_norm = str(getattr(ev, "group_id", "") or "")
+            _hl = group_scene.history_lines(_gid_norm, mood_judge.CTX_LINES)
+            if _hl:
+                ctx = _hl
+            else:
+                ctx = []
         speaker_qq = str(ev.user_id)
         speaker_name = display_name(ev)
+
+        # 🌙 这次回复的对象：决定 prompt 里用谁的白月光说话方式。
+        #    · 这一段里有 @ 她 / 喊她名字的 → 回最后那个叫她的人
+        #    · 没 @ 但在关注期（在接某个人的话）→ 回那个人
+        #    · 都没有（回大家 / 吐槽）→ 空，用群白月光
+        _moon_target_qq = ""
+        try:
+            if _seg_records:
+                _addr_recs = [
+                    r for r in _seg_records
+                    if segments.is_addressed(r)
+                    or _calls_me_by_name(
+                        str(r.get("text") or ""), session_key,
+                        str(r.get("uid") or ""))
+                ]
+                if _addr_recs:
+                    _moon_target_qq = str(_addr_recs[-1].get("uid") or "")
+            if (not _moon_target_qq
+                    and session_key.startswith("group_")):
+                try:
+                    if _focus_active(session_key, ev.user_id):
+                        _moon_target_qq = str(ev.user_id)
+                except Exception:
+                    pass
+        except Exception:
+            _moon_target_qq = ""
 
         # 2026-11-20 记录模型 v2：每个 turn 先落一条 pending（记忆全记）。
         # 判读回来再由 mood_judge.patch_turn 补 delta/salience/valence/mood_word。
@@ -4017,14 +4331,17 @@ async def _session_worker(bot: Bot, session_key: str):
             # 并把那个人的档案一起带上（她自己说「理论上该查那个人的档案」）。
             _focus_qqs = []
             try:
-                _self_id = str(getattr(ev, "self_id", "") or "")
                 _focus_qqs = [
-                    str(q) for q in _at_targets(ev)
-                    if str(q) not in (_self_id, "all", "everyone")
+                    str(q) for q in _canon_at(_at_targets(ev))
+                    if str(q) not in ("all", "everyone")
+                    and not _is_self_qq(q, ev)
                 ]
                 _rp = getattr(ev, "reply", None)
                 _rq = str(getattr(getattr(_rp, "sender", None), "user_id", "") or "")
-                if _rq and _rq != _self_id and _rq not in _focus_qqs:
+                if _rq:
+                    _rq = identity_mod.canon(_rq) or _rq
+                if (_rq and not _is_self_qq(_rq, ev)
+                        and _rq not in _focus_qqs):
                     _focus_qqs.append(_rq)
             except Exception:
                 _focus_qqs = []
@@ -4036,6 +4353,9 @@ async def _session_worker(bot: Bot, session_key: str):
                     )
             except Exception:
                 _addressed = bool(getattr(ev, "is_tome", lambda: False)())
+            # 群聊分段：整段里只要有一条 @ 了她 / 点名她，就算在叫她
+            if _seg_addressed is not None:
+                _addressed = bool(_seg_addressed)
 
             # ---------- 3) 组装上下文（记忆 + 档案 + 心情） ----------
             # 群聊现场：谁 → 谁、几条线程、这条是不是在叫她
@@ -4043,8 +4363,7 @@ async def _session_worker(bot: Bot, session_key: str):
             try:
                 _gid_now = str(getattr(ev, "group_id", "") or "")
                 if _gid_now:
-                    _self_id_now = str(
-                        getattr(bot, "self_id", "") or getattr(ev, "self_id", "") or "")
+                    _self_id_now = _self_id(ev, bot)
                     # 👇 先让「审核 LLM」纠错/补齐硬逻辑，再组装现场
                     #    只审 大家/不确定/低置信 的消息；@/引用 不审。
                     #    失败/超时静默退回硬逻辑，不影响回复。
@@ -4120,6 +4439,8 @@ async def _session_worker(bot: Bot, session_key: str):
                     (isinstance(ev, GroupMessageEvent) and ev.is_tome())
                     or _calls_me_by_name(text, session_key, str(ev.user_id))
                 )
+                if _seg_addressed is not None:
+                    _addressed = bool(_seg_addressed)
                 # 👇 这条消息后面又来了几条（她被刷上去了没）
                 #    用户 2026-11-12：「并没有对回复的那句引用回复」——
                 #    她回的是被刷上去的那条，但协议里写着「回当前这条不用引用」，
@@ -4176,7 +4497,9 @@ async def _session_worker(bot: Bot, session_key: str):
                 text_for_llm = (
                     f"{text_for_llm}\n\n"
                     f"【另一个模型对同一段上下文的回答（仅供参考，可能有错）】\n{_ref1}\n\n"
-                    f"【要求】事实、专有名词、人名作品名可以参考它；"
+                    f"【要求】它只是参考，**不是你要回的内容**；"
+                    f"如果它和当前消息无关、或者明显在答别的事，**直接忽略，别顺着它接**。"
+                    f"事实、专有名词、人名作品名可以参考它；"
                     f"但语气、称呼、要不要说这些由你自己决定，用你自己的话说，"
                     f"不要照抄，也不要提「参考」「另一个模型」这类字眼。"
                 )
@@ -4193,12 +4516,14 @@ async def _session_worker(bot: Bot, session_key: str):
                     session_key, text_for_llm, group_context=ctx,
                     speaker_qq=speaker_qq, speaker_name=speaker_name,
                     is_vision=_is_vision, media_kind=_media_kind,
+                    moon_target_qq=_moon_target_qq,
                 )
             finally:
                 await _typing(bot, ev, False)
 
             # ---------- 4) 拆出 [[MEMO]] / [[CALL]] / [[FOCUS]] ----------
-            parsed = parse_reply(reply)
+            # 带上被引用原文：她如果开头照抄，parse_reply 会剥掉（2026-11-23）。
+            parsed = parse_reply(reply, quote_text=getattr(ev, "_quote_text", ""))
 
             # 👇 她自己在回哪一句？日志里直接看得到，用来诊断「是不是在接历史旧话」
             _focus = str(parsed.get("focus") or "").strip()
@@ -4240,16 +4565,51 @@ async def _session_worker(bot: Bot, session_key: str):
                 # 让判读把好感回暖、心情回升写进去。用户 2026-11-20：
                 # 「道歉可以破冰，可以回暖好感以及回升一些心情。」
                 _thaw_note = str(getattr(ev, "_thaw_note", "") or "")
+                _judge_src = (segments.short(_seg_records, n=4)
+                              if _seg_records else f"{speaker_name}: {text}")
+                # 👇 她明确引用/回复了某一条 → 这次心情/好感算到**那个人**头上，
+                #    不再默认算给「这一段最后一个说话的人」（回复错人的另一半原因）。
+                _reply_to_qq = ""
+                try:
+                    _rid0 = ""
+                    for _it in (parsed.get("items") or []):
+                        _r0 = str(_it.get("replyTo") or "").strip()
+                        if _r0:
+                            _rid0 = _r0
+                            break
+                    if _rid0 and _seg_records:
+                        for _r in _seg_records:
+                            if str(_r.get("mid") or "") == _rid0:
+                                _reply_to_qq = str(_r.get("uid") or "")
+                                break
+                    if _reply_to_qq and _reply_to_qq != speaker_qq:
+                        logger.info(f"[REPLY] 她回的是 {_reply_to_qq}"
+                                    f"（这一段最后说话人是 {speaker_qq}）")
+                except Exception:
+                    _reply_to_qq = ""
+                _judge_qq = _reply_to_qq or speaker_qq
                 _spawn_mood_judge(
                     session_key, _mood_label, ctx, _think,
-                    src=f"{speaker_name}: {text}",
-                    reply=_myreply, speaker_qq=speaker_qq,
+                    src=_judge_src,
+                    reply=_myreply, speaker_qq=_judge_qq,
                     hint=(f"他刚道歉/哄她（原来的心结：{_thaw_note}）"
                           if _thaw_note else ""),
                     repair=bool(_thaw_note), force=bool(_thaw_note),
-                    turn_id=_turn_id)
+                    turn_id=_turn_id,
+                    addressed=bool(_addressed))
             except Exception as e:
                 logger.debug(f"[MOOD-JUDGE] 触发失败: {type(e).__name__}: {e}")
+
+            # 处理过的整段存一份：下一轮上下文 / 翻历史都读这份，
+            # 不再把 NapCat 原生消息直接塞给模型。
+            try:
+                if _seg_records:
+                    _mv = float(mood.get_mood(session_key).get("value") or 0.0) / 100.0
+                    segments.add_processed(
+                        session_key, text, mood=_mood_label, value=_mv,
+                        addressee=("叫了她" if _seg_addressed else "大家"))
+            except Exception as _se:
+                logger.debug(f"[SEGMENT] 存处理过的段失败: {type(_se).__name__}: {_se}")
 
             # ---------- 4.0) 称谓档案：她自己判断「我们以后怎么互相称呼」 ----------
             # 和 `/叫你`（给她起名）/ `/叫我`（她怎么叫你）的区别：
@@ -4330,6 +4690,16 @@ async def _session_worker(bot: Bot, session_key: str):
                 _mgid = str(getattr(ev, "group_id", "") or "")
                 if _mgid:
                     _mtext = f"（群号:{_mgid}）{mtext}"
+                # 👇 刻痕门槛（2026-11-22）：只收「真的动过」的事。
+                #   以前写成 `emo != neutral` → 她随手写个「开心/烦躁」就进刻痕，
+                #   结果记忆和档案里全是流水账（用户：「标了很多很平常的事情」）。
+                #   现在：有判读就只看 |Δ|；没判读才退回 MEMO，而且只认强情绪。
+                _memo_min = float(tuning.f("MEMORY_EMOTION_MIN_DELTA"))
+                _strong_emo = str(emo) in ("sad", "angry", "lonely", "touched",
+                                           "love", "excited")
+                _hit_by_judge = bool(_jd_fresh) and abs(float(_jdelta or 0)) >= _memo_min
+                _hit_by_memo = (not _jd_fresh) and _strong_emo
+                _emo_hit = (not _is_bond) and (_hit_by_judge or _hit_by_memo)
                 try:
                     memory_v2.remember(
                         text=_mtext,
@@ -4338,10 +4708,8 @@ async def _session_worker(bot: Bot, session_key: str):
                         tags=memo.get("tags") or [],
                         importance=0.45 if _is_bond else float(imp),
                         # 刻痕 = |Δ|（这件事让她变了多少），不是当前心情水平。
-                        # 判读够新就用 Δ；没有判读才退回 MEMO 自报的 emotion 表。
-                        emotion_hit=((not _is_bond) and
-                                     ((_jd_fresh and _jsal >= 0.3)
-                                      or emo != "neutral")),
+                        # 判读够新就只看 Δ；没有判读才退回 MEMO 自报的情绪。
+                        emotion_hit=_emo_hit,
                         emotion_weight=(0.0 if _is_bond
                                         else (_jsal if _jd_fresh
                                               else memory_v2.emotion_weight_of(emo))),
@@ -4365,7 +4733,9 @@ async def _session_worker(bot: Bot, session_key: str):
                 #    2026-11-20：中性经历只进记忆目录，不进档案，否则档案变流水账。
                 # 档案只收「让她心情明显动过」的事：判据是 |Δ|，不是当前水平。
                 # 0.15 ≈ 一次"明显被戳到"；小事（±0.05）不写进档案。
-                _bond_worthy = (emo != "neutral") or (_jd_fresh and abs(_jdelta) >= 0.15)
+                # 档案同样只看「真的动过」：|Δ| >= 门槛；没判读时才退回强情绪。
+                _bond_worthy = (_hit_by_judge
+                                or ((not _jd_fresh) and _strong_emo))
                 if _bond_worthy:
                     try:
                         profiles.add_bond_note(
@@ -4550,12 +4920,23 @@ async def _session_worker(bot: Bot, session_key: str):
                 # 被 @ 时系统兜底引用（老行为）；**图片/视频**也兜底引用 ——
                 # 「这图笑死」不引用那张图，群友根本不知道在说哪张。
                 _pic_msg = _media_placeholder(ev) in ("[图片]", "[视频]")
-                if _is_group and (ev.is_tome() or _pic_msg):
+                # 👇 2026-11-22「偶尔回复错人」：分段里可能有好几个人，
+                #    ev 是**最后一条**。如果这一轮是「有人 @ 了她、后面别人又聊了几句」，
+                #    自动引用最后一条就会引到别人身上。
+                #    所以优先引「这一段里最后一条真的 @ 了她」的消息。
+                _mens = [r for r in (_seg_records or []) if r.get("mentioned")]
+                if _is_group and _mens:
+                    _auto_rid = str(_mens[-1].get("mid") or "")
+                    _auto_call = str(_mens[-1].get("name") or "")
+                elif _is_group and (ev.is_tome() or _pic_msg):
                     _auto_rid = str(getattr(ev, "message_id", "") or "")
-                    _quote_left = bool(_auto_rid)
+                    _auto_call = ""
+                    if _pic_msg and _seg_records:
+                        _auto_rid = str(_seg_records[-1].get("mid") or _auto_rid)
+                _quote_left = bool(_auto_rid)
             except Exception:
                 _auto_rid, _quote_left = "", False
-            if _auto_rid:
+            if _auto_rid and not _auto_call:
                 try:
                     _auto_call = profiles.call_of(str(ev.user_id), speaker_name)
                 except Exception:
@@ -4583,6 +4964,8 @@ async def _session_worker(bot: Bot, session_key: str):
                 if kind == "text":
                     # 👇 兜底清 HTML：搜索结果里的 <br> 被模型抄进回复时，用户会直接看到标签
                     val = strip_html(val)
+                    # 👇 最后一道：协议标记（THINK / TOOLS / 半截标签）绝不能发出去
+                    val = strip_protocol_residue(val)
                     # 👇 引用回复：她写了 <reply:消息号> 就真的引那条。
                     #    parse_reply 只负责把标记抠出来塞进 item["replyTo"]，
                     #    真正发 reply 段在这里 —— 之前这段根本没接，标记被静默丢掉了。
@@ -4625,7 +5008,11 @@ async def _session_worker(bot: Bot, session_key: str):
                                     )
                                     said.append(val)
                                     continue
-                            val = limit_hanzi(val, _g_limit)
+                                val = limit_hanzi(val, _g_limit)
+                            # ⚠️ 2026-11-23 用户：「接一句词不达意」。
+                            #    带 @ / 显式引用的长回复以前会被 limit_hanzi 硬切在 20 字，
+                            #    半句话直接发出去 → 看起来就是答非所问。
+                            #    QQ 本身能发长消息，这里**不截断**，整段发完整。
                     else:
                         # 👇 私聊同一条规矩（用户 2026-11-18）：20 字内直接发，超过走合并转发。
                         if not _long and hanzi_count(val) > PRIVATE_MAX_HANZI:
@@ -4633,7 +5020,8 @@ async def _session_worker(bot: Bot, session_key: str):
                                 if await _send_long_as_forward(bot, ev, val):
                                     said.append(val)
                                     continue
-                            val = limit_hanzi(val, PRIVATE_MAX_HANZI)
+                                val = limit_hanzi(val, PRIVATE_MAX_HANZI)
+                            # 带 @ / 引用 → 保留全文，不截断（同上）
                     if not val.strip() and not at_names:
                         # 这个气泡是空的、没发出去 → 把自动引用还给下一个气泡
                         if _auto_used:
@@ -4761,7 +5149,7 @@ async def _session_worker(bot: Bot, session_key: str):
                 try:
                     dialogue_log.log_msg(
                         str(ev.group_id) if _is_group else f"private_{speaker_qq}",
-                        "你", str(bot.self_id), "；".join(said), kind="bot",
+                        "你", _self_id(ev, bot), "；".join(said), kind="bot",
                         extra={"to": speaker_qq},
                     )
                 except Exception:
@@ -4853,6 +5241,28 @@ async def _random_chat_loop(bot: Bot):
                         _spk = str(last_group_speaker.get(gid) or "")
                         if _spk and chat_switch.is_off(f"group_{gid}", _spk)[0]:
                             continue
+                    except Exception:
+                        pass
+
+                    # 👇 最新一句如果是「某个人 → 另一个群友」的私聊式对话，别插话
+                    #    （用户 2026-11-23：「收件人不是大家、是一个群友的情况下他也回复」）。
+                    #    用 group_scene 已经判好的「谁 → 谁」，不靠关键词猜。
+                    try:
+                        _lm = group_scene.last(gid)
+                        if _lm and not _lm.get("is_bot"):
+                            _lk = str(_lm.get("to_kind") or "").strip().lower()
+                            _lq = str(_lm.get("to_qq") or "")
+                            try:
+                                _lc = float(_lm.get("to_conf") or 0.0)
+                            except Exception:
+                                _lc = 0.0
+                            if (_lk == "person" and _lq and _lc >= 0.5
+                                    and not _is_self_qq(_lq)):
+                                logger.debug(
+                                    f"[GROUP] {gid} 最新一句是 "
+                                    f"{_lm.get('name') or '?'} → "
+                                    f"{_lm.get('to_name') or _lq}，不插话")
+                                continue
                     except Exception:
                         pass
 
@@ -5017,15 +5427,16 @@ async def _random_chat_loop(bot: Bot):
                     # 这段上下文已经看过（不管最后是开口还是潜水）→ 下个 tick 不再重复判断
                     _interject_seen[gid] = _latest_human_ts
 
-                    # 上下文给她最近 8 条，**包含她自己刚说的**（带「这是你之前的回复：」标记）。
-                    # 为什么改：以前只给真人的话，她插话时根本不知道自己上一句说了什么
-                    # （用户 2026-11-18：「不清楚自己上一句话」）。
+                    # 上下文给她最近 8 条，**必须是收发件人处理过的历史**
+                    # （用户 2026-11-23：「这些上下文一定要收发件人处理过」）。
+                    # history_lines 里也包含她自己刚说的（带「你 → 大家」）。
                     # 注意 pairs（判相关度/决定要不要插）仍然只算真人，避免她顺着自己接。
-                    _ctx_lines = list(recent)[-8:]
+                    _ctx_lines = group_scene.history_lines(
+                        gid, mood_judge.CTX_LINES) or []
                     # 群聊现场：给插话用的「谁 → 谁 / 几条线程 / 谁在叫」
                     _scene_txt = ""
                     try:
-                        _bid = str(getattr(bot, "self_id", "") or "")
+                        _bid = _self_id(bot=bot)
                         if scene_auditor.enabled():
                             try:
                                 await asyncio.wait_for(
@@ -5112,7 +5523,7 @@ async def _random_chat_loop(bot: Bot):
                             _src2 = str(pairs[-1][1] if pairs else "").strip()
                             _spawn_mood_judge(
                                 f"group_{gid}", _mood_label2,
-                                list(recent)[-mood_judge.CTX_LINES:], _think2,
+                                _ctx_lines, _think2,
                                 src=_src2, reply=_reply2)
                         except Exception as e:
                             logger.debug(f"[MOOD-JUDGE] 插话触发失败: {type(e).__name__}: {e}")
@@ -5340,7 +5751,11 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
             "· 档案 — 人物卡/本群称呼/词条触发/档案图 自检\n"
             "· 现场 — 当前群聊现场（图片）；没人说话时用「现场 回放 / 样例」\n"
             "· 审核 — 审核 LLM 这一层：为什么没审/返回了什么/改了几条\n"
-            "· 搜图 — 拿这个会话最近一张图，看 trace.moe 原始结果和判定\n"
+            "· 搜图 — 拿这个会话最近一张图，看综合搜源（TraceMoe/SauceNAO/Ascii2D/IQDB）结果\n"
+            "· 分段 — 群聊「等一段说完再回」：现在攒了几条 / 参数 / 最近处理过的段\n"
+            "· 群心情 — 这个群 5 小时净变化 / 喜欢讨厌人数 / 单人 0.4 / 整群 0.7\n"
+            "· 面板 [群号] [QQ号] — 只打「心情栏 + 好感栏」两段原样模板\n"
+            "· 模板 [群号] [QQ号] — 她这一轮真正看到的全部内容（人格/规矩/上下文块/好感/心情/工具）\n"
             "· 链路 — 上一次真实请求塞进了哪些块/工具（查「参数没传通」）\n"
             "· 主动 — 主动私聊现在会想找谁（只看不发）\n"
             "· 用量 — API 余额 + 本机记账的调用量（token/次数/缓存命中）\n"
@@ -5348,11 +5763,13 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
             "· 头像 QQ号 — 头像从哪来：NapCat / 直连 / 为什么没拿到\n"
             "· 全链路 — 一条命令看心情这套通没通（判读/数值/插话/安静/记忆/档案）\n"
             "· 安静 [群号/QQ] [时长] — 强制安静（连 @ 也不回；默认 60 分钟）\n"
-            "  · 带时长 = 真的安静，如 /测函数 安静 822659531 1小时\n"
+            "  · 带时长 = 真的安静，如 /测函数 安静 100000017 1小时\n"
             "  · 不带时长 = 只看状态 + 安静建议（好感/心情走势、群里插不插得上话）\n"
-            "  · 加「解除」= 开回来，如 /测函数 安静 解除 822659531\n"
+            "  · 加「解除」= 开回来，如 /测函数 安静 解除 100000017\n"
             "· /说话 [群号/QQ] — 解除安静\n"
             "· 风格 — 列出她学到说话方式的人；/测函数 风格 QQ号 看某人详情\n"
+            "· 白月光 [群号] — 她在这个群最常引用/回复/@谁 + 学到的说话方式\n"
+            "· prompt — 今日每段占比/关注度 + 各用途缓存命中率\n"
             "· 挖掘 QQ号 群号 — 手动从群聊提炼这个人的档案（简介/性格/事情）\n"
             "· 字幕 BV号 — 测B站字幕提取\n"
             "\n"
@@ -5575,17 +5992,19 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
             _data = _r.content
         except Exception as e:
             await _test_fn.finish(f"图片下载失败：{type(e).__name__}: {e}")
-        from services import vision_verify as _vv
+        from services import image_search as _is, vision_verify as _vv
+        _all = await _is.search(_data)
         _res = await _vv.trace_moe(_data)
+        _lines = ["▍综合搜图（TraceMoe / SauceNAO / Ascii2D / IQDB）",
+                  _is.format_results(_all, limit=10) or "（所有源都没结果）"]
         if not _res:
-            await _test_fn.finish(
-                "trace.moe 没返回任何结果（不是动漫截图 / 被纯色挡掉 / 今日额度用完）。\n"
-                f"额度上限 {_vv.TRACE_MAX_PER_DAY} 次/天"
-            )
-        _lines = [
-            f"门槛：采信 ≥{_vv.TRACE_MIN_SIM:.2f}（疑似）｜高置信 ≥{_vv.TRACE_STRONG_SIM:.2f}"
+            _lines.append("· trace.moe 单独判定：无结果（非动漫 / 纯色挡掉 / 额度用完）")
+            await _test_fn.finish("\n".join(_lines))
+        _lines += [
+            f"· trace.moe 门槛：采信 ≥{_vv.TRACE_MIN_SIM:.2f}"
+            f"｜高置信 ≥{_vv.TRACE_STRONG_SIM:.2f}"
             f"｜单帧直通 ≥{_vv.TRACE_SINGLE_SIM:.2f}",
-            f"原始返回：{_res.get('raw', '?')} 条",
+            f"· trace.moe 原始返回：{_res.get('raw', '?')} 条",
         ]
         for _d in (_res.get("debug") or []):
             _lines.append(f"· {_d['work']} 相似度 {_d['sim']:.2f}"
@@ -5601,6 +6020,226 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
                                for c in (_res.get("candidates") or []))
             _lines.append(f"判定：不采信（只当线索）→ {_cands or '无候选'}")
         await _test_fn.finish("\n".join(_lines))
+
+    if what.startswith(("模板", "prompt", "上下文全文", "system")):
+        # /测函数 模板 [群号] [QQ号] —— 打印她这一轮**真正看到的**全部内容。
+        # 用户 2026-11-22：「模板有很多重复的」→ 不再由我重新拼一遍（重拼必然重复），
+        # 直接读 llm._LAST_MSGS：那是真正发出去的那一份。
+        _gid_t = _tgt_gid or str(getattr(event, "group_id", "") or "")
+        _qq_t = (_tgt_gid2
+                 or ("" if _tgt_gid else str(getattr(event, "user_id", "") or "")))
+        _key_t = f"group_{_gid_t}" if _gid_t else f"private_{_qq_t}"
+
+        _msgs = []
+        try:
+            _msgs = llm_mod.last_messages(_key_t) or llm_mod.last_messages()
+        except Exception:
+            _msgs = []
+
+        if _msgs:
+            _total = sum(len(str(m.get("content") or "")) for m in _msgs)
+            _toc = [f"📋 这一轮真正发给模型的输入：{len(_msgs)} 块 / 共 {_total} 字"]
+            for _i, _m in enumerate(_msgs, 1):
+                _b = _m.get("content")
+                _b = _b if isinstance(_b, str) else str(_b)
+                _role = "👤user" if _m.get("role") == "user" else "⚙️sys"
+                _toc.append(f"#{_i} {_role} {len(_b):>5} 字  {_block_title(_b)}")
+            _tools = []
+            try:
+                _tools = llm_mod.tools_for(_key_t)
+            except Exception:
+                _tools = []
+            _toc.append(f"🔧 工具 {len(_tools)} 个："
+                        + "、".join((t.get("function") or {}).get("name") or "?"
+                                   for t in _tools[:20]))
+            _toc.append("（下面是全文；太长会分批）")
+            await bot.send(event, "\n".join(_toc))
+            _sent = 0
+            for _i, _m in enumerate(_msgs, 1):
+                _raw = _m.get("content")
+                _body = _raw if isinstance(_raw, str) else f"[多模态] {str(_raw)[:300]}"
+                for _piece in _chunk_text(f"── #{_i} {_m.get('role')}（{len(_body)} 字）──\n{_body}",
+                                          1200):
+                    await bot.send(event, _piece)
+                    await asyncio.sleep(0.4)
+                    _sent += 1
+                    if _sent >= 40:
+                        await bot.send(event, "（太长，先打到这里；完整内容在 data/llm_trace）")
+                        await _test_fn.finish()
+            await _test_fn.finish()
+
+        # 还没有真实请求（刚重启）→ 退回重建，但只打印 packet 里**没有**的块
+        from services import prompt_builder as _pb
+        from services.persona import persona_for as _persona_for
+        _sections = []
+        try:
+            _pname, _ptext = _persona_for(_key_t)
+            _sections.append((f"人格 system（{_pname}）", _ptext or "（空）"))
+        except Exception as e:
+            _sections.append(("人格 system", f"读取失败：{type(e).__name__}: {e}"))
+        try:
+            _proto = llm_mod._behaviour_protocol(
+                _key_t, is_group=bool(_gid_t), has_ctx=True,
+                addressed=True, dynamic=False)
+            _sections.append(("规矩（固定区）", _proto or "（空）"))
+            _dyn = llm_mod._dynamic_protocol(_key_t, is_group=bool(_gid_t))
+            if _dyn:
+                _sections.append(("规矩（每轮动态区）", _dyn))
+        except Exception as e:
+            _sections.append(("规矩块", f"读取失败：{type(e).__name__}: {e}"))
+        _pk = {}
+        try:
+            _pk = _pb.build_packet(
+                session_key=_key_t, user_text="（模板自检）",
+                speaker_qq=_qq_t, speaker_name=display_name(event),
+                gid=_gid_t, addressed=True, record=False) or {}
+            for _k, _v in _pk.items():
+                if isinstance(_v, str) and _v.strip():
+                    _sections.append((f"上下文块 · {_k}", _v))
+        except Exception as e:
+            _sections.append(("上下文块", f"读取失败：{type(e).__name__}: {e}"))
+        # relation / mood 已经在 packet 里就不再重复打印
+        if "relation" not in _pk:
+            try:
+                _rel = profiles.relation_block(_qq_t, _gid_t, max_len=600)
+                if _rel:
+                    _sections.append(("关系底色", _rel))
+            except Exception:
+                pass
+        if "mood" not in _pk:
+            try:
+                _sections.append(("心情", mood.status_block(_key_t) or "（空）"))
+            except Exception:
+                pass
+        try:
+            _tools = llm_mod.tools_for(_key_t)
+            _lines = [f"共 {len(_tools)} 个"]
+            for _t in _tools:
+                _fn = (_t or {}).get("function") or {}
+                _lines.append(f"· {_fn.get('name')}：{str(_fn.get('description') or '')[:160]}\n"
+                              f"  参数 {json.dumps(_fn.get('parameters') or {}, ensure_ascii=False)[:300]}")
+            _sections.append((f"工具 tools_for（{_key_t}）", "\n".join(_lines)))
+        except Exception as e:
+            _sections.append(("工具", f"读取失败：{type(e).__name__}: {e}"))
+        _all = [f"▍{n}（{len(str(b))} 字）\n{b}" for n, b in _sections]
+        _msg = ("（还没有真实请求，下面是重建版；块已去重）\n\n" + "\n\n".join(_all))
+        _chunks, _cur = [], ""
+        for _ln in _msg.split("\n"):
+            if len(_cur) + len(_ln) + 1 > 1200 and _cur:
+                _chunks.append(_cur)
+                _cur = _ln
+            else:
+                _cur = (_cur + "\n" + _ln) if _cur else _ln
+        if _cur:
+            _chunks.append(_cur)
+        for _i, _c in enumerate(_chunks, 1):
+            await bot.send(event, f"（{_i}/{len(_chunks)}）\n{_c}")
+            await asyncio.sleep(0.4)
+        await _test_fn.finish()
+
+    if what.startswith(("面板", "两栏", "心情好感")):
+        # /测函数 面板 [群号] [QQ号] —— 只打「心情」和「好感」两栏（原样，不重拼）。
+        _gid_p = _tgt_gid or str(getattr(event, "group_id", "") or "")
+        _qq_p = _tgt_gid2 or (str(getattr(event, "user_id", "") or "")
+                              if not _tgt_gid else "")
+        _key_p = f"group_{_gid_p}" if _gid_p else _get_session_key(event)
+        _nm_p = ""
+        try:
+            _nm_p = profiles.call_of(_qq_p, display_name(event), _gid_p) or _qq_p
+        except Exception:
+            _nm_p = _qq_p
+        _lines = ["▍心情栏（这个会话，当前状态）"]
+        try:
+            _lines.append(mood.status_block(_key_p) or "（空）")
+        except Exception as e:
+            _lines.append(f"读取失败：{type(e).__name__}: {e}")
+        _lines += ["", f"▍好感栏（对 {_nm_p}）"]
+        try:
+            _rel = profiles.relation_block(_qq_p, _gid_p, max_len=900)
+            _lines.append(_rel or "（空：还没有好感/相处记录）")
+        except Exception as e:
+            _lines.append(f"读取失败：{type(e).__name__}: {e}")
+        try:
+            _mv = float(mood.get_mood(_key_p).get("value") or 0.0) / 100.0
+            _av = float(profiles.get_affinity(_qq_p))
+            _iv = float(profiles.intimacy(_qq_p))
+            _lines += ["", f"原始值：心情 {_mv:+.2f}｜好感 {_av:+.2f}"
+                           f"｜亲近 {_iv:.2f}"]
+        except Exception:
+            pass
+        _msg = "\n".join(_lines)
+        for _i, _c in enumerate(_chunk_text(_msg, 1200), 1):
+            await bot.send(event, _c)
+            await asyncio.sleep(0.3)
+        await _test_fn.finish()
+
+    if what.startswith(("群心情", "group_mood", "群氛围")):
+        _gm_reset = "重置" in what or "清空" in what
+        # /测函数 群心情 [群号] —— 独立于整体心情的那一层：
+        # 5 小时窗口净变化 / 喜欢讨厌人数 / 单人 0.4 / 整群 0.7+3 人 / 多说话乘数。
+        from services import group_mood as _gm
+        gid = _tgt_gid or str(getattr(event, "group_id", "") or "")
+        key = f"group_{gid}" if gid else _get_session_key(event)
+        _head = ""
+        if _gm_reset:
+            try:
+                _n = _gm.reset(key)
+                _head = f"已清空 {key} 的 {_n} 条群心情事件。\n\n"
+            except Exception as e:
+                _head = f"清空失败：{type(e).__name__}: {e}\n\n"
+        try:
+            _txt = _gm.status_text(key)
+        except Exception as e:
+            _txt = f"读取失败：{type(e).__name__}: {e}"
+        await _test_fn.finish((_head + "▍群心情（独立于整体心情）\n" + _txt)[:1800])
+
+    if what.startswith(("分段", "segment", "攒段")):
+        # /测函数 分段 [群号] —— 看「等一段说完再回」这一层到底在干什么：
+        #   · 参数是多少（安静几秒算说完 / 最长攒多久 / 最多几条）
+        #   · 现在 buffer 里攒着哪几条、最后一条多久之前
+        #   · 最近处理过的段（心情 + 收发件人）
+        # 用户 2026-11-22：「高频率群提问时一条一回很阻塞」→ 改成分段后要能自证。
+        from services import segments as _seg
+        gid = _tgt_gid or str(getattr(event, "group_id", "") or "")
+        key = f"group_{gid}" if gid else _get_session_key(event)
+        buf = _seg.current(key)
+        lines = [
+            f"▍群聊分段（{key}）",
+            f"· 参数：安静 {_seg.WAIT_SEC:.0f}s 算说完"
+            f"｜最长 {_seg.MAX_SEC:.0f}s"
+            f"｜最多 {_seg.MAX_MSGS} 条"
+            f"｜留 {_seg.HISTORY_KEEP} 段",
+            f"· 当前攒着：{len(buf)} 条",
+        ]
+        if buf:
+            _now = time.time()
+            for r in buf[-10:]:
+                _t = time.strftime("%H:%M:%S",
+                                   time.localtime(float(r.get("ts") or 0)))
+                lines.append(
+                    f"  {_t} {r.get('name') or r.get('uid') or '?'}"
+                    f" {_seg.addressee_of(r)}"
+                    f"：{str(r.get('text') or '（图片/表情）')[:40]}")
+            _idle = _now - float(buf[-1].get("ts") or _now)
+            lines.append(
+                f"· 最后一条在 {_idle:.1f}s 前"
+                f"（再过 {max(0.0, _seg.WAIT_SEC - _idle):.1f}s 就算这一段说完）")
+        rows = _seg.recent_processed(key, 3)
+        if rows:
+            lines.append("· 最近处理过的段：")
+            for r in rows:
+                _t = time.strftime("%H:%M",
+                                   time.localtime(float(r.get("at") or 0)))
+                lines.append(
+                    f"  [{_t}] 心情 {r.get('mood') or '-'}"
+                    f"（{float(r.get('value') or 0):+.2f}）"
+                    f"｜收发件人 {r.get('addressee') or '-'}")
+                lines.append("    " + (str(r.get("text") or "")
+                                       .split("\n")[-1][:80]))
+        else:
+            lines.append("· 还没有处理过的段"
+                         "（这是内存态，重启会清空；跑几轮群聊再看）")
+        await _test_fn.finish("\n".join(lines)[:1800])
 
     if what.startswith("字幕"):
         bv = what.replace("字幕", "").strip().upper()
@@ -5737,6 +6376,28 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
         except Exception as e:
             _out.append(f"· 风格检查失败 {type(e).__name__}")
         await _test_fn.finish("\n".join(_out))
+
+    if what.startswith(("prompt", "提示词", "关注度", "分段关注")):
+        # /测函数 prompt —— 今日每段占比/关注度 + 各 purpose 缓存命中
+        # 和 /用量 一样：文字报表 + 横向柱状图 + 扇形图（image-charts 渲染）
+        from services import prompt_report
+        _ptext = prompt_report.report_text()
+        if any(w in what for w in ("文字", "text", "nochart")):
+            await _test_fn.finish(_ptext)
+        _paths = await prompt_report.download_charts()
+        if not _paths:
+            await _test_fn.finish(_ptext)
+        _msg = Message(_ptext)
+        for _p in _paths:
+            _msg += MessageSegment.image(f"file://{Path(_p).resolve()}")
+        await _test_fn.finish(_msg)
+
+    if what.startswith(("白月光", "月光", "moon")):
+        # /测函数 白月光 [群号] —— 她在这个群最常引用/回复/@谁，以及学到的说话方式
+        from services import white_moon
+        _wm_gid = _tgt_gid or (
+            str(event.group_id) if isinstance(event, GroupMessageEvent) else "")
+        await _test_fn.finish(white_moon.status_text(_wm_gid))
 
     if what.startswith(("风格", "说话方式", "style")):
         # /测函数 风格 [QQ] [群号] —— 看「她学到的说话方式」到底存了什么
@@ -5927,8 +6588,8 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
             _txt = await asyncio.wait_for(
                 scene_auditor.diagnose(
                     _gid1,
-                    bot_qq=str(getattr(event, "self_id", "") or ""),
-                    bot_name=_bot_name(_gid1, str(getattr(event, "self_id", "") or "")),
+                    bot_qq=_self_id(event),
+                    bot_name=_bot_name(_gid1, _self_id(event)),
                     names=_scene_names(_gid1),
                 ),
                 timeout=max(4.0, scene_auditor.TIMEOUT + 2),
@@ -5943,7 +6604,7 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
         _gid0 = _tgt_gid or str(getattr(event, "group_id", "") or "")
         if not _gid0:
             await _test_fn.finish("私聊里要带群号：/测函数 现场 123456789")
-        _self0 = str(getattr(event, "self_id", "") or "")
+        _self0 = _self_id(event)
         _scope, _snames, _tag = _gid0, _scene_names(_gid0), ""
         # 👇 没人说话也能测：/测函数 现场 回放（今天日志）/ 样例（内置）
         #    灌进 `<gid>#replay` 这个独立 scope，不碰真实现场。
@@ -6011,6 +6672,15 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
             _ctxj = mood_judge.scene_lines(_sk)
         except Exception as e:
             logger.debug(f"[MOOD-JUDGE] 取上下文失败: {e}")
+        if "重置" in what:
+            # /测函数 心情 重置 —— 把历史误判累积出来的 -1 清回 0
+            try:
+                _nv = mood.reset(_sk)
+            except Exception as e:
+                await _test_fn.finish(f"重置失败：{type(e).__name__}: {e}")
+            await _test_fn.finish(
+                f"已把 {_sk} 的心情重置为 {_nv:+.2f}。\n"
+                "（历史判读流水还在 data/mood_history.jsonl，可以复盘）")
         if "重判" in what:
             # 她没写心情也能判：按最近 20 条群聊判断（用户 2026-11-19）
             _label0 = str(_m.get("label") or "").strip()
@@ -6101,16 +6771,53 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
         await _test_fn.finish("\n".join(_lines))
 
     if what.startswith(("用量", "余额", "usage", "api")):
-        # 和私聊里的 api_usage 工具同一份数据，方便不靠模型也能验证接线
+        # 两套账分开看：
+        #   · llm_usage —— 按 purpose / model 的 token 归因（含 judge / audit 两个三方 LLM）
+        #   · api_usage —— 供应商余额（DeepSeek /user/balance）
+        # 以前这里只调 api_usage，所以「哪块最贵」「三方 LLM 用了多少」永远看不到。
+        #
+        # ⚠️ 2026-11-23 修：finish() 抛的 FinishedException 以前被外层
+        #    `except Exception` 接住 → 报表发完又补一句「查用量失败：FinishedException」。
+        #    现在 try 只包「组装文本」，finish 放在 try 外面。
+        _d = 1
+        _m = re.search(r"\d+", what)
+        if _m:
+            _d = max(1, min(30, int(_m.group(0))))
         try:
-            from services import api_usage as _au
-            _d = 1
-            _m = re.search(r"\d+", what)
-            if _m:
-                _d = max(1, min(30, int(_m.group(0))))
-            await _test_fn.finish(await _au.report_text(days=_d))
+            from services import llm_usage as _lu, api_usage as _au
+            _out = [_lu.report_text(_d)]
+            try:
+                _bal = await _au.fetch_balance()
+                if _bal.get("ok") and _bal.get("items"):
+                    for _it in _bal["items"]:
+                        _out.append(
+                            f"💰 余额（{_bal.get('provider')}）：{_it.get('total')} "
+                            f"{_it.get('currency') or ''}"
+                            f"（赠送 {_it.get('granted')}｜充值 {_it.get('topped_up')}）")
+                elif _bal.get("ok"):
+                    _out.append("💰 " + (_bal.get("note") or "供应商没返回余额"))
+                else:
+                    _out.append(f"💰 余额查不到：{_bal.get('err') or '未知原因'}")
+            except Exception as _e:
+                _out.append(f"💰 余额查不到：{type(_e).__name__}: {_e}")
+            _text = "\n\n".join(_out)
         except Exception as e:
-            await _test_fn.finish(f"查用量失败：{type(e).__name__}: {e}")
+            _text = f"查用量失败：{type(e).__name__}: {e}"
+
+        # 图表：默认带图；`/测函数 用量 文字` 只看数字
+        _paths = []
+        if not any(w in what for w in ("文字", "text", "nochart")):
+            try:
+                from services import usage_chart as _uc
+                _paths = await _uc.download_charts(_d)
+            except Exception as _e:
+                logger.warning(f"[USAGE] 图表生成失败（忽略）: {type(_e).__name__}: {_e}")
+        if not _paths:
+            await _test_fn.finish(_text)
+        _msg = Message(_text)
+        for _p in _paths:
+            _msg += MessageSegment.image(f"file://{Path(_p).resolve()}")
+        await _test_fn.finish(_msg)
 
     await _test_fn.finish(f"不认识的测项：{what}")
 
@@ -6288,6 +6995,10 @@ def _items_to_message(items) -> Message:
         k = str(it.get("kind") or "")
         v = str(it.get("value") or "").strip()
         if k == "text" and v:
+            # 最后一道：任何协议标记都不许出现在发出去的文字里
+            v = strip_protocol_residue(v).strip()
+            if not v:
+                continue
             _ats, _body = _split_at_tags(v)
             for _nm in _ats:
                 out.append(MessageSegment.text(f"@{_nm} "))
@@ -6366,7 +7077,7 @@ async def _send_proactive(bot: Bot, cand: dict) -> bool:
 
     # 落盘 + 记忆：下次她自己能想起来「我昨天主动找过他」
     try:
-        dialogue_log.log_msg(key, _bot_name(), str(getattr(bot, "self_id", "") or ""),
+        dialogue_log.log_msg(key, _bot_name(), _self_id(bot=bot),
                              clean, kind="bot")
     except Exception:
         pass
@@ -6933,42 +7644,22 @@ async def _tool_vision_source(args: dict) -> str:
         return f"图片下载失败：{type(e).__name__}"
 
     try:
-        from services import vision_verify
-        res = await vision_verify.trace_moe(r.content)
+        # 2026-11-22：不再裸调 trace.moe，走 PicImageSearch 综合搜
+        # （TraceMoe / SauceNAO / Ascii2D / IQDB），单 trace.moe 搜错的概率太高。
+        from services import image_search
+        results = await image_search.search(r.content)
     except Exception as e:
         return f"搜图失败：{type(e).__name__}: {e}"
 
-    if not res:
-        return ("trace.moe 没搜到：可能不是动漫截图，或者画面太糊/太碎。"
-                "别硬编出处，直接跟他说没搜到。")
+    if not results:
+        return ("综合搜图（TraceMoe/SauceNAO/Ascii2D/IQDB）都没搜到："
+                "可能不是动漫/插画截图，或者画面太糊/太碎。别硬编出处，直接跟他说没搜到。")
 
-    # 👇 相似度不够（没有 work）时别装死：把最接近的候选当线索给她，
-    #    让她自己结合画面判断，用「这是《X》吧」的推测语气说。
-    if not res.get("work"):
-        cands = res.get("candidates") or []
-        if not cands:
-            return ("trace.moe 没搜到：可能不是动漫截图，或者画面太糊/太碎。"
-                    "别硬编出处，直接跟他说没搜到。")
-        top = "、".join(f"《{c['work']}》{c['similarity']:.2f}" for c in cands[:3])
-        return (f"trace.moe 没有可靠命中，最接近的是：{top}。"
-                "相似度太低，只能当线索 —— 可以说「有点像《X》」，别当事实。")
-
-    parts = [f"《{res.get('work')}》"]
-    if res.get("episode"):
-        parts.append(f"第 {res['episode']} 集")
-    _at = res.get("at")
-    if isinstance(_at, (int, float)):
-        parts.append(f"约 {int(_at) // 60:02d}:{int(_at) % 60:02d} 处")
-    sim = res.get("similarity")
-    if sim:
-        parts.append(f"相似度 {float(sim):.2f}")
-    out = "、".join(parts)
-    chars = [str(x) for x in (res.get("characters") or [])][:4]
-    if chars:
-        out += "；主要角色：" + "、".join(chars)
-    _mid = (res.get("confidence") or "high") != "high"
-    return (f"搜到了（{'把握不大，仅供参考' if _mid else '比对命中'}）：{out}"
-            f"（来源 trace.moe，动漫截图识别）")
+    body = image_search.format_results(results, limit=6)
+    return ("综合搜图结果（按相似度排序；不同源可能指向同一张图）：\n"
+            + body
+            + "\n\n用的时候说清楚是哪个源、把握大不大；"
+              "相似度低就只当线索（「有点像《X》」），别当事实。")
 
 
 register_tool(
@@ -6977,7 +7668,8 @@ register_tool(
         "function": {
             "name": "vision_source",
             "description": (
-                "查一张图的出处（动漫截图 → 哪部番第几集）。"
+                "查一张图的出处（综合以图搜源：动漫截图 → 哪部番第几集；"
+                "插画/网图 → Pixiv/Twitter 等原始出处）。"
                 "用户问「这张图出自哪」「帮我搜下出处」「这是哪个番」时用。"
                 "不填参数 = 查这个会话最近发的那张图；也可以给 message_id 或图片链接。"
             ),
@@ -7086,7 +7778,7 @@ async def _resolve_target(target: str, event, bot=None) -> tuple:
                "this", "对方"):
         return ("人", here_uid) if here_uid else ("", "")
     if low in ("me", "我", "自己"):
-        return "人", str(getattr(event, "self_id", "") or "")
+        return "人", _self_id(event)
     if low in ("owner", "主人", "master"):
         from services import access
         return ("人", access.OWNER_QQ) if access.OWNER_QQ else ("", "")
@@ -7340,6 +8032,93 @@ register_tool(
     },
     _tool_api_usage,
     scope=("private",),
+)
+
+
+async def _tool_hash_decode(args):
+    """解 32/40/64 位十六进制哈希（常见短语/4 位数字）。"""
+    a = args or {}
+    q = str(a.get("hash") or a.get("text") or "").strip()
+    try:
+        from services import hash_solver
+        r = hash_solver.solve(q)
+    except Exception as e:
+        return f"哈希反查失败：{type(e).__name__}: {e}"
+    if not r.get("hash"):
+        return "没看出这是哈希：32 位是 MD5，40 位是 SHA1，64 位是 SHA256。把那一串原样给我。"
+    if r.get("plain"):
+        return (f"这是 {str(r['algo']).upper()}；原文是「{r['plain']}」"
+                f"（本地字典比对出来的，不是解密）。")
+    return (f"这是 {str(r['algo']).upper()} 哈希（{r['hash'][:12]}…）。"
+            "本地字典没查到原文——哈希不可逆，只能靠字典/彩虹表/猜原文；"
+            "可以问他原文大概几个字、是不是中文、有没有加盐。")
+
+
+register_tool(
+    {
+        "type": "function",
+        "function": {
+            "name": "hash_decode",
+            "description": (
+                "解 32/40/64 位十六进制哈希（MD5/SHA1/SHA256）。"
+                "群友发一串哈希让你猜原文、或说「这是用 XX 加密的」时调用。"
+                "本地字典能解常见短语（如 我爱你）和 4 位数字；查不到就直说不可逆。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "hash": {"type": "string",
+                             "description": "要解的哈希值（32/40/64 位十六进制）"},
+                },
+                "required": ["hash"],
+            },
+        },
+    },
+    _tool_hash_decode,
+    scope=("private", "group"),
+)
+
+
+async def _tool_web_fetch(args):
+    """打开一个 URL 并返回正文；也用来提交 GET 表单（参数拼进 URL）。"""
+    a = args or {}
+    url = str(a.get("url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return "给我一个完整的 http/https 链接。"
+    try:
+        from services import web_page
+        r = await web_page.fetch_page(url, timeout=20)
+    except Exception as e:
+        return f"打开失败：{type(e).__name__}: {e}"
+    if r.get("text"):
+        return (f"标题：{r.get('title') or '（无）'}\n"
+                f"{r['text'][:3000]}")
+    return f"打开失败：{r.get('error') or '空页面'}"
+
+
+register_tool(
+    {
+        "type": "function",
+        "function": {
+            "name": "web_fetch",
+            "description": (
+                "打开一个 http/https 链接并返回网页正文。"
+                "用户让你看网页、或做题/填表后要提交时用："
+                "把答案参数拼进页面给的提交 URL，再调这个打开它，"
+                "返回的正文里通常有分数/提交结果。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string",
+                            "description": "完整 URL（含 ?a=b&c=d 查询参数）"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    _tool_web_fetch,
+    scope=("private", "group"),
 )
 
 
@@ -8106,7 +8885,7 @@ def _scene_selfcheck(event, gid: str = "") -> str:
     gid = str(gid or getattr(event, "group_id", "") or "")
     if not gid:
         return "🎬 群聊现场\n· 这个只能在群里看（私聊没有多线程）。"
-    self_id = str(getattr(event, "self_id", "") or "")
+    self_id = _self_id(event)
     uid = str(getattr(event, "user_id", "") or "")
     snap = group_scene.snapshot(
         gid, bot_qq=self_id, my_names=_my_names(f"group_{gid.split('#')[0]}", uid))
@@ -8752,8 +9531,8 @@ async def _(bot: Bot, event: NoticeEvent):
             return
         if getattr(event, "sub_type", "") != "poke":
             return
-        if int(getattr(event, "target_id", 0) or 0) != int(bot.self_id):
-            return                      # 戳的是别人，不管
+        if not _is_self_qq(getattr(event, "target_id", ""), event):
+            return                      # 戳的是别人（不是她的任何号），不管
 
         uid = str(getattr(event, "user_id", "") or "")
         gid = getattr(event, "group_id", None)
@@ -8767,6 +9546,33 @@ async def _(bot: Bot, event: NoticeEvent):
         if gid and _in_sleep_hour():
             logger.info(f"[POKE] {session_key} 免打扰时段"
                         f"（{SLEEP_HOUR_START}~{SLEEP_HOUR_END} 点），不接戳")
+            return
+
+        # 👇 先把「被戳」写进对话上下文（不管回不回都记，她知道被戳了几次）。
+        #    用户 2026-11-12：「我问他，他说没收到戳啊」—— poke 是 notice 事件，
+        #    以前只在这里回一句就完了，**没进 recent_group_msgs**，
+        #    所以她下一轮看上下文时压根不知道刚被戳过，只能说「没收到」。
+        # 戳一戳自带的动作/台词（「揉了揉…并说了句：好可爱」）—— 以前整个丢掉了
+        _act = _poke_action_text(event)
+        _nm = _msg_label(event) if gid else ""
+        try:
+            _now_p = time.time()
+            recent_group_msgs[str(gid)].append(
+                f"{_ts_tag(_now_p)}{_nm or ('QQ' + uid)}【戳了你一下】"
+                f"{_act or '（没有附加动作）'}: （不是消息，是戳一戳）"
+            )
+            recent_group_ts[str(gid)].append(_now_p)
+        except Exception:
+            pass
+
+        # 👇 戳一戳次数屏蔽（2026-11-23 用户）：
+        #    「同一个人 2 小时内戳超过 3 次就不回，2 小时后再看」
+        #    窗口内第 4 次起：不回、也不戳回，只记上下文；滑出窗口后自动恢复。
+        _allow, _n = poke_guard.note(uid)
+        if not _allow:
+            logger.info(
+                f"[POKE] {uid} 在 {poke_guard.WINDOW_SEC / 3600:.0f}h 内第 {_n} 次戳"
+                f"（上限 {poke_guard.MAX_PER_WINDOW}）→ 不回、不戳回，只记上下文")
             return
 
         _focus_start(session_key, uid)   # 走和 @ 完全一样的关注逻辑
@@ -8783,25 +9589,6 @@ async def _(bot: Bot, event: NoticeEvent):
             logger.info(f"[POKE] {session_key} 已戳回 {uid}")
         except Exception as e:
             logger.warning(f"[POKE] 戳回 {uid} 失败: {type(e).__name__}: {e}")
-
-        # 👇 把「被戳」写进对话上下文。
-        #    用户 2026-11-12：「我问他，他说没收到戳啊」—— poke 是 notice 事件，
-        #    以前只在这里回一句就完了，**没进 recent_group_msgs**，
-        #    所以她下一轮看上下文时压根不知道刚被戳过，只能说「没收到」。
-        # 戳一戳自带的动作/台词（「揉了揉…并说了句：好可爱」）—— 以前整个丢掉了
-        _act = _poke_action_text(event)
-        try:
-            _nm = ""
-            if gid:
-                _nm = _msg_label(event)
-            _now_p = time.time()
-            recent_group_msgs[str(gid)].append(
-                f"{_ts_tag(_now_p)}{_nm or ('QQ' + uid)}【戳了你一下】"
-                f"{_act or '（没有附加动作）'}: （不是消息，是戳一戳）"
-            )
-            recent_group_ts[str(gid)].append(_now_p)
-        except Exception:
-            pass
 
         # 👇 不再用写死的台词（用户 2026-11-19：「她回复了一句没有疑惑标签的表情。
         #    实际上是有的」—— 根因是戳一戳的 raw_info 里明明有「揉了揉…并说了句：好可爱」，
@@ -8881,7 +9668,7 @@ async def _(bot: Bot, event: MessageEvent):
         if not text:
             return
         # 它在跟我们说话吗？（at 了我们就说明是两条鱼在对话 → 只留档不核对）
-        talking_to_us = str(bot.self_id) in _at_targets(event)
+        talking_to_us = any(_is_self_qq(q, event) for q in _at_targets(event))
         logger.info(
             f"[PEER] 收到 {uid} 的回复（{len(text)} 字）"
             f"{'，是在跟我们说话' if talking_to_us else '，去核对'}"

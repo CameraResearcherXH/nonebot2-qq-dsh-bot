@@ -17,7 +17,7 @@ trace_reply.py —— 把小鲸鱼每次回复的「三份视角」并排摆出�
     python scripts/trace_reply.py --date 2026-11-10 --limit 10 --before 20 --after 20
 
     # 只看某个群
-    python scripts/trace_reply.py --key group_822659531
+    python scripts/trace_reply.py --key group_100000017
 
     # 叠加容器日志（docker logs qq-grok-bot > napcat.log 之后）
     python scripts/trace_reply.py --log napcat.log
@@ -43,7 +43,7 @@ DIA_DIR = Path(ROOT / "data" / "dialogue")
 
 # 容器日志里 nonebot 打的收消息行：
 #   qq-grok-bot  | 11-10 20:33:10 [SUCCESS] nonebot | OneBot V11 123456789 | \
-#   [message.group.normal]: Message 781523941 from 354783017@[群:822659531] '小肥鱼呢'
+#   [message.group.normal]: Message 781523941 from 354783017@[群:100000017] '小肥鱼呢'
 _LOG_MSG_RE = re.compile(
     r"\[message\.(?P<scope>group|private)\.\w+\]:\s*Message\s+(?P<mid>\d+)\s+"
     r"from\s+(?P<uid>\d+)(?:@\[群:(?P<gid>\d+)\])?\s+'(?P<text>.*)'\s*$"
@@ -200,7 +200,7 @@ def gid_of_key(key: str) -> list:
     session_key → dialogue 里可能的 gid 写法。
 
     群的 gid 是裸号，私聊带 private_ 前缀，影子回答是 shadow_ 前缀
-    （shadow_822659531 也是那个群的影子回答，C 段应该显示这个群的上帝视角）。
+    （shadow_100000017 也是那个群的影子回答，C 段应该显示这个群的上帝视角）。
     """
     k = str(key or "")
     for pre in ("shadow_", "group_"):
@@ -417,7 +417,7 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=20, help="最近 N 次回复（默认 20）")
     ap.add_argument("--before", type=int, default=20, help="上帝视角：前 N 条（默认 20）")
     ap.add_argument("--after", type=int, default=20, help="上帝视角：后 N 条（默认 20）")
-    ap.add_argument("--key", default="", help="只看某个会话，如 group_822659531")
+    ap.add_argument("--key", default="", help="只看某个会话，如 group_100000017")
     ap.add_argument("--block-chars", type=int, default=700,
                     help="A 段每块截断字数（默认 700，0=不截断）")
     ap.add_argument("--full", action="store_true", help="不截断，打全文")

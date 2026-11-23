@@ -24,8 +24,8 @@
 
 | 分组 | 项数 |
 |---|---|
-| 回复 / 限流 / 主动插话 | 41 |
-| 心情 | 29 |
+| 回复 / 限流 / 主动插话 | 42 |
+| 心情 | 34 |
 | 档案 / 好感 | 12 |
 | 记忆 | 16 |
 | 表情 | 7 |
@@ -41,8 +41,8 @@
 | 语音 / 音乐 | 27 |
 | 世界书 | 4 |
 | 安全 / 工具 | 10 |
-| 其他 | 1 |
-| **合计** | **229** |
+| 其他 | 5 |
+| **合计** | **239** |
 
 ## 回复 / 限流 / 主动插话
 
@@ -69,6 +69,7 @@
 | `GROUP_SEND_MAX_WAIT` | `15` | 配额不足时最多等多久（秒） | `plugins/chat/__init__.py` |
 | `LONG_FORWARD_MIN` | `120` | 超过多少字改用合并转发 | `plugins/chat/__init__.py` |
 | `MAX_GROUP_RECENT` | `16` | 群聊上下文保留多少条消息（16 = 修过长消息被挤出窗口的问题） | `plugins/chat/__init__.py` |
+| `MEMORY_EMOTION_MIN_DELTA` | `0.1` | 记忆刻痕门槛：|Δ| 达到多少才算（0.10 = 设计里的 💥 档） | `plugins/chat/__init__.py` |
 | `MERGE_WINDOW` | `0.6` | 合并转发判定窗口（秒） | `plugins/chat/__init__.py` |
 | `MOOD_WATCH_SEC` | `60` | 被动心情观察的最小间隔（秒） | `plugins/chat/__init__.py` |
 | `PEER_REPLY_COOLDOWN` | `180` | 对鱼接话的冷却（秒） | `plugins/chat/__init__.py` |
@@ -99,16 +100,19 @@
 | `GROUP_MOOD_CHAT_MIN` | `0.55` | 群心情最差时「愿不愿意多说话」的乘数下限（0.55） | `services/mood.py` |
 | `GROUP_MOOD_GROUP_DROP` | `0.7` | 整个群净掉多少 → 判定群聊不愉快（0.7） | `services/group_mood.py` |
 | `GROUP_MOOD_LIKE_MIN` | `0.05` | 净 Δ 达到多少算喜欢/讨厌（0.05，算人数和比例用） | `services/group_mood.py` |
+| `GROUP_MOOD_MAX_DELTA` | `0.2` | 单条群心情事件上限（0.20，防小事刷满） | `services/group_mood.py` |
 | `GROUP_MOOD_MAX_EVENTS` | `400` | 每个群最多保留多少条心情事件 | `services/group_mood.py` |
 | `GROUP_MOOD_MIN_DELTA` | `0.03` | 进群心情的最小 |Δ|（0.03，防小事噪声） | `services/group_mood.py` |
 | `GROUP_MOOD_MIN_PEOPLE` | `3` | 至少几个不同的人让心情掉，才算「群聊导致」（3） | `services/group_mood.py` |
 | `GROUP_MOOD_PERSON_DROP` | `0.4` | 某个人在窗口内净让心情掉多少 → 单独不理他（0.4） | `services/group_mood.py` |
 | `GROUP_MOOD_WINDOW_SEC` | `18000` | 群心情窗口（秒，默认 18000 = 5 小时；超时事件自动过期） | `services/group_mood.py` |
+| `MOOD_ENV_MAX_DELTA` | `0.05` | 不是冲她来（别人之间/群气氛）时单次 Δ 上限（0.05） | `services/mood_judge.py` |
 | `MOOD_GLOBAL_SHARE` | `0.35` | 全局心情占会话心情的权重（0~1） | `services/mood.py` |
+| `MOOD_HALF_LIFE_HOURS` | `12` | 心情回到 0 的半衰期（小时，设计默认 12） | `services/mood.py` |
 | `MOOD_IDLE_AFTER` | `300` | 空闲多少秒后心情开始衰减（默认 300 = 5 分钟；之后每 5 分钟向 0 走一步） | `services/mood.py` |
 | `MOOD_IDLE_STEP` | `1` | 每步走多少点（内部 -100~100 口径，1.0 ≈ 外口径 0.01） | `services/mood.py` |
 | `MOOD_IDLE_TICK` | `300` | 衰减步长（秒）：每这么久向 0 走一步（默认 300 = 5 分钟走 0.01） | `services/mood.py` |
-| `MOOD_JUDGE_CTX` | `20` | 判读时带多少条上下文 | `services/mood_judge.py` |
+| `MOOD_JUDGE_CTX` | `8` | 判读时带多少条上下文（8 = 5~8 条，和主模型上下文同源同条数） | `services/mood_judge.py` |
 | `MOOD_JUDGE_FRESH_SEC` | `600` | 判读结果有效期（秒），过期不当「现在」 | `services/mood.py` |
 | `MOOD_JUDGE_MIN_INTERVAL` | `60` | 两次判读的最小间隔（秒），防刷屏时来回震荡 | `services/mood_judge.py` |
 | `MOOD_JUDGE_REFRESH` | `300` | 她没主动写心情时，多久用群聊重新判一次（秒）。0 = 只在她说的时候判 | `services/mood_judge.py` |
@@ -117,9 +121,11 @@
 | `MOOD_LABEL_MAX` | `60` | 心情词最多保留多少个 | `services/mood.py` |
 | `MOOD_LABEL_STEP` | `0.2` | 心情名词的分档步长（0.2 = 每 0.2 一个名词） | `services/mood.py` |
 | `MOOD_LABEL_TTL_HOURS` | `12` | 心情词的有效期（小时），过期不再当「现在」 | `services/mood.py` |
-| `MOOD_MAX_DELTA` | `0.5` | 单次「涨幅」上限（0.50）：判读报的涨/跌最多按这个算 | `services/mood.py` |
+| `MOOD_MAX_DELTA` | `0.5` | 单次「涨幅」上限（设计 0.50，只是护栏；防一边倒靠噪音丢弃） | `services/mood.py` |
 | `MOOD_MAX_SESSIONS` | `50` | 最多保留多少个会话的心情（防字典无限长） | `services/mood.py` |
 | `MOOD_MAX_STEP` | `0.3` | 单次判读最多改变多少心情（外口径，0.30 = 30 点），防一句话翻脸 | `services/mood.py` |
+| `MOOD_NOISE_DELTA` | `0.03` | Δ 噪音门槛：|Δ| 小于它视为 0（0.03，不动数值/好感/刻痕） | `services/mood_judge.py` |
+| `MOOD_PASSIVE_MAX_DELTA` | `0.03` | 她没说话（被动观察）时单次 Δ 上限（0.03，旁观不背锅） | `services/mood_judge.py` |
 | `MOOD_PEAK_MIN_DELTA` | `0.03` | 进入「峰值事件」候选的最小 |Δ|（0.03，防小事顶掉大事） | `services/mood.py` |
 | `MOOD_PEAK_WINDOW_SEC` | `7200` | 心情峰值事件的保质期（秒，默认 7200 = 2 小时；每件事最多挂 2 小时） | `services/mood.py` |
 | `MOOD_THINK_KEEP` | `30` | 判读心理活动保留多少条 | `services/mood_judge.py` |
@@ -362,4 +368,8 @@
 | 参数 | 默认 | 说明 | 生效位置 |
 |---|---|---|---|
 | `MAX_BUBBLES` | `2` | 一条回复最多拆几个气泡 | `services/aura_logic.py` |
+| `SEGMENT_HISTORY_KEEP` | `24` | 保留多少个「处理过的段」给上下文/翻历史 | `services/segments.py` |
+| `SEGMENT_MAX_MSGS` | `40` | 群聊分段：最多攒多少条（防刷屏） | `services/segments.py` |
+| `SEGMENT_MAX_SEC` | `30` | 群聊分段：最长攒多久必须处理（默认 30 秒） | `services/segments.py` |
+| `SEGMENT_WAIT_SEC` | `6` | 群聊分段：安静多少秒算「这一段说完了」（默认 6） | `services/segments.py` |
 

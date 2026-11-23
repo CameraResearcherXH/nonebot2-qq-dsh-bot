@@ -546,6 +546,64 @@ async def t_mood():
     _pr4 = parse_reply("(不想回复) [[THINK|懒得理]]")
     check(S, _pr4.get("silent") and _pr4.get("think") == "懒得理",
           "沉默时也带 think（判读照样有依据）")
+
+    # ---------- 协议残留清理（2026-11-22 真机：偶尔把心里话/工具标记发出来）----------
+    from services.aura_logic import strip_protocol_residue
+    # 单括号 / 全角 / 冒号 / 内容里带 [] 都不能漏
+    for _bad, _want in (
+        ("[THINK|单括号心里话]", "单括号心里话"),
+        ("[[THINK：冒号心里话]]", "冒号心里话"),
+        ("[[THINK|他说的[重点]我记住了]]", "他说的[重点]我记住了"),
+        ("[[THINK|半截没闭合", "半截没闭合"),
+    ):
+        _tc2, _th2 = parse_think(_bad)
+        check(S, _th2 == _want and "THINK" not in _tc2,
+              f"THINK 畸形写法也能抠干净：{_bad!r} → {_tc2!r}")
+    # 工具标记 / 残留标记绝不能进正文
+    for _raw in (
+        "好呀 [[TOOLS|猪猪]]",
+        "好呀 [[TOOLS|猪猪",
+        "好呀 [[SEARCH|a]b]]",
+        "好呀 [[PROFILE|阿明]]",
+        "好呀 [[LUCK]]",
+        "好呀 [[[STICKER|列表]]]",
+        "好呀 THINK|忘了括号",
+        "好呀 TOOLS:猪猪",
+    ):
+        _pp = parse_reply(_raw)
+        _txt = "".join(str(i.get("value") or "") for i in _pp.get("items") or [])
+        check(S, all(w not in _txt for w in
+                     ("TOOLS", "SEARCH", "PROFILE", "LUCK", "STICKER", "[[")),
+              f"协议标记不漏给用户：{_raw!r} → {_txt!r}")
+    check(S, strip_protocol_residue("这是[1]正常的") == "这是[1]正常的",
+          "正常方括号不误伤")
+    check(S, strip_protocol_residue("I think: this is fine") == "I think: this is fine",
+          "英文小写 think 不误伤（只认大写协议词）")
+    # ---------- 识图描述回显（2026-11-23 真机：她把看到的画面念出来）----------
+    from services.aura_logic import strip_media_echo
+    check(S, strip_media_echo(
+        "【图片】一只淡蓝色的卡通仓鼠双臂交叉抱在胸前，咧着嘴") == "",
+        "画面描述整条丢弃")
+    check(S, "图片识别结果" not in strip_media_echo("【图片识别结果】啊……这个……"),
+          "识别标记不漏给用户")
+    check(S, strip_media_echo("图里那个人我认识") == "图里那个人我认识",
+          "正常提到图片不误伤")
+    # ---------- 语音不许念工具词 / 引用块不许照抄（2026-11-23）----------
+    from services.aura_logic import clean_voice_text
+    check(S, clean_voice_text("sticker：开心 今天好累") == "今天好累",
+          "语音 stick:开心 被清掉")
+    _vq = parse_reply("<voice>好累啊 <sticker:开心></voice>")
+    _vv = [i for i in _vq.get("items") or [] if i.get("kind") == "voice"]
+    check(S, _vv and _vv[0]["value"] == "好累啊", "语音里的 <sticker:…> 不进 TTS")
+    _qq = parse_reply("〔引用 阿明 的消息（只作指代）：今天吃了吗〕 吃了")
+    _qqt = "".join(str(i.get("value") or "") for i in _qq.get("items") or [])
+    check(S, _qqt == "吃了", "引用块不会被照抄进回复")
+    _qe = parse_reply("今天吃了吗？吃了", quote_text="今天吃了吗")
+    _qet = "".join(str(i.get("value") or "") for i in _qe.get("items") or [])
+    check(S, _qet == "吃了", "开头照抄原文被剥掉")
+    _qs = parse_reply("今天好累啊", quote_text="今天好累")
+    _qst = "".join(str(i.get("value") or "") for i in _qs.get("items") or [])
+    check(S, _qst == "今天好累啊", "短引用不误伤正常口语")
     # prompt 里必须有这一节（不然模型不会写）。
     # 这里读源码而不是 import llm：llm 顶层 import httpx，离线环境跑不起来。
     _llm_src = (ROOT / "services" / "llm.py").read_text(encoding="utf-8")
@@ -819,8 +877,15 @@ async def t_persona():
     from services import persona
     S = "persona"
     key, prompt = persona.persona_for("group_999")
+    # 发行仓不带私人人格卡（只有 personality.example.txt）：没有卡时只做结构断言
+    _pdir = ROOT / "services" / "Personality"
+    _has_cards = _pdir.exists() and any(_pdir.glob("*.txt"))
     check(S, isinstance(key, str) and key, f"persona_for 返回人格名：{key}")
-    check(S, isinstance(prompt, str) and len(prompt) > 50, f"System Prompt 长度 {len(prompt)}")
+    if _has_cards:
+        check(S, isinstance(prompt, str) and len(prompt) > 50,
+              f"System Prompt 长度 {len(prompt)}")
+    else:
+        check(S, isinstance(prompt, str), "没有人格卡时仍返回字符串（回落内置性格）")
     check(S, key == persona.DEFAULT_PERSONA, f"未设置过的 session → 默认人格（{persona.DEFAULT_PERSONA}）")
     if persona.DEFAULT_PERSONA in persona.PERSONALITY_MAP:
         check(S, len(prompt) > 500, f"默认人格加载的是完整外部角色卡（{len(prompt)} 字）")
@@ -2528,12 +2593,33 @@ async def t_focus():
     check(S, C._is_sticker_request("收个表情包") is False, "「收个表情包」是收藏，不接管")
     check(S, C._is_sticker_request("今天好热") is False, "闲聊不触发发表情")
 
-    # 刚被 @ 完的第一条后续 → 默认回（不再过模型）
+    # 刚被 @ 完的第一条后续：2026-11-23 起默认交给模型判（不再无条件回）；
+    # 显式打开 FOCUS_FIRST_FOLLOW_ALWAYS 时才走「第一条必回」。
+    _old_last = C.group_scene.last
+    _old_first = C._FOCUS_FIRST_FOLLOW_ALWAYS
+    C.group_scene.last = lambda gid: None
     C.focus_sessions.clear()
     C._focus_start(key, "666")
-    ok = await C._judge_focus_follow("今天天气不错", "999", "666")
-    check(S, ok is True, "刚 @ 完的第一条后续 → 默认回")
+    C._FOCUS_FIRST_FOLLOW_ALWAYS = True
+    try:
+        ok = await C._judge_focus_follow("今天天气不错", "999", "666")
+    finally:
+        C._FOCUS_FIRST_FOLLOW_ALWAYS = _old_first
+    check(S, ok is True, "开启 FIRST_FOLLOW_ALWAYS 时第一条后续 → 回")
     check(S, C.focus_sessions[key]["666"].get("neg") == 0, "判是时 neg 归零")
+
+    # 收件人明确是别人 → 关注期也不回（用户 2026-11-23：别人互聊别接）
+    C.focus_sessions.clear()
+    C._focus_start(key, "666")
+    C.group_scene.last = lambda gid: {
+        "is_bot": False, "to_kind": "person", "to_qq": "777",
+        "to_name": "小红", "to_conf": 0.9,
+    }
+    try:
+        ok2 = await C._judge_focus_follow("你俩别吵了", "999", "666")
+    finally:
+        C.group_scene.last = _old_last
+    check(S, ok2 is False, "收件人是别人 → 关注期不回")
 
     # 强否定：@ 了别人 / 引用回复别人 → 不回，且扣额度
     class _FakeEv:
@@ -2576,11 +2662,11 @@ async def t_focus():
     C.recent_group_msgs.clear()
 
     # 单群插话频率覆盖（测试群 1 分钟一次）
-    _ovs = C._parse_group_interject_overrides("936601568:60:0.9:60:2")
-    check(S, _ovs["936601568"]["cooldownSec"] == 60.0, "单群冷却覆盖成 60s")
-    check(S, _ovs["936601568"]["interjectChance"] == 0.9, "单群插话概率覆盖")
-    check(S, _ovs["936601568"]["maxPerHour"] == 60, "单群每小时上限覆盖（否则 6 次就封顶）")
-    check(S, _ovs["936601568"]["minRelevance"] == 0.0, "覆盖群关掉关键词相关度（交给模型判断）")
+    _ovs = C._parse_group_interject_overrides("100000021:60:0.9:60:2")
+    check(S, _ovs["100000021"]["cooldownSec"] == 60.0, "单群冷却覆盖成 60s")
+    check(S, _ovs["100000021"]["interjectChance"] == 0.9, "单群插话概率覆盖")
+    check(S, _ovs["100000021"]["maxPerHour"] == 60, "单群每小时上限覆盖（否则 6 次就封顶）")
+    check(S, _ovs["100000021"]["minRelevance"] == 0.0, "覆盖群关掉关键词相关度（交给模型判断）")
     check(S, C._parse_group_interject_overrides("") == {}, "空配置不报错")
 
     # 插话不再用正则预筛「值不值得接」（用户 2026-11-18：交给模型判断）
@@ -2589,9 +2675,9 @@ async def t_focus():
 
     # 单群体验覆盖（测试群：4 秒接话）
     from services import group_tuning as GT
-    _go = GT._parse("936601568:4:45")
-    check(S, _go["936601568"]["reply_interval"] == 4.0, "单群回复间隔覆盖解析")
-    check(S, _go["936601568"]["max_hanzi"] == 45, "单群直接发字数阈值覆盖解析")
+    _go = GT._parse("100000021:4:45")
+    check(S, _go["100000021"]["reply_interval"] == 4.0, "单群回复间隔覆盖解析")
+    check(S, _go["100000021"]["max_hanzi"] == 45, "单群直接发字数阈值覆盖解析")
     check(S, GT._parse("") == {}, "空覆盖配置不报错")
 
     # 人称/指代：把「这条 @ 的是谁」写进 prompt（用户 2026-11-18）
@@ -2637,7 +2723,7 @@ async def t_focus():
     check(S, "_send_long_as_forward(bot, ev, _full)" in _chat_src,
           "群聊视频总结走合并转发（不再砍成 60 字）")
     from services.llm import _length_rule as _lr
-    _rule = _lr("group_936601568")
+    _rule = _lr("group_100000021")
     check(S, "合并转发" in _rule and "不要写" not in _rule,
           "群聊字数铁律：超过阈值转卡片，不再要求「不发长文」")
     check(S, "hanzi_count(val) > PRIVATE_MAX_HANZI" in _chat_src,
@@ -3022,7 +3108,10 @@ async def t_timing():
     # 2026-11-19：现在有「背景/历史分块/对话状态/表达学习」等多处按需 append，
     # 数量本身不是问题 —— 真正的不变量是「固定区仍然只有 2 条（人设 + 规矩）」。
     _np = llm_src.count('msgs.append({"role": "system"')
-    check(S, _np <= 12, f"system 块数量受控（实际 {_np} 处 append）")
+    # 2026-11-22：13 处 —— 人设/规矩/现在时间/人称/收件人/现场/历史/状态/
+    #            人物卡/表达/设定/动态规矩/post-rules（focus 卡去重后仍是 1 处）
+    # 2026-11-23：+1 心情/好感 depth 注入、+1 白月光 → 上限 16。
+    check(S, _np <= 16, f"system 块数量受控（实际 {_np} 处 append）")
     check(S, '"content": _proto' in llm_src, "固定区仍合成 1 条 system（不吃 8 条）")
 
     check(S, "def _split_prompt" in llm_src, "_split_prompt 把背景/当前消息拆开")
@@ -3124,10 +3213,10 @@ async def t_timing():
     check(S, M.is_noise("[图片识别结果] 群号:1 | 图片内容:x") is True,
           "图片识别记录算噪音")
     check(S, M.is_noise("小明喜欢白米饭") is False, "正常记忆不算噪音")
-    check(S, M.group_ok("群号:927198150 | 图片内容:x", "339762659") is False,
+    check(S, M.group_ok("群号:100000020 | 图片内容:x", "100000011") is False,
           "跨群记忆被挡掉")
-    check(S, M.group_ok("群号:339762659 | x", "339762659") is True, "同群记忆放行")
-    check(S, M.group_ok("没有群号的记忆", "339762659") is True, "无群号的通用记忆放行")
+    check(S, M.group_ok("群号:100000011 | x", "100000011") is True, "同群记忆放行")
+    check(S, M.group_ok("没有群号的记忆", "100000011") is True, "无群号的通用记忆放行")
 
     for _g in _gs:
         C.group_mute_until.pop(_g, None)
@@ -3482,7 +3571,7 @@ async def t_referee():
     S = "referee"
     from services import referee as R, glm as G
 
-    check(S, "822659531" in R.PEER_GROUPS, f"监听群：{sorted(R.PEER_GROUPS)}")
+    check(S, "100000017" in R.PEER_GROUPS, f"监听群：{sorted(R.PEER_GROUPS)}")
     check(S, "2267107632" in R.PEER_QQS, f"peer：{sorted(R.PEER_QQS)}")
     check(S, G.GLM_MODEL.startswith("glm-"), f"GLM 模型：{G.GLM_MODEL}")
     check(S, G.GLM_MODEL == "glm-5.3-flash", "默认 glm-5.3-flash（多模态）")
@@ -3498,8 +3587,8 @@ async def t_referee():
     check(S, "语气、口吻、人格" in R._DIFF_PROMPT, "diff 明确排除语气/人格")
     check(S, "作品名、番剧名、角色名" in R._DIFF_PROMPT, "名词范围写清楚了")
 
-    # ---- 事前参考（preflight）：GLM 先答，DeepSeek 做最终决策 ----
-    check(S, R.PREFLIGHT_ENABLED is True, "preflight 默认开启")
+    # ---- 事前参考（preflight）：2026-11-23 起默认关闭（GLM 只做视觉）----
+    check(S, R.PREFLIGHT_ENABLED is False, "preflight 默认关闭（GLM 只做视觉）")
     check(S, R.PREFLIGHT_MIN_CHARS >= 1, f"短问题跳过阈值 {R.PREFLIGHT_MIN_CHARS}")
     check(S, await R.preflight("k1", "哈", "模板") == "", "太短的问题不调 GLM（省 3 秒）")
     check(S, R.take_preflight("k1") == "", "没生成过 → 取不到参考")
@@ -3519,9 +3608,9 @@ async def t_referee():
     R.PEER_MERGE_WINDOW = 0.05
     R.on_peer_reply = _fake_on
     try:
-        R.queue_peer_reply("822659531", "再让网页版那版代入人设给回复打分纠错")
-        R.queue_peer_reply("822659531", "就是一层扣一层 真跑起来得盯着")
-        R.queue_peer_reply("822659531", "改完再塞回 data 里")
+        R.queue_peer_reply("100000017", "再让网页版那版代入人设给回复打分纠错")
+        R.queue_peer_reply("100000017", "就是一层扣一层 真跑起来得盯着")
+        R.queue_peer_reply("100000017", "改完再塞回 data 里")
         await asyncio.sleep(0.4)
         check(S, len(got) == 1, f"连发 3 条合并成 1 条（实际 {len(got)} 次）")
         check(S, got and "再让网页版" in got[0] and "改完再塞回" in got[0],
@@ -3531,7 +3620,7 @@ async def t_referee():
         R.on_peer_reply = _old_on
         R._peer_buf.clear()
 
-    gid = "822659531"
+    gid = "100000017"
 
     # 把后台 task 换成假的，别在自检里真调 LLM
     orig_finish = R._finish_our
@@ -3654,7 +3743,7 @@ async def t_weekly():
     from services import dialogue_log as D
 
     # ---- 对话落盘 ----
-    gid = "822659531"
+    gid = "100000017"
     D.log_msg(gid, "阿明(0001)", "10001", "这是谁？", kind="user")
     D.log_msg(gid, "你", "999", "星井美希", kind="bot")
     D.log_msg(gid, "阿明(0001)", "10001", "[图片]", kind="user",
@@ -4773,7 +4862,7 @@ async def t_night():
     # 2026-11-20：新增群/人白名单（SAFE 级也校验），测试里放行用到的群/人
     _old_g = set(NT2.ALLOWED_GROUPS)
     _old_p = set(NT2.ALLOWED_PRIVATE)
-    NT2.ALLOWED_GROUPS.update({"1", "123456", "822659531"})
+    NT2.ALLOWED_GROUPS.update({"1", "123456", "100000017"})
     NT2.ALLOWED_PRIVATE.update({"555", "10001"})
     _fb = _FB()
     await NT2.execute(_fb, "get_group_msg_history", {"count": 500},
@@ -4861,6 +4950,23 @@ async def t_night():
     check(S, '[POKE] 生成回复失败' in chat_src,
           "写死台词只剩「LLM 失败」兜底（不是主路径）")
     check(S, "_POKE_LAST" in chat_src, "连戳只回一次（8 秒内不重复）")
+    # ---- 戳一戳次数屏蔽（2026-11-23：2 小时内超过 3 次就不回）----
+    try:
+        from services import poke_guard as _pg
+        _pg.reset()
+        _t0 = 1_000_000.0
+        _rs = [_pg.note("u_poke", now=_t0 + i) for i in range(3)]
+        check(S, all(_ok for _ok, _ in _rs) and [_n for _, _n in _rs] == [1, 2, 3],
+              "前 3 次戳允许回复")
+        _ok4, _n4 = _pg.note("u_poke", now=_t0 + 10)
+        check(S, (not _ok4) and _n4 == 4, "2 小时内第 4 次戳被屏蔽")
+        _ok5, _n5 = _pg.note("u_poke", now=_t0 + _pg.WINDOW_SEC + 11)
+        check(S, _ok5 and _n5 == 1, "窗口滑过后恢复（不是永久拉黑）")
+        _pg.reset()
+    except Exception as e:
+        check(S, False, "戳一戳屏蔽逻辑异常", f"{type(e).__name__}: {e}")
+    check(S, "poke_guard.note(uid)" in chat_src, "戳一戳屏蔽接在 handler 里")
+    check(S, "不回、不戳回" in chat_src, "被屏蔽时不戳回去")
     check(S, C.SLEEP_HOUR_START == 0 and C.SLEEP_HOUR_END == 8, "群聊免打扰 0~8 点")
     check(S, C.PRIVATE_SLEEP is False, "私聊不受睡眠限制（24 小时）")
     va_src = (ROOT / "plugins" / "vision_agent" / "__init__.py").read_text(encoding="utf-8", errors="ignore")
@@ -5187,7 +5293,7 @@ async def t_archive():
     S = "archive"
     from services import profiles, lorebook
 
-    q, g = "30101", "936601568"
+    q, g = "30101", "100000021"
     profiles._save("profile", q, {})
     profiles.upsert_profile(q, nickname="明哥")
     p = profiles.get_profile(q)
@@ -5414,7 +5520,7 @@ async def t_scene():
     except Exception as e:
         check(S, False, "persona_name 不可用", f"{type(e).__name__}: {e}")
 
-    gid = "936601568"
+    gid = "100000021"
     gs.clear(gid)
     names = {"阿明": "101", "小柚子": "102", "老王": "103", "阿强": "104", "小鲸鱼": "999"}
     gs.observe(gid, mid="m1", qq="101", name="阿明",
@@ -5570,7 +5676,7 @@ async def t_scene():
         gs.observe(g4, qq="101", name="阿明", text="没有消息号", names=names)
         check(S, bool(gs.last(g4).get("mid")), "缺 message_id 时生成合成 id")
 
-        # 交错发言不能拆线程（用户 2026-11-19 实测：夹竹桃连说几句，喵插一句「好噢~」，
+        # 交错发言不能拆线程（用户 2026-11-19 实测：阿明连说几句，喵插一句「好噢~」，
         # 同一场对话被拆成两条线，现场里两条线程各说各的）
         g8 = "936601575"
         gs.clear(g8)
@@ -5637,13 +5743,13 @@ async def t_scene():
         check(S, len(gs.recent_messages(g9, 20)) == len(_r9),
               "补过一次就不重复补（再读一次条数不变）")
         # 补完再来一条活消息：不该重复、也不该把补回来的冲掉
-        gs.observe(g9, mid="live9", qq="104", name="夹竹桃",
+        gs.observe(g9, mid="live9", qq="104", name="阿明",
                    text="我打印个log看看", bot_qq="999")
         _r9b = gs.recent_messages(g9, 20)
         check(S, len(_r9b) == len(_r9) + 1 and _r9b[-1]["text"] == "我打印个log看看",
               f"补回来的现场能接着记活消息（{len(_r9b)} 条）")
         # 同一条消息记两遍（NapCat 回显 / 识图+chat 各记一次）只算一条
-        gs.observe(g9, mid="live9", qq="104", name="夹竹桃",
+        gs.observe(g9, mid="live9", qq="104", name="阿明",
                    text="我打印个log看看", bot_qq="999")
         check(S, len(gs.recent_messages(g9, 20)) == len(_r9b), "同一个消息号只进现场一次")
         # 占位（[图片]）留在现场里给审核当前因，但不进审核队列
@@ -5665,7 +5771,7 @@ async def t_scene():
             ("103", "老王(103)", "这猫躺得比我还会摆烂"),
         ]:
             _dl9.log_msg(g10, _who, _qq, _tx)
-        gs.observe(g10, mid="live10", qq="104", name="夹竹桃", text="我打印个log看看")
+        gs.observe(g10, mid="live10", qq="104", name="阿明", text="我打印个log看看")
         gs.ensure_seeded(g10)
         _snap10 = gs.snapshot(g10, bot_qq="999")
         check(S, len(_snap10["threads"]) == 1 and _snap10.get("seeded") >= 3,
@@ -5676,11 +5782,11 @@ async def t_scene():
               f"补 + 活消息一共 4 条（实际 {len(gs.recent_messages(g10, 20))}）")
 
         # ---------- 冲人短句：判给「最近被提到的人」，不是紧挨着的上一句 ----------
-        # 用户 2026-11-19 真机：肥舞「找打了」其实是对「肥鱼」说的，
+        # 用户 2026-11-19 真机：老王「找打了」其实是对「肥鱼」说的，
         # 硬逻辑和审核都判成了上一句的 OTAKU咩。
         g12 = "936601580"
         gs.clear(g12)
-        _n12 = {"阿明": "101", "肥舞": "103", "OTAKU咩": "104",
+        _n12 = {"阿明": "101", "老王": "103", "OTAKU咩": "104",
                 "肥鱼": "105", "小鲸鱼": "999"}
         gs.observe(g12, mid="j1", qq="104", name="OTAKU咩",
                    text="为啥肥鱼现在会这样说话了", to_qq="999", to_reason="at",
@@ -5691,7 +5797,7 @@ async def t_scene():
                    bot_qq="999", names=_n12)
         gs.observe(g12, mid="j4", qq="101", name="阿明",
                    text="超过20字就转发发送", bot_qq="999", names=_n12)
-        _m12 = gs.observe(g12, mid="j5", qq="103", name="肥舞", text="找打了",
+        _m12 = gs.observe(g12, mid="j5", qq="103", name="老王", text="找打了",
                           bot_qq="999", names=_n12)
         check(S, _m12.get("to_name") == "肥鱼"
               and _m12.get("to_reason") == "recent_mention",
@@ -5719,7 +5825,7 @@ async def t_scene():
         check(S, "第0句" in gs.format_block(_s13), "prompt 的现场块也带上更早的句子")
 
         # 滚动总结：写回后现场块最后一行要能看到
-        gs.set_summary(g2, "大家在聊家庭组，无病呻吟在招人，肥舞说懒得退组。",
+        gs.set_summary(g2, "大家在聊家庭组，小红在招人，老王说懒得退组。",
                        until_mid=str(gs.recent_messages(g2, 1)[0].get("mid")))
         blk = gs.format_block(gs.snapshot(g2, bot_qq="999", my_names=["小鲸鱼"]))
         check(S, "【最近这段在聊什么】" in blk, "现场块末尾带滚动总结")
@@ -5815,8 +5921,14 @@ async def t_scene():
     check(S, "scene_text=_scene_text" in _chat and "scene_text" in _pb,
           "现场块传进 build_prompt")
     check(S, "if _bg_text:" in _llm, "普通文字聊天不再丢弃 build_prompt 背景段")
-    check(S, "只接一个线程" in _chat and "只接一个线程" in _llm,
-          "插话/最后提醒都要求只接一个线程")
+    # 2026-11-23 用户：「艾特也不回复」→ 一段里多条 @ 必须逐条回应，
+    # 不能再写「只接一个线程 / 默认回最后一条」。
+    check(S, "多条 @ 你" in _llm and "一条回复全部答完" in _llm
+          and "只接一个线程" not in _llm,
+          "@ 她的消息要求逐条回应（一条消息答完，不再只接一个线程）")
+    _seg = (ROOT / "services" / "segments.py").read_text(encoding="utf-8")
+    check(S, "def _pick_rows" in _seg and "必须回应" in _seg,
+          "分段截断保留 @ 消息 + 段末「必须回应」清单")
     check(S, "_scene_selfcheck" in _chat and "🎬 群聊现场" in _chat,
           "有 /测函数 现场（打印当前线程/收件人）")
     check(S, "scene_auditor.diagnose" in _chat and 'startswith(("审核"' in _chat,
@@ -6187,6 +6299,7 @@ async def t_moodjudge():
         _res = await MJ.judge_and_store(_k, "被夸得有点飘，但还装作没事", _ctx, force=True)
         check(S, _res.get("ok"), "判读写回成功")
         _j = mood.get_judge(_k)
+        # 2026-11-22：Δ 上限按设计 0.5，0.42 原样落库（防一边倒靠入口噪音丢弃）
         check(S, _j.get("word") == "被夸得有点飘" and abs(float(_j.get("delta")) - 0.42) < 1e-6,
               f"mood 里存下了涨幅（{_j.get('word')}/Δ{_j.get('delta')}）")
         check(S, abs(float(_j.get("value")) - (_v0 + 0.42)) < 1e-3,
@@ -6223,8 +6336,10 @@ async def t_moodjudge():
     _ctxs = MJ.scene_lines(f"group_{_gid}")
     check(S, len(_ctxs) == MJ.CTX_LINES,
           f"按条数拉最近 {MJ.CTX_LINES} 条（实际 {len(_ctxs)}）")
-    check(S, any(x.startswith("你: ") for x in _ctxs), "上下文里包含她自己说的话")
-    check(S, _ctxs[-1] == "你: 我也说一句", "取的是最新的那几条")
+    check(S, any(x.startswith("你 → 大家: ") for x in _ctxs),
+          "上下文里包含她自己说的话")
+    check(S, _ctxs[-1].startswith("你 → 大家: 我也说一句"),
+          "取的是最新的那几条")
 
     # 她没写、只有群聊 → 也能判（假 judge 走通整条链）
     _k2 = f"group_{_gid}"
@@ -6366,8 +6481,8 @@ async def t_quiet():
             check(S, C._minutes_of("1小时") == 60 and C._minutes_of("30分钟") == 30
                   and C._minutes_of("90") == 90 and C._minutes_of("2天") == 2880,
                   "/测函数 安静 时长解析：1小时/30分钟/90/2天")
-            _tg, _rs = C._split_quiet_args("822659531 1小时")
-            check(S, _tg == "822659531" and "1小时" in _rs,
+            _tg, _rs = C._split_quiet_args("100000017 1小时")
+            check(S, _tg == "100000017" and "1小时" in _rs,
                   "群号和时长能拆开")
 
             class _Bot:

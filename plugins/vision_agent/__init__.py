@@ -16,6 +16,7 @@ from nonebot.adapters.onebot.v11 import (
 from nonebot.rule import Rule
 from services.llm import call_llm, VISION_TAG
 from services.reply import reply_with_multimodal
+from services import identity as identity_mod
 
 # ================= 核心配置 =================
 # ⚠️ 原来读 os.getenv("DASHSCOPE_API_KEY", "")：.env 里没写就是空字符串，
@@ -604,7 +605,7 @@ async def process_image(bot: Bot, event: MessageEvent, img_url: str = "",
                        if s.type == "at"]
             _tk, _tn, _tr = _gs_t.image_target(
                 gid, uid, _at_qqs,
-                bot_qq=str(getattr(event, "self_id", "") or ""))
+                bot_qq=identity_mod.canonical(str(getattr(event, "self_id", "") or "")))
             if _tk == "bot":
                 _tgt_line = f"这张图是发给你的（{_tr}）。"
             elif _tk == "person":
@@ -619,7 +620,10 @@ async def process_image(bot: Bot, event: MessageEvent, img_url: str = "",
     if _tgt_line:
         fake_text += (
             f"\n【这张图】{_tgt_line}"
-            "\n（上面的画面描述只给你自己看：**不要在回复里复述画面**，直接说你想说的。"
+            "\n（上面的画面描述只给你自己看：**绝对不要在回复里复述画面**，"
+            "不要写「【图片】…」这种格式，也不要报颜色/姿势/表情/背景细节。"
+            "图里是题目、截图或文字信息时，直接回答里面的问题/意思，不要念题干；"
+            "其他情况就直接回应图里的内容、情绪或梗。"
             "如果这张图不是发给你的，通常不用接 —— 除非你真的想插一句。）"
         )
 
@@ -654,7 +658,7 @@ async def process_image(bot: Bot, event: MessageEvent, img_url: str = "",
                 reply_mid=str(getattr(getattr(event, "reply", None),
                                       "message_id", "") or ""),
                 is_bot=False,
-                bot_qq=str(getattr(event, "self_id", "") or ""),
+                bot_qq=identity_mod.canonical(str(getattr(event, "self_id", "") or "")),
                 no_audit=True,
             )
         except Exception:
@@ -749,7 +753,7 @@ def _vision_should_reply(event: MessageEvent) -> bool:
 
 # ================= 被动识图规则 =================
 async def check_passive_image(event: MessageEvent) -> bool:
-    if str(event.user_id) == str(event.self_id): return False
+    if identity_mod.is_self(str(event.user_id), str(getattr(event, "self_id", "") or "")): return False
     if _sleep_blocked(event) or event.is_tome(): return False
 
     if isinstance(event, GroupMessageEvent):
@@ -808,7 +812,7 @@ async def _(bot: Bot, event: MessageEvent):
 
 # ================= 主动 @ 识图规则 =================
 async def check_active_image(event: MessageEvent) -> bool:
-    if str(event.user_id) == str(event.self_id): return False
+    if identity_mod.is_self(str(event.user_id), str(getattr(event, "self_id", "") or "")): return False
     if _sleep_blocked(event): return False
     return event.is_tome() and any(seg.type == "image" for seg in event.get_message())
 

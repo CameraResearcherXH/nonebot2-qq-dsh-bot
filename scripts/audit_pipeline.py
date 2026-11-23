@@ -50,7 +50,7 @@ for _k, _v in {
     "VISION_VERIFY": "true",
     "GLM_VISION": "false",
     "GROUP_NEED_AT": "true",
-    "ALLOWED_GROUPS": "822659531",
+    "ALLOWED_GROUPS": "100000017",
     "ALLOWED_PRIVATE": "10001",
     "PROACTIVE_PRIVATE": "true",
 }.items():
@@ -218,7 +218,7 @@ async def main() -> int:
 
     # ---------- 1. 群消息 → 现场 ----------
     print("\n[1] 群消息 → 群聊现场（谁→谁 / 线程 / 收件人）")
-    gid = "822659531"
+    gid = "100000017"
     group_scene.clear(gid)
     group_scene.observe(gid, mid="101", qq="10001", name="阿明", text="英伟达跌了吗",
                         to_reason="", reply_mid="", is_bot=False, bot_qq="999",
@@ -364,7 +364,7 @@ async def main() -> int:
     must = {
         "人设": "小鲸鱼" in sent or "鱼" in sent,
         "规矩(编号)": "▍00" in sent,
-        "你在哪(群号)": "群号：822659531" in sent,
+        "你在哪(群号)": "群号：100000017" in sent,
         "你的地盘": "你能说话的群" in sent,
         "注意力风格": "漂移" in sent,
         "群聊现场": "英伟达" in sent,

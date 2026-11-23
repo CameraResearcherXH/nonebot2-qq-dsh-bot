@@ -11,6 +11,8 @@ from nonebot.adapters.onebot.v11 import Bot, Message, MessageSegment
 from nonebot.adapters.onebot.v11.exception import ActionFailed
 from nonebot.log import logger
 
+from services import identity as _identity
+
 from .runtime import ROLLPIG_TIMEZONE, is_group_rollpig_enabled, resolve_roast_charge_max
 from .store import store
 from .store.models import (
@@ -278,7 +280,11 @@ async def get_refill_eligible_users(
         store.get_group_active_user_ids(group_id, date_str),
     )
     normalized_active = {str(user_id) for user_id in active_user_ids if user_id}
-    eligible_user_ids = (normalized_active & set(group_member_roles)) - {str(bot.self_id)}
+    _sid = str(bot.self_id)
+    eligible_user_ids = {
+        uid for uid in (normalized_active & set(group_member_roles))
+        if not _identity.is_self(uid, _sid)
+    }
     manager_user_ids = {
         user_id
         for user_id in eligible_user_ids
@@ -429,7 +435,9 @@ async def reconcile_refill_request(
         return GroupRoastRefillCompleteResult(False, "unbound", request)
 
     raw_voters = await fetch_refill_reactors(bot, request.message_id)
-    raw_supporter_count = len(raw_voters - {str(bot.self_id)})
+    _sid = str(bot.self_id)
+    raw_supporter_count = len(
+        {u for u in raw_voters if not _identity.is_self(u, _sid)})
     if fast_below_threshold and (
         raw_supporter_count < ROAST_REFILL_MIN_DISTINCT_VOTERS
         or raw_supporter_count * 2 < request.required_votes
@@ -446,7 +454,7 @@ async def reconcile_refill_request(
     manager_voter_ids = valid_voter_ids & eligibility.manager_user_ids
     excluded_user_ids = (
         eligibility.active_user_ids - eligibility.eligible_user_ids
-    ) | {str(bot.self_id)}
+    ) | {u for u in (_identity.accounts() | {_sid}) if u}
     max_charges = resolve_roast_charge_max()
     # 群成员与 reaction 查询期间开关可能变化；在实际修改配额前再确认一次。
     if not is_group_rollpig_enabled(request.group_id):

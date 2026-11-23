@@ -5,6 +5,8 @@ from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent, MessageSe
 from nonebot.log import logger
 from nonebot.matcher import Matcher
 
+from services import identity as _identity
+
 from ..roast_flow import (
     RoastFoodMissingError,
     build_member_roast_outcome,
@@ -77,12 +79,14 @@ def _register_preparation_owner(preparation, current_bot_id: str) -> None:
 
 def _is_reservation_reply(event: GroupMessageEvent) -> bool:
     """只接收回复当前 Bot 的完整短语，避免抢占普通聊天和其他 Bot。"""
+    _sid = str(event.self_id)
     return bool(
         event.reply
-        and str(event.reply.sender.user_id) == str(event.self_id)
+        and _identity.is_self(event.reply.sender.user_id, _sid)
         and event.get_plaintext().strip() in {"加入", "加入预约", "加入烤猪"}
         and all(segment.type in {"text", "reply"} or (
-            segment.type == "at" and str(segment.data.get("qq")) == str(event.self_id)
+            segment.type == "at"
+            and _identity.is_self(segment.data.get("qq"), _sid)
         ) for segment in event.get_message())
     )
 

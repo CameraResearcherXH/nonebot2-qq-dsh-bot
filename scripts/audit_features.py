@@ -293,6 +293,195 @@ def check_g13():
     return (not bad), "；".join(bad), "群心情 / 单人 0.4 / 整群 0.7 / 好感参与主动私聊 正常"
 
 
+def check_g14():
+    """协议残留清理不能回退（2026-11-22 真机：心里话 / 工具标记漏给用户）。
+
+    要求：
+      1. aura_logic 有 strip_protocol_residue；
+      2. parse_reply 的正文和 _push_text 的气泡都过一遍；
+      3. chat 的正常发送路径和 _items_to_message 也过一遍（最后一道防线）。
+    """
+    al = read("services/aura_logic.py")
+    chat = read("plugins/chat/__init__.py")
+    bad = []
+    if "def strip_protocol_residue(" not in al:
+        bad.append("aura_logic 没有 strip_protocol_residue")
+    if "strip_protocol_residue(raw)" not in al:
+        bad.append("parse_reply 没清协议残留")
+    if "strip_protocol_residue(t)" not in al:
+        bad.append("_push_text 没清协议残留")
+    if "strip_protocol_residue(val)" not in chat:
+        bad.append("chat 正常发送路径没清协议残留")
+    if "strip_protocol_residue(v)" not in chat:
+        bad.append("_items_to_message 没清协议残留")
+    if "strip_stage_direction" not in al:
+        bad.append("没拦「旁白/心理活动」当正文发出去")
+    if "soften_harsh" not in al:
+        bad.append("没拦攻击性词（去死/找死）")
+    return (not bad), "；".join(bad), "协议残留 / 旁白拦截 正常"
+
+
+def check_g15():
+    """分段回复 / 用量归因 / 以图搜源 不能回退（2026-11-22）。
+
+    要求：
+      1. 群聊走 segments.wait_close（等一段说完再回），不再一条一回；
+      2. 翻历史优先用 group_scene（收发件人处理过的），不直接塞原生消息；
+      3. llm_usage 报表按模型拆开（judge/audit 两个三方 LLM 要看得到）；
+      4. PicImageSearch 已 vendored，picsearch 插件已注册；
+      5. vision_verify 不再自己拼 trace.moe HTTP，走 image_search。
+    """
+    chat = read("plugins/chat/__init__.py")
+    llm = read("services/llm.py")
+    lu = read("services/llm_usage.py")
+    vv = read("services/vision_verify.py")
+    bad = []
+    if "segments.wait_close(" not in chat:
+        bad.append("群聊 worker 没走 segments.wait_close")
+    if "segments.push(" not in chat:
+        bad.append("群消息没进分段 buffer")
+    if "group_scene.recent_messages(gid, n)" not in llm:
+        bad.append("翻历史没优先用 group_scene（收发件人处理过的）")
+    if "按模型" not in lu:
+        bad.append("用量报表没有按模型拆开")
+    if not (ROOT / "plugins/third/picsearch/plugin.toml").exists():
+        bad.append("缺少 plugins/third/picsearch/plugin.toml")
+    if not (ROOT / "services/image_search.py").exists():
+        bad.append("缺少 services/image_search.py")
+    if "image_search.trace_moe_raw(" not in vv:
+        bad.append("vision_verify 还在自己拼 trace.moe HTTP")
+    if "_extra_sources" not in vv or "搜图源（SauceNAO" not in vv:
+        bad.append("识图没把多源搜图结果交给角色扮演模型")
+    # /测函数 要能自证这两层（分段 / 群心情）
+    if 'what.startswith(("分段"' not in chat:
+        bad.append("缺少 /测函数 分段")
+    if 'what.startswith(("群心情"' not in chat:
+        bad.append("缺少 /测函数 群心情")
+    # vendored 库必须在根目录（services 不能 import plugins）
+    if not (ROOT / "vendor/PicImageSearch/__init__.py").exists():
+        bad.append("vendor/PicImageSearch 不存在")
+    # ⚠️ 2026-11-22 事故：plugin.toml 的 handler 不能指向 plugins.third.*
+    #    register_all() 会在 nonebot 之前 import 它 → load_plugins 直接 RuntimeError。
+    for toml in (ROOT / "plugins/third").glob("*/plugin.toml"):
+        txt = toml.read_text(encoding="utf-8", errors="ignore")
+        if 'handler = "plugins.third.' in txt:
+            bad.append("%s 的 handler 指向 plugins.third（会被提前 import 导致加载失败）"
+                       % toml.relative_to(ROOT))
+    return (not bad), "；".join(bad), "分段 / 用量按模型 / 以图搜源 / 测函数 正常"
+
+
+def check_g16():
+    """收发件人贯通 + 数值封顶 + 模板自检（用户 2026-11-22）。
+
+    要求：
+      1. 分段带收发件人（segments.addressee_of / set_addressee），
+         chat 在 group_scene.observe 之后回填；
+      2. 三方判心情的上下文也带「谁 → 谁」（mood_judge.scene_lines）；
+      3. 群心情净变化封顶 ±1（net_raw 保留原始求和），单条事件有上限；
+      4. 心情半衰期可调、接近边界时同方向阻尼（不许钉死 ±1）；
+      5. 记忆刻痕 / 档案只收 |Δ| 达标的事（MEMORY_EMOTION_MIN_DELTA）；
+      6. 有 /测函数 模板（把她看到的每一块原样打出来）。
+    """
+    seg = read("services/segments.py")
+    gs = read("services/group_scene.py")
+    mj = read("services/mood_judge.py")
+    gm = read("services/group_mood.py")
+    md = read("services/mood.py")
+    chat = read("plugins/chat/__init__.py")
+    tn = read("core/tuning.py")
+    bad = []
+    if "def addressee_of(" not in seg or "def set_addressee(" not in seg:
+        bad.append("segments 没有收发件人渲染/回填")
+    if "segments.set_addressee(" not in chat:
+        bad.append("chat 没有把 group_scene 的收发件人回填给分段")
+    if "→ {to}:" not in gs:
+        bad.append("统一历史没带「谁 → 谁」")
+    if "net_raw" not in gm or "min(1.0, net)" not in gm:
+        bad.append("群心情净变化没封顶 ±1")
+    if "MAX_DELTA" not in gm:
+        bad.append("群心情没有单条事件上限")
+    # 心情必须按设计 §13.1 线性累加；不许再用「饱和阻尼」这种补丁
+    if "room ** 1.5" in md:
+        bad.append("心情又被加了饱和阻尼（设计是 clamp(v+Δ)，防一边倒靠入口噪音丢弃）")
+    if "MOOD_NOISE_DELTA" not in mj or "NOISE_DELTA" not in mj:
+        bad.append("Δ 入口没有噪音丢弃（旁观会被算成负分）")
+    if "PASSIVE_MAX_DELTA" not in mj:
+        bad.append("被动观察没有 Δ 上限（她没说话也会被扣心情）")
+    if "passive=bool(passive)" not in chat:
+        bad.append("chat 没把 passive 传给判读（旁观不背锅失效）")
+    if "MOOD_HALF_LIFE_HOURS" not in md or "MOOD_HALF_LIFE_HOURS" not in tn:
+        bad.append("心情半衰期不可调")
+    if "MEMORY_EMOTION_MIN_DELTA" not in chat:
+        bad.append("记忆刻痕没有 |Δ| 门槛")
+    if "def reset(" not in md:
+        bad.append("心情没有重置（历史误判的 -1 清不掉）")
+    if 'what.startswith(("模板"' not in chat:
+        bad.append("缺少 /测函数 模板")
+    return (not bad), "；".join(bad), "收发件人 / Δ护栏 / 模板自检 正常"
+
+
+def check_g17():
+    """统一历史 + 模板去重（用户 2026-11-22）。
+
+    要求：
+      1. group_scene.history_lines 是唯一出口（带收发件人）；
+      2. 判心情 / 主模型上下文 都读它，条数一致（MOOD_JUDGE_CTX=8）；
+      3. 主模型不再另拉一份 recent_group_msgs / napcat 原生消息；
+      4. packet 在有 brief 人物卡时不再塞 micro 卡（同一个人不描述两遍）；
+      5. llm 给 focus 卡不再套第二层 ▍标题；
+      6. /测函数 模板 打的是真实请求（last_messages），不是重拼。
+    """
+    gs = read("services/group_scene.py")
+    mj = read("services/mood_judge.py")
+    chat = read("plugins/chat/__init__.py")
+    pb = read("services/prompt_builder.py")
+    llm = read("services/llm.py")
+    tn = read("core/tuning.py")
+    bad = []
+    if "def history_lines(" not in gs:
+        bad.append("group_scene 没有 history_lines（统一历史出口）")
+    if "group_scene.history_lines(" not in mj:
+        bad.append("判读上下文没走统一历史")
+    if "group_scene.history_lines(" not in chat:
+        bad.append("主模型上下文没走统一历史")
+    if "'MOOD_JUDGE_CTX': 8," not in tn:
+        bad.append("判读上下文不是 8 条")
+    if "_give_focus" not in pb:
+        bad.append("packet 还在重复塞 micro 人物卡")
+    if '"▍这一条在跟你说话的人' in llm:
+        bad.append("focus 卡还套了第二层标题")
+    if "last_messages(_key_t)" not in chat:
+        bad.append("/测函数 模板 没读真实请求")
+    return (not bad), "；".join(bad), "统一历史 / 模板去重 正常"
+
+
+def check_g18():
+    """回复对象正确性 + 心情/好感两栏（用户 2026-11-22）。
+
+    要求：
+      1. 分段每行带消息号，并告诉模型「回谁就 <reply:消息号>」；
+      2. 自动引用优先引「这一段里 @ 了她」那条，不是最后一条；
+      3. 她引用谁，判读/好感就算到谁头上（不是最后说话人）；
+      4. 有 `/测函数 面板` 只打心情 + 好感两栏；
+      5. 找不到关联时允许沉默（不许凭空开新话题）。
+    """
+    seg = read("services/segments.py")
+    chat = read("plugins/chat/__init__.py")
+    llm = read("services/llm.py")
+    bad = []
+    if "<reply:" not in seg:
+        bad.append("分段没告诉模型怎么引用某一条")
+    if "_mens" not in chat:
+        bad.append("自动引用没优先选「@ 了她」那条")
+    if "_judge_qq" not in chat:
+        bad.append("判读归属没按她引用的人算")
+    if 'what.startswith(("面板"' not in chat:
+        bad.append("缺少 /测函数 面板（心情+好感两栏）")
+    if "往上往下都找不到关联" not in llm:
+        bad.append("没有「找不到关联就沉默」的兜底")
+    return (not bad), "；".join(bad), "回复对象 / 两栏面板 正常"
+
+
 def check_g7():
     src = read("services/mood.py")
     body = func_body(src, "get_mood")
@@ -356,6 +545,423 @@ def check_a4():
     return ok, "mood.touch 只挂在 Rule，block 插件命中时不会刷新", "touch 在观察器内"
 
 
+def check_g19():
+    """识图描述不能发出去（用户 2026-11-23：「偶尔还是会发送出图片的描述」）。
+
+    要求：
+      1. aura_logic 有 strip_media_echo，并在 _push_text 里调用（输出层兜底）；
+      2. llm.py 视觉分支最后一条 system 明确「不要复述画面」；
+      3. vision_agent 给模型的提示词也明确禁止复述画面。
+    """
+    al = read("services/aura_logic.py")
+    llm = read("services/llm.py")
+    va = read("plugins/vision_agent/__init__.py")
+    bad = []
+    if "def strip_media_echo" not in al:
+        bad.append("aura_logic 缺 strip_media_echo")
+    if "strip_media_echo(" not in func_body(al, "_push_text"):
+        bad.append("_push_text 没调用 strip_media_echo")
+    if "不要复述画面" not in llm:
+        bad.append("视觉分支缺「不要复述画面」提示")
+    if "绝对不要在回复里复述画面" not in va:
+        bad.append("vision_agent 提示词没收紧")
+    return (not bad), "；".join(bad), "识图描述不回声 / 标记不漏"
+
+
+def check_g20():
+    """用量图表 + 查用量不再误报 FinishedException（2026-11-23）。
+
+    要求：
+      1. /用量 与 /测函数 用量 都接 usage_chart.download_charts；
+      2. 图表同时有横向排行（cht=bhg）和扇形（cht=p3）；
+      3. 用量文本在 try 内组装，finish 放在 try 外 —— 否则 finish 抛的
+         FinishedException 会被 `except Exception` 接住，多发一条「查用量失败」。
+    """
+    chat = read("plugins/chat/__init__.py")
+    uc = read("services/usage_chart.py")
+    bad = []
+    if "download_charts" not in chat:
+        bad.append("/用量 没接图表")
+    if "cht=bhg" not in uc:
+        bad.append("缺横向排行图")
+    if "cht=p3" not in uc:
+        bad.append("缺扇形图")
+    if '_text = "\\n\\n".join(_out)' not in chat:
+        bad.append("用量文本没在 try 内组装（finish 可能被 except 接住）")
+    return (not bad), "；".join(bad), "用量图表 / finish 控制流正常"
+
+
+def check_g21():
+    """引用不复述 + 语音不念工具词（2026-11-23）。
+
+    要求：
+      1. 输出层有 `_QUOTE_ECHO_RE`，`_push_text` 会剥掉 `〔引用…〕`；
+      2. `parse_reply` 的 `<voice>` 分支调用 `clean_voice_text`；
+      3. `clean_voice_text` 会清 `stick:…` / 标签；
+      4. 末尾硬要求明确「不要在回复里复述、朗读引用内容」。
+    """
+    al = read("services/aura_logic.py")
+    llm = read("services/llm.py")
+    chat = read("plugins/chat/__init__.py")
+    bad = []
+    if "_QUOTE_ECHO_RE" not in al:
+        bad.append("aura_logic 缺引用块剥离")
+    if "clean_voice_text" not in func_body(al, "parse_reply"):
+        bad.append("parse_reply 的 voice 分支没清洗")
+    if "def clean_voice_text" not in al or "stick" not in al:
+        bad.append("缺 clean_voice_text / stick 清洗")
+    if "不要在回复里复述、朗读引用内容" not in llm:
+        bad.append("末尾硬要求缺引用复述禁令")
+    if "clean_voice_text(text)" not in chat:
+        bad.append("speak_voice 没做最后清洗")
+    return (not bad), "；".join(bad), "引用不复述 / 语音不念工具词"
+
+
+def check_g22():
+    """普通网页链接要能读正文（2026-11-23）。
+
+    要求：
+      1. services/web_page.py 有 fetch_page / html_to_text / should_skip；
+      2. chat 的 _enrich_text 会调用 web_page.fetch_page；
+      3. 末尾硬要求明确「有【链接内容】就直接用，不要说点不开」。
+    """
+    wp = read("services/web_page.py")
+    chat = read("plugins/chat/__init__.py")
+    llm = read("services/llm.py")
+    bad = []
+    for name in ("def fetch_page", "def html_to_text", "def should_skip"):
+        if name not in wp:
+            bad.append(f"web_page 缺 {name}")
+    if "web_page" not in chat or "fetch_page" not in chat:
+        bad.append("_enrich_text 没接网页读取")
+    if "【链接内容】" not in llm:
+        bad.append("末尾硬要求没提【链接内容】")
+    return (not bad), "；".join(bad), "普通网页可读 / 链接内容直接用"
+
+
+def check_g23():
+    """群聊分段不能截断网页正文（2026-11-23）。
+
+    真机：群聊里 2488 字的链接正文被 `format` 截到 220 字，只剩一个「A」，
+    她看不到题目，只能回「等会给你答案」。
+    """
+    sg = read("services/segments.py")
+    bad = []
+    if "_SEG_LINK_MAX" not in sg or "【链接内容" not in sg:
+        bad.append("segments 缺链接正文放宽")
+    if "_clip_text" not in sg:
+        bad.append("push 没走 _clip_text")
+    if "_LINK_MARK" not in sg:
+        bad.append("format 没识别链接标记")
+    return (not bad), "；".join(bad), "群聊链接正文不截断"
+
+
+def check_g24():
+    """群聊分段不能把同一条消息回多次（2026-11-23 串线）。
+
+    真机：一段 3 条消息被整段处理一次，队列里剩下的 item 又被单独处理两次，
+    同两条消息回了三次。要求整段取走后把段内每条 mid 登记为已处理。
+    """
+    chat = read("plugins/chat/__init__.py")
+    body = func_body(chat, "_session_worker")
+    bad = []
+    if "_seg_records = await segments.wait_close" not in body:
+        bad.append("没找到分段取走")
+    if "for _r in _seg_records" not in body:
+        bad.append("没遍历段内消息")
+    if "_already_replied(session_key, _rm)" not in body:
+        bad.append("没把段内 mid 登记为已处理（会重复回）")
+    return (not bad), "；".join(bad), "分段消息不会被队列重复处理"
+
+
+def check_g25():
+    """哈希反查工具（2026-11-23）。
+
+    群友用「我爱你」做 SHA-256 测试；模型不该靠猜。
+    要求：
+      1. services/hash_solver.py 有 solve/detect；
+      2. chat 注册了 hash_decode；
+      3. TOOL_CATALOG「查东西」里有 hash_decode，模型才知道调。
+    """
+    hs = read("services/hash_solver.py")
+    chat = read("plugins/chat/__init__.py")
+    llm = read("services/llm.py")
+    bad = []
+    if "def solve" not in hs or "def detect" not in hs:
+        bad.append("hash_solver 缺 solve/detect")
+    if '"name": "hash_decode"' not in chat:
+        bad.append("chat 没注册 hash_decode")
+    if "hash_decode" not in llm:
+        bad.append("TOOL_CATALOG 没写 hash_decode")
+    return (not bad), "；".join(bad), "哈希反查工具已接入"
+
+
+def check_g26():
+    """做题/填表能直接提交（2026-11-23）。
+
+    要求：
+      1. chat 注册了 web_fetch（打开 URL / GET 提交）；
+      2. TOOL_CATALOG 里有 web_fetch；
+      3. 末尾硬要求提醒「把答案拼进提交 URL，用 web_fetch 打开」；
+      4. skill_switch 的 search 组覆盖 web_fetch。
+    """
+    chat = read("plugins/chat/__init__.py")
+    llm = read("services/llm.py")
+    sk = read("services/skill_switch.py")
+    bad = []
+    if '"name": "web_fetch"' not in chat:
+        bad.append("chat 没注册 web_fetch")
+    if "web_fetch" not in llm:
+        bad.append("TOOL_CATALOG 没写 web_fetch")
+    if "拼进提交 URL" not in llm:
+        bad.append("末尾没提醒直接提交")
+    if "web_fetch" not in sk:
+        bad.append("skill_switch 没覆盖 web_fetch")
+    return (not bad), "；".join(bad), "网页提交工具已接入"
+
+
+def check_g27():
+    """文本超时不能重试（2026-11-23 重复消息）。
+
+    真机：QQ 协议层超时后 `_safe_send` 重试一次，第一次其实已经送达 →
+    群里出现两条一模一样、引用也相同的消息。
+    要求：只有图片/语音/视频重试；纯文本超时按已送达处理。
+    """
+    chat = read("plugins/chat/__init__.py")
+    body = func_body(chat, "_safe_send")
+    bad = []
+    if "_msg_has_media" not in chat:
+        bad.append("缺 _msg_has_media")
+    if "_msg_has_media(msg)" not in body:
+        bad.append("_safe_send 没区分媒体/文本")
+    if "按已送达处理，不重试" not in body:
+        bad.append("文本超时仍会重试")
+    return (not bad), "；".join(bad), "文本超时不重试（防重复消息）"
+
+
+def check_g28():
+    """@ 她的消息不能被分段窗口漏掉（2026-11-23）。
+
+    真机：一段 5 条，第 4 条是「老大 @她：我的今日小猪呢，刚刚怎么不理我」，
+    第 5 条是别人问别的 → 模型只回第 5 条，@ 的那条被整段回复漏掉。
+    要求：
+      · segments 标 ⭐ / 截断保留 addressed / 段末列「必须回应」；
+      · group_scene.history_lines 也带 ⭐（prompt 让模型找 ⭐，以前没有）；
+      · prompt 不许再说「只接一个线程」「默认回最后一条」。
+    """
+    seg = read("services/segments.py")
+    gs = read("services/group_scene.py")
+    llm = read("services/llm.py")
+    chat = read("plugins/chat/__init__.py")
+    bad = []
+    if "def is_addressed(" not in seg:
+        bad.append("segments 缺 is_addressed")
+    if "def _pick_rows(" not in seg:
+        bad.append("segments 缺 _pick_rows")
+    if "必须回应" not in seg:
+        bad.append("segments 缺「必须回应」清单")
+    if "每一条 ⭐ 都必须回应" not in seg:
+        bad.append("segments 没要求逐条回应")
+    if "⭐" not in func_body(gs, "history_lines"):
+        bad.append("history_lines 没打 ⭐")
+    if "只接一个线程" in llm or "只接**一个**线程" in llm:
+        bad.append("prompt 仍写「只接一个线程」")
+    if "多条 @ 你" not in llm:
+        bad.append("prompt 缺「多条 @ 你」规矩")
+    if 'session_key.startswith("group_") and not _seg_records' not in chat:
+        bad.append("群聊无分段时没回退到处理过的历史")
+    return (not bad), "；".join(bad), "@ 消息逐条回应 / 上下文只用处理过的历史"
+
+
+def check_g29():
+    """别人互相聊天时别乱接 + 不发旁白（2026-11-23）。
+
+    用户：
+      · 「收件人不是大家、是一个群友的情况下他也回复，接的词不达意」
+      · 「有的时候说心里话，这是谁和谁说不是和我说，发出来了」
+    要求：
+      · 关注期：收件人明确是别人 → 不回；不确定 → 不回（不再「宁可多回」）。
+      · 主动插话：最新一句是「某人 → 另一个群友」→ 跳过。
+      · 插话上下文也用处理过的 history_lines，不用 recent_group_msgs 原串。
+      · 输出层剥掉「谁跟谁说 / 我插不上话 / 系统怎么回」这类旁白。
+      · 多条 @ 用一条消息答完（不一人一条，避免撞发送上限）。
+    """
+    chat = read("plugins/chat/__init__.py")
+    al = read("services/aura_logic.py")
+    llm = read("services/llm.py")
+    seg = read("services/segments.py")
+    bad = []
+    focus = func_body(chat, "_judge_focus_follow")
+    if "收件人是" not in focus:
+        bad.append("关注期没查收件人是不是别人")
+    if "不确定（{ans[:8]}）→ 不回" not in focus:
+        bad.append("关注期「不确定」仍按回处理")
+    loop = func_body(chat, "_random_chat_loop")
+    if "不插话" not in loop or "to_kind" not in loop:
+        bad.append("主动插话没挡「某人 → 群友」")
+    if "_ctx_lines = group_scene.history_lines" not in loop:
+        bad.append("插话上下文仍用未处理原串")
+    if "def strip_meta_talk" not in al or "strip_meta_talk(t)" not in al:
+        bad.append("输出层没剥「点评对话本身」旁白")
+    if "别点评对话本身" not in llm:
+        bad.append("prompt 没禁止点评对话")
+    if "一条消息全部答完" not in seg:
+        bad.append("多条 @ 仍可能一人一条")
+    if "整段发完整" not in chat:
+        bad.append("带 @/引用的长回复仍会被截断")
+    return (not bad), "；".join(bad), "别人互聊不乱接 / 旁白不外发 / 多条 @ 一条答完"
+
+
+def check_g30():
+    """白月光模式 / prompt 体检 / 好感注入（2026-11-23）。
+
+    用户：
+      · 「心情和好感并没有关注太多」→ relation 以前根本没进 prompt；
+      · 「统计她更容易引用回复/艾特谁，学那个人的说话方式」→ 白月光；
+      · 「想看 prompt 每段关注度 + 缓存命中率」→ /测函数 prompt。
+    """
+    wm = read("services/white_moon.py")
+    llm = read("services/llm.py")
+    prof = read("services/profiles.py")
+    chat = read("plugins/chat/__init__.py")
+    pr = read("services/prompt_report.py")
+    bad = []
+    for fn in ("def note_incoming(", "def person_moon(", "def group_moon(",
+               "def render(", "def profile_note("):
+        if fn not in wm:
+            bad.append(f"white_moon 缺 {fn}")
+    if '"relation", "mood"' not in llm:
+        bad.append("relation/mood 没挪到 depth 区")
+    if "white_moon.render" not in llm:
+        bad.append("prompt 没注入白月光")
+    if "white_moon.profile_note" not in prof:
+        bad.append("人物档案没标白月光")
+    if "from services import white_moon" not in chat or "_wm.note_incoming(" not in chat:
+        bad.append("群聊入口没统计「A @/引用 B」")
+    if "prompt_report.report_text" not in chat:
+        bad.append("/测函数 prompt 没接")
+    if "def section_report" not in pr or "def cache_report" not in pr:
+        bad.append("prompt_report 不完整")
+    return (not bad), "；".join(bad), "白月光统计/注入 + 好感进 depth + prompt 体检"
+
+
+def check_g31():
+    """角色扮演 provider 拆分 + prompt 图表（2026-11-23）。
+
+    用户：「角色扮演用 deepseek 4.1-flash（API 名 deepseek-flash）；
+           两个三方检测心情和收发件人的用 chat；GLM 只做视觉。」
+    要求：
+      · 主聊天/工具循环走 ROLEPLAY_*（DeepSeek deepseek-flash）；
+      · 心情判读/收发件人审核仍走 deepseek-chat；
+      · GLM 文本 preflight 关闭（REFEREE_PREFLIGHT=false），GLM 只留视觉；
+      · `/测函数 prompt` 和 `/用量` 一样出横向柱状 + 扇形图。
+    """
+    cfg = read("services/config.py")
+    llm = read("services/llm.py")
+    chat = read("plugins/chat/__init__.py")
+    pr = read("services/prompt_report.py")
+    uc = read("services/usage_chart.py")
+    bad = []
+    for k in ("ROLEPLAY_API_KEY", "ROLEPLAY_BASE_URL", "ROLEPLAY_MODEL"):
+        if k not in cfg:
+            bad.append(f"config 缺 {k}")
+    if "deepseek-flash" not in cfg:
+        bad.append("角色扮演默认模型不是 deepseek-flash")
+    if "ROLEPLAY_BASE_URL" not in llm or "ROLEPLAY_MODEL" not in llm:
+        bad.append("主聊天没用 ROLEPLAY_*")
+    _env = read(".env")
+    if _env and "REFEREE_PREFLIGHT=false" not in _env:
+        bad.append("GLM 文本 preflight 还开着")
+    if "prompt_report.download_charts" not in chat:
+        bad.append("/测函数 prompt 没发图表")
+    if "def chart_urls" not in pr or "def download_charts" not in pr:
+        bad.append("prompt_report 缺图表函数")
+    if "def build_charts" not in uc:
+        bad.append("usage_chart 缺通用 build_charts")
+    return (not bad), "；".join(bad), "角色扮演 deepseek-flash / 三方 chat / GLM 视觉 / prompt 图表"
+
+
+def check_g32():
+    """人格 ID 与登录 QQ 解耦（2026-11-23）。
+
+    用户：「标签自己的话全部改成 NAPCAT_ACCOUNT……包括判定收发件人发给她
+           也是 NAPCAT_ACCOUNT……让她认为我就是 NAPCAT_ACCOUNT，
+           要不然我 QQ 被封一个记忆就不能复用了？」
+
+    要求：
+      · services/identity.py：人格 ID 落盘固定，登录过的号都是别名；
+      · 群聊现场/对话日志里她自己的发言统一记成人格 ID；
+      · 「@ 的是不是她 / 收件人是不是她」认所有别名（含旧号）；
+      · 第三方插件里判 bot 的地方也走别名。
+    """
+    bad = []
+    try:
+        idn = read("services/identity.py")
+    except Exception as e:
+        return False, f"读 services/identity.py 失败: {e}"
+    for k in ("def canonical", "def is_self", "def note_account",
+              "def canon", "_scan_bot_accounts", "_env_aliases"):
+        if k not in idn:
+            bad.append(f"identity 缺 {k}")
+    if "SELF_ALIASES" not in idn:
+        bad.append("identity 不支持 SELF_ALIASES 旧号配置")
+    chat = read("plugins/chat/__init__.py")
+    for k in ("def _self_id(", "def _is_self_qq(", "def _canon_at(",
+              "identity_mod.note_account"):
+        if k not in chat:
+            bad.append(f"chat 缺 {k}")
+    if "str(bot.self_id), \"；\".join(said)" in chat:
+        bad.append("对话日志仍用 bot.self_id 记她的话")
+    gs = read("services/group_scene.py")
+    for k in ("def _is_bot_qq(", "def _to_is_bot(", "_identity.canon(qq)"):
+        if k not in gs:
+            bad.append(f"group_scene 缺 {k}")
+    wm = read("services/white_moon.py")
+    if "_identity.is_self(a)" not in wm or "_identity.is_self(b)" not in wm:
+        bad.append("white_moon 没按别名排除她自己")
+    llm = read("services/llm.py")
+    if "identity_mod.is_self" not in llm:
+        bad.append("私聊历史没按别名认「这是你之前的回复」")
+    third = read("plugins/third/nonebot_plugin_rollpig_plus/handlers/roast.py")
+    if "_identity.is_self" not in third:
+        bad.append("rollpig 回复预约没按别名认 bot")
+    env = read(".env")
+    if env and "NAPCAT_ACCOUNT=" not in env:
+        bad.append(".env 没配 NAPCAT_ACCOUNT")
+    return (not bad), "；".join(bad), "人格 ID 落盘 / 旧号别名 / 日志与收发件人统一"
+
+
+def check_g33():
+    """戳一戳次数屏蔽（2026-11-23）。
+
+    用户：「2 小时内该用户戳超过三次则不予回复戳一戳消息，2 小时后再看。」
+    要求：
+      · services/poke_guard.py 用滑动窗口按用户计数；
+      · 第 4 次起 handler 直接 return（不回、也不戳回），但上下文照记；
+      · 阈值走 core/tuning.py（POKE_MAX_PER_WINDOW / POKE_WINDOW_HOURS）。
+    """
+    bad = []
+    try:
+        pg = read("services/poke_guard.py")
+    except Exception as e:
+        return False, f"读 services/poke_guard.py 失败: {e}"
+    for k in ("def note", "def count", "WINDOW_SEC", "MAX_PER_WINDOW"):
+        if k not in pg:
+            bad.append(f"poke_guard 缺 {k}")
+    tun = read("core/tuning.py")
+    for k in ("POKE_MAX_PER_WINDOW", "POKE_WINDOW_HOURS"):
+        if k not in tun:
+            bad.append(f"tuning 缺 {k}")
+    chat = read("plugins/chat/__init__.py")
+    if "poke_guard.note(uid)" not in chat:
+        bad.append("chat 没接 poke_guard")
+    if "不回、不戳回" not in chat:
+        bad.append("被屏蔽时没写明不戳回")
+    if chat.find("poke_guard.note(uid)") > chat.find('call_api("group_poke"'):
+        bad.append("屏蔽判断在戳回之后（顺序反了）")
+    return (not bad), "；".join(bad), "2 小时滑动窗口 / 第 4 次不回不戳回 / 可调阈值"
+
+
 CHECKS = [
     ("C1", "破冰可独立执行", "behavior", check_c1),
     ("A1", "插话设置 tool context", "behavior", check_a1),
@@ -376,6 +982,26 @@ CHECKS = [
     ("G11", "涨幅驱动（不是水平驱动）", "record", check_g11),
     ("G12", "峰值事件 / 印象最深一件事", "record", check_g12),
     ("G13", "群心情（单人 0.4 / 整群 0.7）", "record", check_g13),
+    ("G14", "协议残留清理（不漏心里话）", "record", check_g14),
+    ("G15", "分段回复 / 用量 / 以图搜源", "record", check_g15),
+    ("G16", "收发件人贯通 / Δ 护栏 / 模板", "record", check_g16),
+    ("G17", "统一历史 / 模板去重", "record", check_g17),
+    ("G18", "回复对象 / 心情好感两栏", "record", check_g18),
+    ("G19", "识图描述不回声 / 标记不漏", "record", check_g19),
+    ("G20", "用量图表 / finish 控制流", "record", check_g20),
+    ("G21", "引用不复述 / 语音不念工具词", "record", check_g21),
+    ("G22", "普通网页可读 / 链接内容直接用", "record", check_g22),
+    ("G23", "群聊链接正文不截断", "record", check_g23),
+    ("G24", "分段消息不重复回（串线）", "record", check_g24),
+    ("G25", "哈希反查工具", "record", check_g25),
+    ("G26", "网页提交工具（web_fetch）", "record", check_g26),
+    ("G27", "文本超时不重试（防重复）", "record", check_g27),
+    ("G28", "@ 消息逐条回应 / 上下文已处理", "record", check_g28),
+    ("G29", "别人互聊不乱接 / 旁白不外发", "record", check_g29),
+    ("G30", "白月光 / prompt 体检 / 好感注入", "record", check_g30),
+    ("G31", "角色扮演 deepseek-flash / 三方 chat / prompt 图表", "record", check_g31),
+    ("G32", "人格 ID 与登录 QQ 解耦（换号不丢记忆）", "record", check_g32),
+    ("G33", "戳一戳次数屏蔽（2h / 3 次）", "record", check_g33),
     ("F1", "BM25 降为加分", "recall", check_f1),
     ("F2", "recall 传 gid", "recall", check_f2),
     ("F2b", "remember 带群号", "recall", check_f2b),

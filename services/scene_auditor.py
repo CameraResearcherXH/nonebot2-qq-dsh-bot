@@ -223,7 +223,7 @@ def _build_prompt(rows: list, todo_idx: set, bot_name: str, names: list) -> str:
         "看不出来就只写你看到的话题（例：两人在聊单机游戏，一个说只玩 3A）。",
         "",
         "只输出 JSON，不要解释、不要 markdown：",
-        '{"summary":"大家在聊家庭组，无病呻吟在招人，肥舞说自己懒得退组",'
+        '{"summary":"大家在聊家庭组，小红在招人，老王说自己懒得退组",'
         '"items":[{"i":2,"to":"阿明","why":"回答上一句的胃疼"}]}',
     ]
     return "\n".join(lines)
@@ -334,7 +334,7 @@ async def audit_recent(gid: str, *, bot_qq: str = "", bot_name: str = "",
             data = r.json()
             try:
                 from . import llm_usage as _lu
-                _lu.record_from_response(data, purpose="audit")
+                _lu.record_from_response(data, purpose="audit", provider="audit", model=MODEL)
             except Exception:
                 pass
             content = (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""

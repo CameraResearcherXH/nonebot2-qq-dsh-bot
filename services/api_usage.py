@@ -239,7 +239,7 @@ async def report_text(days: int = 1) -> str:
                 f"{r.get('day')[5:]} {_fmt(r.get('calls'))} 次"
                 f"/{_fmt(int(r.get('prompt') or 0) + int(r.get('completion') or 0))} tok"
                 for r in rows))
-    lines.append("（用量是本机按天记账，只算聊天主链路；审核/压缩那些旁路没记）")
+    lines.append("（这里只算聊天主链路；完整 token 归因看 /用量（含 judge/audit 两个三方 LLM））")
     return "\n".join(lines)
 
 

@@ -1,0 +1,13 @@
+[plugin]
+name = "picsearch"
+version = "0.1.0"
+description = "以图搜源：PicImageSearch 聚合（TraceMoe / SauceNAO / Ascii2D / IQDB）"
+
+[[tools]]
+name = "picsearch"
+description = "以图搜源：给一张图片链接，综合 TraceMoe / SauceNAO / Ascii2D / IQDB 查出处。"
+level = "safe"
+handler = "services.picsearch_tool:picsearch"
+scope = ["private", "group"]
+hold = true
+parameters = { type = "object", properties = { image_url = { type = "string", description = "要搜的图片直链" } }, required = ["image_url"] }

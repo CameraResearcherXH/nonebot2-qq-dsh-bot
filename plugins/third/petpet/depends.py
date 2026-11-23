@@ -17,6 +17,8 @@ from nonebot.rule import Rule
 from nonebot.typing import T_State
 from nonebot_plugin_imageutils import BuildImage
 
+from services import identity as _identity
+
 from .config import petpet_config
 from .download import download_avatar, download_url
 from .utils import UserInfo
@@ -80,8 +82,8 @@ def is_qq(msg: str):
 def split_msg():
     def dependency(event: MessageEvent, state: T_State):
         def _is_at_me_seg(segment: MessageSegment):
-            return segment.type == "at" and str(segment.data.get("qq", "")) == str(
-                event.self_id
+            return segment.type == "at" and _identity.is_self(
+                segment.data.get("qq", ""), str(event.self_id)
             )
 
         msg: Message = state["REGEX_ARG"]

@@ -33,7 +33,10 @@ MOOD_FILE.parent.mkdir(parents=True, exist_ok=True)
 # 心情波动流水（给「两天一复盘」的 journal_agent 读，不进 Prompt）
 MOOD_HISTORY = Path("data/mood_history.jsonl")
 
-HALF_LIFE_HOURS = 12  # 12 小时半衰期回到 0
+# 心情回到 0 的半衰期（设计默认 12 小时，可在 .env / tuning 调）。
+# 注意：这是「慢慢忘掉」的兜底；真正防一边倒的是 Δ 入口的噪音丢弃
+# （见 mood_judge：旁观/别人之间/她没说话 → Δ 压到 0 或 ±0.03）。
+HALF_LIFE_HOURS = tuning.f("MOOD_HALF_LIFE_HOURS")
 
 # 👇 她自己写的心情（原话）能管多久。
 #    用户 2026-11-19：「心情不能是我们指定的几种，她要自己有写心情的权利。」
@@ -719,6 +722,12 @@ def apply_delta(delta: float, session_key: str = "", *, word: str = "",
 
     def _bump(rec: dict, amount: float) -> dict:
         old = float(rec.get("value") or 0.0)
+        # 设计口径（mood-affinity-design.md §13.1）：心情值 ← clamp(心情值 + Δ)
+        # ⚠️ 2026-11-22 我一度在这里加「饱和阻尼」—— 那是错的：
+        #    一边倒到 -1 的根因是**旁观/刷图被给了负 Δ**（40 条里 32 条负数，
+        #    均值 -0.073，全是「懒得掺和/被刷图刷到眼晕」），不是累加公式本身。
+        #    正确做法是在 Δ 入口做「噪音丢弃 + 旁观归零」，让 Δ 保持设计里的分布，
+        #    这样 §13.3 的 0.10/0.25/0.50 刻痕阈值才继续有意义。
         rec["value"] = _clamp(old + amount)
         rec["updated_at"] = now
         # 名词由数值分档决定（不是模型每次起名）
@@ -746,6 +755,34 @@ def apply_delta(delta: float, session_key: str = "", *, word: str = "",
     except Exception:
         pass
     return round(value_now / 100.0, 4)
+
+
+def reset(session_key: str = "", *, value: float = 0.0) -> float:
+    """把某个会话的心情重置到 value（默认 0），并清掉名词/判读。
+
+    为什么需要：历史误判（旁观被算成 -0.07，几十条累积）会把数值钉在 -1，
+    改完代码也不会自己回到 0 —— `/测函数 心情 重置` 用它清理。
+    """
+    key = _scope_key(session_key)
+    now = time.time()
+    st = _load()
+    st["global"] = _decay(st["global"], now)
+    if key:
+        rec = st["sessions"].get(key) or {"value": 0.0, "updated_at": now}
+        rec["value"] = _clamp(float(value) * 100.0)
+        rec["updated_at"] = now
+        rec["last_active_at"] = now
+        for _k in ("label", "label_at", "judge", "last_decay_at"):
+            rec.pop(_k, None)
+        st["sessions"][key] = rec
+        out = float(rec["value"])
+    else:
+        st["global"]["value"] = _clamp(float(value) * 100.0)
+        for _k in ("label", "label_at", "judge", "last_decay_at"):
+            st["global"].pop(_k, None)
+        out = float(st["global"]["value"])
+    _save(st)
+    return round(out / 100.0, 4)
 
 
 def state_word(session_key: str = "") -> str:

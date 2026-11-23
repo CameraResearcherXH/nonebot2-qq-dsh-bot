@@ -235,22 +235,113 @@ MOOD_RE = re.compile(r"\[\[\s*MOOD\s*\|([^\]\[]{1,120})\]\]", re.IGNORECASE)
 # 以前心理活动只藏在 [[MEMO|think:…]] 里，而 MEMO 是「真的触动才写」→
 # 大部分回复没有 think。现在独立成 [[THINK|…]]，**每条回复都要带**，
 # 不发给用户、不当记忆，只喂心情判读。
-THINK_RE = re.compile(r"\[\[\s*THINK\s*\|([^\]\[]{1,120})\]\]", re.IGNORECASE)
+# 兼容模型手滑：单/双/三括号、半角/全角竖线、冒号都认。
+THINK_RE = re.compile(
+    r"[\[【]{1,3}\s*THINK\s*[|｜:：]\s*"
+    r"((?:[^\[\]【】]|\[[^\[\]【】]*\]|【[^\[\]【】]*】){1,200}?)\s*[\]】]{1,3}",
+    re.IGNORECASE)
 
 
 def parse_think(text: str) -> tuple:
-    """抠出 [[THINK|…]]。返回 (清理后的正文, 心里话)。"""
+    """抠出 [[THINK|…]]。返回 (清理后的正文, 心里话)。
+
+    ⚠️ 2026-11-22：真机偶尔会把心里话发到群里。原因是模型有时写成
+    `[THINK|…]` / `[[THINK:…]]` / 内容里带 `[` `]`，旧的严格正则匹配不到，
+    兜底又只认完整的 `[[...]]` → 整段原样漏给用户。
+    现在：先宽松匹配，再统一交给 `strip_protocol_residue()` 清残留。
+    """
     raw = str(text or "")
     think = ""
     for m in THINK_RE.finditer(raw):
         v = str(m.group(1) or "").strip()
         if v:
             think = v
-    if think:
-        raw = THINK_RE.sub("", raw)
+    # 没闭合的半截标签：正文会被下面清掉，但内容还要留给心情判读
+    if not think:
+        _m = re.search(
+            r"[\[【]{1,3}\s*THINK\s*[|｜:：]\s*(.+)$", raw, re.IGNORECASE)
+        if _m:
+            think = str(_m.group(1) or "").strip().strip("[]【】")
+    # 不管有没有抠到，标记本身都不能留
+    raw = THINK_RE.sub("", raw)
     # 被截断的半截标签也清掉，别让它漏给用户
-    raw = re.sub(r"\[\[\s*THINK[\s\S]*$", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"[\[【]{1,3}\s*THINK[\s\S]*$", "", raw, flags=re.IGNORECASE)
     return raw, think[:200]
+
+
+# ================= 三-0d、协议残留清理（最后一道防线） =================
+# 这些词是「给系统看的标记」，绝不允许出现在用户消息里。
+# 模型偶尔会写畸形：单括号、三括号、全角括号、内容里带 [ ]、只写一半没闭合……
+# 旧兜底 `\[{2,3}[^\]]*\]{2,3}` 遇到嵌套括号就整段匹配失败 → 原文漏给用户。
+# 这里按「从标记词开始，一直吃到配对的右括号 / 行尾」来清，嵌套一层也能处理。
+_PROTO_WORDS = (
+    "THINK", "MOOD", "MEMO", "CALL", "FOCUS", "LONG", "LUCK",
+    "TOOLS?", "SEARCH", "LIBRARY", "SING", "WHO", "HISTORY", "MEMORY",
+    "PROFILE", "ASKGLM", "LATER", "LIKE", "POKE", "NAPCAT", "STICKER",
+    "VIDEO_UNDERSTAND", "VIDEO", "VOICE", "REPLY", "DEEP", "AT",
+)
+_PROTO_START_RE = re.compile(
+    r"[\[【]{1,3}\s*(?:%s)\b" % "|".join(_PROTO_WORDS), re.IGNORECASE)
+
+
+def strip_protocol_residue(text: str) -> str:
+    """删掉任何残留的协议标记，返回干净正文。
+
+    只处理「以协议词开头」的方括号段，正常聊天里的 `[1]`、`【笑】` 不会误伤。
+    """
+    s = str(text or "")
+    if not s:
+        return s
+    out, pos = [], 0
+    while True:
+        m = _PROTO_START_RE.search(s, pos)
+        if not m:
+            out.append(s[pos:])
+            break
+        out.append(s[pos:m.start()])
+        i, depth, end = m.end(), 0, -1
+        while i < len(s):
+            ch = s[i]
+            if ch in "[【":
+                depth += 1
+            elif ch in "]】":
+                if depth > 0:
+                    depth -= 1
+                else:
+                    # 只有「后面紧跟另一个右括号 / 行尾 / 结尾」才算闭合。
+                    # 例：[[SEARCH|a]b]] —— 第一个 ] 是参数里的，不能在这里截断。
+                    _nxt = s[i + 1] if i + 1 < len(s) else ""
+                    if _nxt and _nxt not in "]】\n":
+                        i += 1
+                        continue
+                    j = i
+                    while j < len(s) and s[j] in "]】" and j - i < 3:
+                        j += 1
+                    end = j
+                    break
+            elif ch == "\n" and depth == 0:
+                # 没闭合的标记：只吃到行尾，别把后面的正常聊天也删了
+                end = i
+                break
+            i += 1
+        if end < 0:
+            end = len(s)
+        pos = end
+    s = "".join(out)
+    # 连括号都忘了写的裸协议行：`THINK|…` / `TOOLS:…`（只认大写协议词，避免误伤英文）
+    s = re.sub(
+        r"(?<![A-Za-z])(?:%s)\s*[|｜:：][^\n]*" % "|".join(_PROTO_WORDS),
+        "", s)
+    # 模型手滑写成小写 `stick:开心` / `sticker：开心`（语音最容易念出来）。
+    # 只删「标记 + 紧跟的短词」，不要把同一行后面的话一起吞掉。
+    # 注意：前面是 `<` 的是 `<sticker:…>` 标签，交给 voice/sticker 分支处理，
+    # 这里不能先把它拆坏（否则 <voice>…</voice> 匹配不上）。
+    s = re.sub(
+        r"(?<![A-Za-z<])(?:stick(?:er)?)\s*[|｜:：]\s*[^\s，。！？!?,]{1,20}",
+        "", s, flags=re.I)
+    # 行尾空白顺手清掉
+    s = re.sub(r"[ \t]+$", "", s, flags=re.MULTILINE)
+    return s
 
 
 def parse_mood(text: str) -> tuple:
@@ -471,7 +562,44 @@ def parse_focus(text: str) -> tuple:
     return clean.strip(), val
 
 
-def parse_reply(text: str) -> dict:
+_ECHO_PUNCT = " \t\r\n，,。.!！?？；;：:…~～、"
+
+
+def _norm_echo(s: str) -> str:
+    return "".join(ch for ch in str(s or "") if ch not in _ECHO_PUNCT)
+
+
+def _strip_quote_echo(t: str, quote_text: str = "") -> str:
+    """回复开头原样照抄被引用原文 → 把这一段剥掉，只留她自己的话。
+
+    用户 2026-11-23：「回复引用消息时会把原来消息读一遍。」
+    提示词已经写了「不要复述」，这里再兜一层**精确照抄**：
+    · 只处理开头（避免误删正文里正常的指代）；
+    · 标点/空白不参与比较；
+    · 整条只有原文 → 返回空（等于这句不该发）。
+    """
+    q = _norm_echo(quote_text)
+    if len(q) < 4:
+        return t
+    chars, idx = [], []
+    for i, ch in enumerate(str(t or "")):
+        if ch not in _ECHO_PUNCT:
+            chars.append(ch)
+            idx.append(i)
+    tn = "".join(chars)
+    if not tn.startswith(q):
+        return t
+    cut = idx[len(q) - 1] + 1
+    raw_rest = str(t)[cut:]
+    # 短引用（<6 字）容易和正常口语重合：只有后面紧跟标点/空白才认为是照抄。
+    # 例：「今天好累」+「今天好累啊」不该削成「啊」；
+    #     「今天吃了吗」+「今天吃了吗？吃了」才削。
+    if len(q) < 6 and raw_rest[:1] not in _ECHO_PUNCT:
+        return t
+    return raw_rest.lstrip(_ECHO_PUNCT)
+
+
+def parse_reply(text: str, quote_text: str = "") -> dict:
     # [[LONG]] 必须活到发送层（那边靠它跳过截断、改走合并转发）。
     # 但第 ③ 步会把所有未认领的 [[...]] 一起剥掉 —— 以前它就是这么被吃掉的，
     # 导致「写 [[LONG]] 也没用，照样被截成 20 字」。这里先记下来，最后补回第一个文字气泡。
@@ -484,10 +612,12 @@ def parse_reply(text: str) -> dict:
     raw, think = parse_think(raw)
     # ② [[AT|名字]] → 内部写法 <at:名字>，由发送层换成 NapCat 的真 @ 段
     raw = AT_REQ_RE.sub(lambda m: f"<at:{m.group(1)}>", raw)
-    # ③ 兜底：剥掉任何没被上面认领的 [[...]]（模型手滑写的 [[LUCK]] 之类），
-    #    绝不让「正则词」原文漏给用户（2026-11-17 实测漏过 [[LUCK]]）。
-    # 支持双/三括号：她按提示常写 [[[TOOLS|猪猪]]]，
-    # 只匹配双括号会把外层剩成 "[]"，用户就看到句尾挂一个 "]"（评测抓到 2 次）。
+    # ③ 兜底：剥掉任何没被上面认领的协议标记（[[LUCK]] / [[TOOLS|…]] / 畸形半截标签），
+    #    绝不让「正则词」原文漏给用户（2026-11-17 实测漏过 [[LUCK]]，
+    #    2026-11-22 又漏过 [[THINK|…]] 和连续调用工具时的残留标记）。
+    #    先按「协议词 + 配对括号 / 行尾」清（能处理嵌套括号、单/三括号、全角括号），
+    #    再把完全不认识的 [[...]] 一并清掉。
+    raw = strip_protocol_residue(raw)
     raw = re.sub(r"\[{2,3}[^\]]*\]{2,3}", "", raw)
     # 兜底：括号小动作一律不发给用户（（歪头）（笑）（摊手）（小声）…）
     raw = strip_actions(raw)
@@ -511,7 +641,7 @@ def parse_reply(text: str) -> dict:
         last = 0
         for m in regex.finditer(part):
             from_idx = len(items)
-            _push_text(items, part[last:m.start()])
+            _push_text(items, part[last:m.start()], quote_text=quote_text)
             attach(from_idx)
             from_idx = len(items)
             if m.group(0).startswith("<poke"):
@@ -520,7 +650,9 @@ def parse_reply(text: str) -> dict:
             elif m.group(1) is not None:
                 reply_to = m.group(1)
             elif m.group(2) is not None:
-                v = strip_markdown(m.group(2))
+                # 语音文本必须过清洗：<sticker:开心> / stick:开心 / [[THINK|…]]
+                # 都可能被 TTS 原样念出来（用户 2026-11-23）。
+                v = clean_voice_text(strip_markdown(m.group(2)))
                 if v: items.append({"kind": "voice", "value": v})
             elif m.group(3) is not None:
                 v = m.group(3).strip()
@@ -530,14 +662,13 @@ def parse_reply(text: str) -> dict:
             attach(from_idx)
             last = m.end()
         from_idx = len(items)
-        _push_text(items, part[last:])
+        _push_text(items, part[last:], quote_text=quote_text)
         attach(from_idx)
 
-    quoted = False
-    for it in items:
-        if it.get("replyTo"):
-            if quoted: del it["replyTo"]
-            else: quoted = True
+    # 2026-11-23：以前全局只保留第一个 replyTo（后面的一律删掉），
+    # 但一段里可能有好几个人同时 @ 她，需要「每条 ⭐ 都用 <reply:> 引对应那句」。
+    # 发送层是**一个气泡一条消息**，所以每个气泡各带各的 replyTo 完全没问题；
+    # 同一个气泡里连写两个 <reply:> 时 attach() 也会自动只让后一个生效。
 
     if not items:
         return {"silent": True, "items": [], "memos": memos, "calls": calls,
@@ -582,8 +713,190 @@ def split_lines(text: str) -> list:
     if listy >= (len(lines) + 1) // 2: return [t]
     return lines
 
-def _push_text(items: list, s: str):
+# ================= 三-0d2、媒体描述回显（2026-11-23） =================
+# 用户反馈：「偶尔还是会发送出图片的描述。」
+# 真机两例：
+#   ① `【图片识别结果】啊……这个……` —— 识别标记漏给用户；
+#   ② `【图片】一只淡蓝色的卡通仓鼠双臂交叉抱在胸前，咧着嘴，一脸得意的样子。`
+#      —— 把她自己看到的画面描述整句念了出来，下一句才是真正的回复。
+# 处理：标记直接删；以【图片】/【画面】开头的描述整条丢弃（她不需要用这种格式说话）；
+#      多来源报告 / 结构化头整行丢弃。
+_MEDIA_TAG_RE = re.compile(
+    r"[\[【]\s*(?:图片|视频|图像)\s*(?:识别|解析)?结果\s*[\]】]", re.I)
+_MEDIA_ECHO_HEAD_RE = re.compile(r"^\s*[\[【]\s*(?:图片|视频|图像|画面)\s*[\]】]\s*")
+_MEDIA_REPORT_LINE_RE = re.compile(
+    r"^\s*(?:群号|发送者QQ|发送者昵称|图片内容|视频内容|画面内容)\s*[:：]")
+_MEDIA_SOURCE_LINE_RE = re.compile(
+    r"^\s*(?:qwen|glm|gpt|claude|gemini|trace\.moe|saucenao|ascii2d|iqdb)\s*[:：]", re.I)
+
+# 引用块是给模型理解指代用的（`〔引用 谁 的消息：原文〕`）。
+# 模型偶尔会把整块照抄进回复，甚至念出来 —— 输出层整块剥掉。
+_QUOTE_ECHO_RE = re.compile(r"〔引用[^〕]*〕")
+
+
+def strip_media_echo(text: str) -> str:
+    """去掉「把识图结果念出来」的内容；正常聊天不受影响。"""
+    s = str(text or "").strip()
+    if not s:
+        return s
+    # ① 以【图片】/【画面】开头：后面是描述性长句就整条丢掉，短句只留正文
+    m = _MEDIA_ECHO_HEAD_RE.match(s)
+    if m:
+        rest = s[m.end():].strip()
+        if not rest or len(rest) >= 10:
+            return ""
+        s = rest
+    # ② 句中的识别标记（【图片识别结果】/【视频解析结果】）直接删
+    s = _MEDIA_TAG_RE.sub("", s).strip()
+    # ③ 结构化头 / 多来源报告行：整行丢掉
+    kept = []
+    for ln in s.splitlines():
+        if _MEDIA_REPORT_LINE_RE.match(ln) or _MEDIA_SOURCE_LINE_RE.match(ln):
+            continue
+        kept.append(ln)
+    return "\n".join(kept).strip()
+
+
+# ================= 三-0e、旁白 / 心理活动（2026-11-22） =================
+# 用户：「她偶尔会把内心活动说出来。」
+# 实测：她发过 `（想了一会儿，还是不知道说啥好）`（4 次）——
+# 这是**旁白/心理活动**，不是聊天内容。模型把它写在正文里（没写进 [[THINK]]），
+# 就变成"把心里话说了出来"。
+# 处理：整条是旁白 → 丢弃（等于沉默）；开头的旁白 → 剥掉，留后面真正要说的话。
+_STAGE_VERBS = ("想", "心", "嘀咕", "默默", "暗自", "叹气", "皱眉", "摇头",
+                "沉默", "顿了顿", "犹豫", "尴尬", "无语", "愣", "咬了咬",
+                "叹了口气", "深吸", "挠头", "扶额", "小声")
+_STAGE_FULL_RE = re.compile(r"^[（(]\s*[^（）()]{1,60}\s*[）)]$")
+_STAGE_HEAD_RE = re.compile(r"^[（(]\s*[^（）()]{1,60}\s*[）)]\s*")
+
+
+def is_stage_direction(text: str) -> bool:
+    """整条都是「（想了一会儿…）」这种旁白吗。"""
+    t = str(text or "").strip()
+    if not _STAGE_FULL_RE.match(t):
+        return False
+    return any(v in t for v in _STAGE_VERBS)
+
+
+def strip_stage_direction(text: str) -> str:
+    """把旁白去掉：整条是旁白 → ""；开头是旁白 → 只留后面的正文。"""
+    t = str(text or "").strip()
+    if not t:
+        return t
+    if is_stage_direction(t):
+        return ""
+    m = _STAGE_HEAD_RE.match(t)
+    if m and any(v in m.group(0) for v in _STAGE_VERBS):
+        t = t[m.end():].strip()
+    return t
+
+
+# ================= 三-0e2、点评对话本身 / 心里话（2026-11-23） =================
+# 用户：「有的时候说心里话，这是谁和谁说不是和我说，发出来了；还有时候接一句词不达意的内容」。
+# 真机原句：
+#   · 「串线这个是系统的问题，不是我乱接话；这几条本来就是分着回你们俩的」
+#   · 「没招了，我就看着你们聊；上课去吧，晚点回来水」
+#   · 「所以刚刚是我心情低着 不是我不理你」
+# 这些是**她对对话结构的判断/旁白**，不是聊天内容。整句/整个分句丢掉。
+_META_TALK_RE = re.compile(
+    r"(串线|不是我乱接话|系统(的)?问题|分着回你们|"
+    r"不是(在)?(跟|和)我(说|聊)|不是(跟|和)我说|谁(跟|和)谁(说|聊)|"
+    r"(跟我|和我)没(关系|事)|我就(看着|听着|围观)你们|"
+    r"不是我该接|不是(我)?(该|要)接的|不是我不理你|不是不理你|"
+    r"不是我(在)?接话|别把账算我头上|"
+    r"(不想|懒得)(插嘴|接话|掺和|管这|管那)|"
+    r"我也?不想(插嘴|接话|掺和)|"
+    r"(你们|你俩|他们|这)(的|堆|些)?.{0,8}(破事|烂事).{0,8}(不想|懒得|别))"
+)
+
+
+def strip_meta_talk(text: str) -> str:
+    """去掉「点评谁跟谁说 / 我插不上话 / 系统怎么回」这类旁白。
+
+    按分句（；/;）处理：命中且不长 → 丢这一句；全丢了就返回空（等于沉默）。
+    不动正常内容，比如「系统已经加上了」不含上述模式。
+    """
+    s = str(text or "").strip()
+    if not s:
+        return s
+    keep = []
+    for c in re.split(r"[；;]", s):
+        c = c.strip()
+        if not c:
+            continue
+        if _META_TALK_RE.search(c) and len(c) <= 60:
+            continue
+        keep.append(c)
+    return "；".join(keep).strip(" ，,、。.!！?？~～")
+
+
+# ================= 三-0f、伤人的词（2026-11-22） =================
+# 用户：「最近很多次她说话很直很冲，很多次怼用户，有的时候还会带死字。」
+# 人设是温柔的，但长人设会被稀释 → 除了 prompt 收紧，这里再兜一层：
+# 只处理**明确攻击性**的说法，不动「笑死」「好吃死了」这种正常口语。
+# ① 明确的攻击：整句不要（不是"改软"，是这句不该说）
+_HARSH_DROP_RE = re.compile(r"(去死|死开|死一边(去|儿)?|你个死|死肥鱼)")
+# ② 只是口癖/情绪词：换成软的
+_HARSH_SOFTEN = (
+    (re.compile(r"找死"), "太冒险了"),
+    (re.compile(r"该死"), "糟了"),
+    (re.compile(r"(死鬼|死样)"), ""),
+)
+
+
+def soften_harsh(text: str) -> str:
+    """攻击性词：整句丢弃 / 换软。删空了就当这句没说。"""
+    s = str(text or "")
+    if not s:
+        return s
+    if _HARSH_DROP_RE.search(s):
+        return ""
+    for pat, rep in _HARSH_SOFTEN:
+        s = pat.sub(rep, s)
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    return s.strip(" ，,、。.!！?？~～")
+
+
+# ================= 三-0g、语音文本清洗（2026-11-23） =================
+# 用户：「她语音偶尔会说出 stick:开心。」
+# 原因：`parse_reply` 的 <voice> 分支只做了 strip_markdown，
+# 协议标记 / 标签 / 裸 stick:xxx 会原样进 TTS。
+_TAG_ANY_RE = re.compile(r"<[^<>\n]{1,40}>")
+_BARE_STICK_RE = re.compile(
+    r"(?<![A-Za-z<])(?:stick(?:er)?)\s*[|｜:：]\s*[^\s，。！？!?,]{1,20}", re.I)
+
+
+def clean_voice_text(text: str) -> str:
+    """语音朗读前把标记/标签/裸工具词清干净；正常话不受影响。"""
+    s = str(text or "").strip()
+    if not s:
+        return s
+    s = _TAG_ANY_RE.sub("", s)
+    s = strip_protocol_residue(s)
+    s = _BARE_STICK_RE.sub("", s)
+    s = strip_media_echo(s)
+    s = strip_stage_direction(s)
+    s = soften_harsh(s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip(" ，,、。.!！?？~～")
+
+
+def _push_text(items: list, s: str, quote_text: str = ""):
     t = strip_markdown(re.sub(r"</?reply[^>]*>", "", str(s or "")))
+    # 引用块只给模型理解指代；她照抄/朗读出来就是错的（用户 2026-11-23）。
+    t = _QUOTE_ECHO_RE.sub("", t)
+    # 不带〔〕、直接把原文开头的照抄也剥掉。
+    t = _strip_quote_echo(t, quote_text)
+    # 最后一道：气泡里也不能残留任何协议标记
+    t = strip_protocol_residue(t)
+    # 识图描述 / 识别标记不该发给用户（用户 2026-11-23）
+    t = strip_media_echo(t)
+    # 旁白 / 心理活动不该发出去（用户 2026-11-22）
+    t = strip_stage_direction(t)
+    # 点评「谁跟谁说 / 我插不上话 / 系统怎么回」这类旁白（用户 2026-11-23）
+    t = strip_meta_talk(t)
+    # 攻击性词（去死/找死…）删掉；删空了就这句不说
+    t = soften_harsh(t)
     if not t or is_silence(t): return
     # 只剩括号碎片的气泡不要发（真机出现过她只发一个 "]" ——
     # 模型写畸形标记 [[AT|名字] 被剥掉后留下的残渣，用户看到一脸问号）。

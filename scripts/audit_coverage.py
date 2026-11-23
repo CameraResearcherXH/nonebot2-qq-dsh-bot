@@ -70,6 +70,15 @@ def imported_names():
                     names.add(node.module.split(".")[-1])
                 for a in node.names:
                     names.add(a.name)
+    # plugin.toml 里的 handler 也是真接线（例如 services.picsearch_tool:picsearch）。
+    # 只按 AST 收 import 会把它误判成孤儿模块（2026-11-22）。
+    for toml in (ROOT / "plugins").rglob("*.toml"):
+        for m in re.finditer(r'handler\s*=\s*"([A-Za-z_][\w\.]*):([A-Za-z_]\w*)"',
+                             read(toml)):
+            mod = m.group(1)
+            names.add(mod.split(".")[0])
+            names.add(mod.split(".")[-1])
+            names.add(m.group(2))
     return names
 
 

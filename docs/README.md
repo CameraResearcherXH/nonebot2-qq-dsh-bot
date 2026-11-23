@@ -10,9 +10,12 @@
 | 文档 | 说明 |
 |---|---|
 | [../README.md](../README.md) | 项目简介、快速开始、常用命令 |
+| [deployment.md](deployment.md) | **部署指南**：Docker / NapCat / `.env` / 验证 / 排错 |
 | [features.md](features.md) | **功能总览**：每个能力是干嘛的、怎么用、配置在哪 |
 | [plugin-dev.md](plugin-dev.md) | 插件开发：`plugin.toml`、工具声明、插件商城 |
+| [third-party-integration.md](third-party-integration.md) | **三方插件接入**：怎么变成 function calling 工具 + 我们对上游改了什么 |
 | [persona-card.md](persona-card.md) | **人格卡**：格式、字段、参考来源、怎么写自己的角色 |
+| [CHANGELOG.md](CHANGELOG.md) | 更新日志（新增 / 优化 / 修复） |
 
 ## 设计
 
@@ -21,6 +24,9 @@
 | [architecture-map.md](architecture-map.md) | 代码地图：core / services / plugins 各层职责 |
 | [master-design.md](master-design.md) | 总体设计（记忆 / 心情 / 档案 / 群聊现场） |
 | [mood-affinity-design.md](mood-affinity-design.md) | **心情 / 好感 / 群心情 / 峰值事件** 的完整设计 |
+| [memory-profile-design.md](memory-profile-design.md) | **记忆 / 档案 / 心情 / 好感** 的数据结构、读写链、进 prompt 顺序 |
+| [whitemoon.md](whitemoon.md) | **白月光模式**：两层统计、风格取样、注入时机 |
+| [usage-report.md](usage-report.md) | **用量与 prompt 体检**：缓存命中、分段占比、图表 |
 | [feature-audit.md](feature-audit.md) | 功能链路审计：每个断点编号与对应闸门 |
 | [harness_design.md](harness_design.md) | 自测 / 闸门体系 |
 | [harness_stack_selection.md](harness_stack_selection.md) | 自测技术选型 |
