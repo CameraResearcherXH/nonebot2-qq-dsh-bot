@@ -37,9 +37,14 @@ except Exception:  # pragma: no cover
     logger = logging.getLogger(__name__)
 
 ENABLED = os.getenv("PROFILE_MINE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-MODEL = (os.getenv("PROFILE_MINE_MODEL")
-         or os.getenv("MOOD_JUDGE_MODEL")
-         or os.getenv("XAI_MODEL") or "").strip()
+# 2026-11-24：由 providers 决定（PROFILE_PROVIDER / PROFILE_MODEL）
+from .providers import resolve as _resolve_provider  # noqa: E402
+
+_PROFILE_P = _resolve_provider("profile")
+MODEL = _PROFILE_P["model"]
+XAI_API_KEY = _PROFILE_P["api_key"]
+XAI_BASE_URL = _PROFILE_P["base_url"].rstrip("/")
+XAI_MODEL = _PROFILE_P["model"]
 TIMEOUT = tuning.f("PROFILE_MINE_TIMEOUT")
 MIN_MSGS = tuning.i("PROFILE_MINE_MIN_MSGS")     # 攒多少条发言挖一次
 INTERVAL_H = tuning.f("PROFILE_MINE_INTERVAL_H")  # 同一个人多久挖一次
@@ -106,8 +111,8 @@ def note_message(gid: str, qq: str) -> bool:
 
 
 def _base() -> tuple:
-    return ((os.getenv("XAI_BASE_URL") or "").rstrip("/"),
-            (os.getenv("XAI_API_KEY") or "").strip())
+    p = _resolve_provider("profile")
+    return (p["base_url"].rstrip("/"), (p["api_key"] or "").strip())
 
 
 def _samples(qq: str, gid: str) -> tuple:

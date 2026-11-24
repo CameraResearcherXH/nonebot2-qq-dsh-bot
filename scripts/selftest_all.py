@@ -1075,7 +1075,8 @@ async def t_vision():
               "没配 DASHSCOPE_API_KEY 时为空（源码无硬编码 key）")
     check(S, V.VISION_ENDPOINT.endswith("/chat/completions"), f"端点：{V.VISION_ENDPOINT[:60]}…")
     check(S, "只能从这些词里挑一个" in V.STICKER_VISION_PROMPT, "表情 prompt 限定词表")
-    check(S, V.VISION_USE_URL is True, "默认优先传图片链接（省掉上传大图）")
+    check(S, V.VISION_USE_URL is False,
+          "默认自己下载再压（画质可控；链接只当下载失败时的兜底）")
     check(S, V.VISION_MAX_ATTEMPTS > 0, f"尝试次数上限 {V.VISION_MAX_ATTEMPTS}")
     check(S, "60" in V.DEFAULT_VISION_PROMPT, "视觉 prompt 硬性限定 60 字")
     check(S, "禁止" in V.DEFAULT_VISION_PROMPT, "视觉 prompt 有禁止项（防模型啰嗦）")
@@ -1090,8 +1091,13 @@ async def t_vision():
         _Image.new("RGB", (2400, 1600), (200, 30, 30)).save(buf, format="PNG")
         big = buf.getvalue()
         small, mime2 = V._compress(big)
-        check(S, len(small) < len(big) * 0.5,
-              f"大图压缩 {len(big) / 1024:.0f}KB → {len(small) / 1024:.0f}KB")
+        # 2026-11-24：quality 提到 90 后，纯色图「体积减半」不再成立（PNG 本来就小），
+        # 真正要保证的是**长边被缩到上限**、且体积不涨。
+        _im2 = _Image.open(_io.BytesIO(small))
+        check(S, max(_im2.size) <= V.VISION_MAX_SIDE,
+              f"大图长边缩到 {max(_im2.size)}px（上限 {V.VISION_MAX_SIDE}）")
+        check(S, len(small) <= len(big),
+              f"压缩后不涨体积 {len(big) / 1024:.0f}KB → {len(small) / 1024:.0f}KB")
         check(S, mime2 == "image/jpeg", f"压缩后 mime={mime2}")
         check(S, V._compress(png)[0] == png, "小图压完更大时保留原图")
     except ImportError:
@@ -2575,12 +2581,39 @@ async def t_focus():
     check(S, C._focus_active("group_888", "111") is True, "各自关注独立")
 
     # 空 @ 之后补一句（2026-11-18 真机：@ 空消息 → 「发个表情包」被判不回）
+    # ⚠️ 2026-11-24：关注期新增「心情太低就不追」的闸门，
+    #    前面的心情测试会把全局压到 -100，这里必须先复位，否则全是假失败。
+    try:
+        from services import mood as _mood
+        _st_m = _mood._load()
+        _st_m["global"]["value"] = 0.0
+        _st_m.setdefault("sessions", {}).setdefault(key, {})["value"] = 0.0
+        _mood._save(_st_m)
+    except Exception as _e:
+        print(f"[focus] 复位心情失败: {type(_e).__name__}: {_e}")
     C.focus_sessions.clear()
     C._focus_start(key, "555", pending=True)
     check(S, C.focus_sessions[key]["555"].get("pending") is True, "空 @ → 标记 pending")
     ok = await C._judge_focus_follow("发个表情包", "999", "555")
     check(S, ok is True, "空 @ 后的补话 → 直接回（不调模型）")
     check(S, C.focus_sessions[key]["555"].get("pending") is False, "pending 用完即清")
+
+    # 省流模式硬信号（2026-11-24）：只有 @/引用/喊名字/收件人是她 才入队
+    class _FakeLiteEv:
+        def __init__(self, tome):
+            self._t = tome
+
+        def is_tome(self):
+            return self._t
+
+    check(S, C._lite_hard_signal(_FakeLiteEv(True), "999", "555") is True,
+          "省流：@ 她是硬信号")
+    check(S, C._lite_hard_signal(_FakeLiteEv(False), "999", "555",
+                                 text="今天好热") is False,
+          "省流：闲聊不接")
+    check(S, C._lite_hard_signal(_FakeLiteEv(False), "999", "555",
+                                 scene_meta={"to_kind": "bot"}) is True,
+          "省流：收发件人判定是她 → 接")
 
     # 关注期内不再用正则猜意图：除结构信号（名字/空@补话/@别人）外都交给模型
     check(S, not hasattr(C, "_looks_like_request_to_me"),

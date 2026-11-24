@@ -16,6 +16,14 @@ NODE_COMPUTE = os.getenv("NODE_COMPUTE", "1").strip().lower() not in (
 #   harness   = 接 DeepSeek Harness 会话（可以真的改仓库代码），self_tool 自动关闭
 #   off       = 两个都不开
 CODE_AGENT = os.getenv("CODE_AGENT", "self_tool").strip().lower()
+
+# 群聊观察范围（2026-11-24 用户要求）：
+#   full = 现状：所有群消息都进判定（关注全部群聊）
+#   lite = 省流：只观察/记录，只有「硬信号」才入队回（@她 / 引用她 / 喊名字 / 收件人是她）；
+#          接话时只拉附近 8 条上下文 + 记忆。私聊不受影响。
+GROUP_WATCH_MODE = (os.getenv("GROUP_WATCH_MODE", "full") or "full").strip().lower()
+if GROUP_WATCH_MODE not in ("full", "lite"):
+    GROUP_WATCH_MODE = "full"
 HARNESS_ENABLED = CODE_AGENT == "harness"
 # ⚠️ XAI_* 现在只给「三方判读 / 审核 / 参考 / 表达学习」等辅助调用用，
 #    默认仍是 DeepSeek（deepseek-chat）。
@@ -27,12 +35,14 @@ PROXY = os.getenv("XAI_PROXY", "")
 # 角色扮演（主聊天）单独一套 provider（用户 2026-11-23：
 # 「角色扮演用 deepseek 4.1-flash（API 模型名 deepseek-flash），
 #   三方判读用 deepseek-chat；GLM 只做视觉」）。
-ROLEPLAY_API_KEY = (os.getenv("ROLEPLAY_API_KEY", "")
-                    or os.getenv("XAI_API_KEY", "")
-                    or os.getenv("GLM_API_KEY", ""))
-ROLEPLAY_BASE_URL = os.getenv(
-    "ROLEPLAY_BASE_URL", "https://api.deepseek.com").rstrip("/")
-ROLEPLAY_MODEL = os.getenv("ROLEPLAY_MODEL", "deepseek-flash")
+# 2026-11-24：改成统一走 providers 注册表 —— 用户可以在 .env 里把主聊天
+# 换成 glm / qwen / 自己的中转站，不用改代码。
+from .providers import resolve as _resolve_provider  # noqa: E402
+
+_roleplay = _resolve_provider("roleplay")
+ROLEPLAY_API_KEY = _roleplay["api_key"]
+ROLEPLAY_BASE_URL = _roleplay["base_url"]
+ROLEPLAY_MODEL = _roleplay["model"]
 # ⚠️ MAX_HISTORY 已废弃删除：历史轮次由 chat 的 MAX_GROUP_RECENT（群聊上下文条数）
 #    + prompt_builder 的预算分配（PROMPT_BUDGET / BLOCK_BUDGET）共同控制。
 #    .env 里留着 MAX_HISTORY 也不会有任何作用。

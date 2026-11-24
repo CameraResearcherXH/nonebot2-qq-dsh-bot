@@ -46,7 +46,15 @@ from .config import BOT_MODE, PROXY, XAI_API_KEY, XAI_BASE_URL, XAI_MODEL
 from . import group_scene
 
 ENABLED = os.getenv("SCENE_AUDIT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-MODEL = os.getenv("SCENE_AUDIT_MODEL", XAI_MODEL)
+# 2026-11-24：审核模型由 providers 决定（AUDIT_PROVIDER / AUDIT_MODEL）
+from .providers import resolve as _resolve_provider  # noqa: E402
+
+_AUDIT_P = _resolve_provider("audit")
+MODEL = _AUDIT_P["model"]
+# 下游代码沿用 XAI_* 这三个名字，但值已经换成「audit 角色」解析出来的
+XAI_API_KEY = _AUDIT_P["api_key"]
+XAI_BASE_URL = _AUDIT_P["base_url"].rstrip("/")
+XAI_MODEL = _AUDIT_P["model"]
 TIMEOUT = tuning.f("SCENE_AUDIT_TIMEOUT")
 # 默认 20 条：用户 2026-11-19 ——「A：英伟达跌了吗」……10 分钟后「B：对啊，都是老黄的锅」，
 # 这种中间没人说话的对话，按时间窗拉会拆成两句，审核 LLM 根本没法判断。

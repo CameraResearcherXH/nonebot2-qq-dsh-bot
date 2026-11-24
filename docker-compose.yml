@@ -94,6 +94,12 @@ services:
       ACCOUNT: "${NAPCAT_ACCOUNT:-}"
       WEBUI_PORT: "6099"
       WEBUI_HOST: "0.0.0.0"
+      # 👇 2026-11-24：腾讯老把快速登录 token 作废（「你的用户身份已失效」），
+      #    没配密码就只能干等扫码。在 .env 里写 NAPCAT_QUICK_PASSWORD 后，
+      #    掉线会自动用密码重登，不用再手动扫码。
+      #    ⚠️ 只在 .env 里写，别提交到仓库；也可以只配 MD5（更安全）。
+      NAPCAT_QUICK_PASSWORD: "${NAPCAT_QUICK_PASSWORD:-}"
+      NAPCAT_QUICK_PASSWORD_MD5: "${NAPCAT_QUICK_PASSWORD_MD5:-}"
     logging: *default-logging
     volumes:
       - ./napcat/config:/app/napcat/config

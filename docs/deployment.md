@@ -210,6 +210,32 @@ CODE_AGENT=self_tool
 
 Harness 桥的配置与用法见 [harness-bridge.md](harness-bridge.md)。
 
+## 5.7 模型自由搭配（每个角色单独选）
+
+```ini
+# 主聊天
+ROLEPLAY_PROVIDER=deepseek
+ROLEPLAY_MODEL=deepseek-flash
+# 识图（也可以换 deepseek-flash / qwen3-vl-plus）
+VISION_PROVIDER=glm
+VISION_MODEL=glm-4v-plus
+# 两个 chat 检测
+JUDGE_PROVIDER=deepseek
+AUDIT_PROVIDER=deepseek
+```
+
+查看当前分配：`/测函数 模型`。完整说明见 [model-providers.md](model-providers.md)。
+
+## 5.8 群聊观察模式（`GROUP_WATCH_MODE`）
+
+```ini
+# full = 所有群消息都判定（默认，最像真人，也最费 token）
+# lite = 省流：消息照记（白月光/心情不受影响），只回 @她 / 引用她 / 喊名字 / 收件人是她
+GROUP_WATCH_MODE=full
+```
+
+省流模式下不主动插话、不做表达学习；接话时上下文仍是最近 8 条 + 记忆。私聊不受影响。
+
 ## 6. 可选：算力机（画图 / 翻唱 / 语音 / 视频）
 
 在一台有 NVIDIA GPU 的机器上：

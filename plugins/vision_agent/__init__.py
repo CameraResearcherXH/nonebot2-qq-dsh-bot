@@ -38,7 +38,13 @@ VISION_TIMEOUT = tuning.f("VISION_TIMEOUT")
 # ---- 图片体积控制（7MB 的图不压缩直接 base64 = 9.4MB 请求体，必超时）----
 VISION_MAX_SIDE = tuning.i("VISION_MAX_SIDE")       # 最长边缩到多少
 VISION_MAX_BYTES = int(os.getenv("VISION_MAX_BYTES", str(4 * 1024 * 1024)))
-VISION_USE_URL = os.getenv("VISION_USE_URL", "true").lower() == "true"  # 优先传链接
+# 2026-11-24：默认改成「先下载再传」。
+#   以前优先把 QQ 图片链接丢给视觉模型，模型拉到的是 CDN 那份（可能被压过/被限流），
+#   用户一直反馈「图看不清」。现在自己下载 → 按 VISION_MAX_SIDE 压 → base64 传，
+#   我们控制画质；链接只作为「下载失败时的兜底」。
+VISION_USE_URL = os.getenv("VISION_USE_URL", "false").lower() == "true"
+# 视觉主通道：qwen（默认，阿里云 DashScope）｜glm（智谱，GLM_VISION_MODEL）
+VISION_PROVIDER = (os.getenv("VISION_PROVIDER", "qwen") or "qwen").strip().lower()
 VISION_MAX_ATTEMPTS = tuning.i("VISION_MAX_ATTEMPTS")  # 总尝试次数上限
 
 # 👇 模型名自动降级：不同 workspace 上架的模型不一样，
@@ -46,14 +52,16 @@ VISION_MAX_ATTEMPTS = tuning.i("VISION_MAX_ATTEMPTS")  # 总尝试次数上限
 #    按顺序试，第一个能用的记进 data/vision_model.txt，下次直接用。
 _env_cands = [m.strip() for m in (os.getenv("VISION_MODEL_CANDIDATES") or "").split(",") if m.strip()]
 VISION_MODEL_CANDIDATES = _env_cands or [
-    VISION_MODEL,              # Qwen3.5-Flash
-    "qwen3.5-flash",           # 大小写变体
-    "qwen-vl-max",
-    "qwen-vl-max-latest",
-    "qwen-vl-plus",
+    # 2026-11-24 实测（当前 workspace）：
+    #   · qwen-vl-plus / qwen3.5-flash 名字不对或极慢（404 / 30~50s）；
+    #   · qwen-vl-max-latest 403（没权限）；
+    #   · qwen3-vl-plus ~10s，稳定可用 → 作 Qwen 侧主力。
+    VISION_MODEL,              # 默认 qwen3-vl-plus
     "qwen3-vl-plus",
     "qwen2.5-vl-72b-instruct",
     "qwen2.5-vl-7b-instruct",
+    "qwen-vl-max-latest",
+    "qwen3.5-flash",           # 兜底：慢，但能读细节
 ]
 _MODEL_CACHE_FILE = Path("data/vision_model.txt")
 _working_model = None
@@ -152,7 +160,8 @@ def _compress(image_bytes: bytes, max_side: int = 0) -> tuple:
         if max(w, h) > max_side:
             im.thumbnail((max_side, max_side), Image.LANCZOS)
         buf = io.BytesIO()
-        im.save(buf, format="JPEG", quality=85, optimize=True)
+        # quality 90：85 对截图里的细字太狠，视觉模型会回「看不清」
+        im.save(buf, format="JPEG", quality=90, optimize=True)
         out = buf.getvalue()
         # 压完反而更大（小图）就用原图
         if len(out) >= len(image_bytes):
@@ -287,16 +296,48 @@ STICKER_VISION_PROMPT = (
 )
 
 
-def _model_order() -> list:
-    """先用上次成功的，再按候选表顺序试。"""
-    order = []
+# 各 provider 的视觉兜底模型（2026-11-24 实测本账号可用性）
+_VISION_FALLBACKS = {
+    "glm": ["glm-4v-plus", "glm-4v-flash"],
+    "qwen": ["qwen3-vl-plus", "qwen2.5-vl-72b-instruct"],
+    "deepseek": ["deepseek-flash"],
+    "xai": [],
+    "openai": [],
+    "custom": [],
+}
+
+
+def _vision_targets() -> list:
+    """[(endpoint, api_key, model)] —— 识图用哪家由 `VISION_PROVIDER` 决定。
+
+    2026-11-24 用户要求：「有的用户直接用 deepseek v4 flash 做视觉，有些想换 glm」。
+    所以识图不再写死阿里云：providers.resolve("vision") 给出 base_url / key / model，
+    这里只负责拼 `/chat/completions` 和兜底模型名。
+    """
+    try:
+        from services import providers
+        p = providers.resolve("vision")
+        name = str(p.get("provider") or "").lower()
+        base = str(p.get("base_url") or "").rstrip("/")
+        key = str(p.get("api_key") or "")
+        primary = str(p.get("model") or "")
+    except Exception as e:      # pragma: no cover - 兜底：老行为
+        logger.debug(f"[VISION] providers 解析失败，退回 DashScope: {type(e).__name__}: {e}")
+        name, base, key, primary = "qwen", _DASH_BASE, DASHSCOPE_API_KEY, VISION_MODEL
+
+    if not base:
+        base = _DASH_BASE
+    ep = base if base.endswith("/chat/completions") else base + "/chat/completions"
+
+    models = []
+    for m in [primary] + list(_VISION_FALLBACKS.get(name, [])) + [c for c in VISION_MODEL_CANDIDATES]:
+        m = str(m or "").strip()
+        if m and m not in models:
+            models.append(m)
     cached = _load_working_model()
-    if cached:
-        order.append(cached)
-    for m in VISION_MODEL_CANDIDATES:
-        if m and m not in order:
-            order.append(m)
-    return order
+    if cached and cached not in models:
+        models.insert(0, cached)
+    return [(ep, key, m) for m in models]
 
 
 async def _vl_describe(image_bytes: bytes, prompt: str = DEFAULT_VISION_PROMPT,
@@ -305,20 +346,23 @@ async def _vl_describe(image_bytes: bytes, prompt: str = DEFAULT_VISION_PROMPT,
     真正调视觉模型的地方。
 
     两条载体，按代价从低到高：
-      1) url   —— 只把图片链接发过去，阿里云自己拉图，请求体几百字节（首选）
-      2) b64   —— 压缩后再 base64（url 不可用 / 私有链接时的兜底）
+      1) url   —— 只把图片链接发过去（省流量，默认已关：链接可能被 CDN 压过）
+      2) b64   —— 自己下载 + 压缩后再 base64（默认，画质可控）
 
-    ⚠️ 7MB 的图直接 base64 会变成 9.4MB 请求体，上传慢到超时 —— 这就是之前
-       「日志停在 图片 7070 KB 之后再无下文」的原因。
+    provider 由 `VISION_PROVIDER` 决定（glm / qwen / deepseek / 自定义）。
     """
     if not image_bytes:
         return ""
-    if not DASHSCOPE_API_KEY:
-        logger.error("❌ [VISION] DASHSCOPE_API_KEY 为空，无法识图（检查 .env 或 services/config.py）")
-        return ""
 
-    headers = {"Authorization": f"Bearer {DASHSCOPE_API_KEY}", "Content-Type": "application/json"}
-    last_err = ""
+    targets = _vision_targets()
+    if not targets:
+        logger.error("❌ [VISION] 没有可用的视觉模型")
+        return ""
+    if not targets[0][1]:
+        logger.error(
+            "❌ [VISION] 没有视觉 API key（检查 VISION_API_KEY / "
+            f"VISION_PROVIDER={VISION_PROVIDER} 对应的 key）")
+        return ""
 
     # ---- 准备图片载体 ----
     payloads = []          # [(kind, image_item, 说明)]
@@ -337,93 +381,91 @@ async def _vl_describe(image_bytes: bytes, prompt: str = DEFAULT_VISION_PROMPT,
     b64 = f"data:{mime};base64,{base64.b64encode(small).decode('utf-8')}"
     payloads.append(("b64", {"type": "image_url", "image_url": {"url": b64}}, "base64"))
 
-    # ---- 逐个组合尝试（有次数上限，避免 8 模型 × 2 端点 一路试到天荒地老）----
+    # ---- 逐个组合尝试（有次数上限，避免一路试到天荒地老）----
     attempts = 0
-    for endpoint in _endpoints():
-        switch_endpoint = False
-        for model in _model_order():
-            switch_model = False
-            for kind, item, label in payloads:
-                if attempts >= VISION_MAX_ATTEMPTS:
-                    logger.warning(f"⚠️ [VISION] 已达尝试上限 {VISION_MAX_ATTEMPTS} 次，停止")
-                    switch_endpoint = True
-                    break
-                attempts += 1
-                t0 = time.time()
-                payload = {
-                    "model": model,
-                    "messages": [{"role": "user", "content": [item, {"type": "text", "text": prompt}]}],
-                    "max_tokens": max_tokens,
-                }
-                try:
-                    async with httpx.AsyncClient(timeout=VISION_TIMEOUT, trust_env=False) as client:
-                        r = await client.post(endpoint, headers=headers, json=payload)
-                    cost = time.time() - t0
-
-                    if r.status_code == 200:
-                        data = r.json()
-                        desc = data["choices"][0]["message"]["content"]
-                        if isinstance(desc, list):
-                            desc = " ".join([i.get("text", "") for i in desc if isinstance(i, dict)])
-                        desc = (desc or "").strip()
-                        if desc:
-                            if model != _load_working_model():
-                                logger.info(
-                                    f"[VISION] ✅ 视觉可用：{model}（{label}，{cost:.1f}s）已记住"
-                                )
-                                _save_working_model(model)
-                            return desc
-                        last_err = "模型返回空描述"
-                        logger.warning(f"[VISION] {model} 返回空描述（{label}，{cost:.1f}s）")
-                        switch_model = True
-                        break
-
-                    body = r.text[:300]
-                    low = body.lower()
-                    last_err = f"HTTP {r.status_code}: {body}"
-                    logger.warning(
-                        f"[VISION] {model} @ {endpoint} {label} → HTTP {r.status_code} "
-                        f"（{cost:.1f}s）: {body[:120]}"
-                    )
-
-                    # 模型不存在 → 换模型
-                    if r.status_code == 404 or "model_not_found" in low or "model not exist" in low:
-                        switch_model = True
-                        break
-                    # 端点不认 key → 换端点
-                    if r.status_code in (401, 403):
-                        switch_endpoint = True
-                        break
-                    # 图片下载不到 / 图片不合法 → 换个载体再试（url → b64）
-                    if r.status_code in (400, 413, 422) and kind == "url":
-                        logger.info(f"[VISION] {label} 不可用（图片链接拉不到？），改用 base64 重试")
-                        continue
-                    # 其他（限流/欠费/审核）换什么都没用
-                    logger.error(f"❌ [VISION] 放弃：HTTP {r.status_code}（model={model}）")
-                    return ""
-                except Exception as e:
-                    last_err = f"{type(e).__name__}: {e}"
-                    logger.warning(
-                        f"[VISION] {model} @ {endpoint} {label} 请求异常"
-                        f"（{time.time() - t0:.1f}s）: {last_err}"
-                    )
-                    # 超时/连接错误 → 换载体或换端点，不要一路死磕同一个
-                    if kind == "url":
-                        continue
-                    switch_endpoint = True
-                    break
-
-            if switch_endpoint:
+    last_err = ""
+    for endpoint, api_key, model in targets:
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        bad_key = False
+        model_missing = False
+        for kind, item, label in payloads:
+            if attempts >= VISION_MAX_ATTEMPTS:
+                logger.warning(f"⚠️ [VISION] 已达尝试上限 {VISION_MAX_ATTEMPTS} 次，停止")
                 break
-            if switch_model:
-                continue
+            attempts += 1
+            t0 = time.time()
+            payload = {
+                "model": model,
+                "messages": [{"role": "user",
+                              "content": [item, {"type": "text", "text": prompt}]}],
+                "max_tokens": max_tokens,
+            }
+            try:
+                async with httpx.AsyncClient(timeout=VISION_TIMEOUT, trust_env=False) as client:
+                    r = await client.post(endpoint, headers=headers, json=payload)
+                cost = time.time() - t0
+
+                if r.status_code == 200:
+                    data = r.json()
+                    desc = data["choices"][0]["message"]["content"]
+                    if isinstance(desc, list):
+                        desc = " ".join([i.get("text", "") for i in desc if isinstance(i, dict)])
+                    desc = (desc or "").strip()
+                    if desc:
+                        if model != _load_working_model():
+                            logger.info(
+                                f"[VISION] ✅ 视觉可用：{model}（{label}，{cost:.1f}s）已记住")
+                            _save_working_model(model)
+                        return desc
+                    last_err = "模型返回空描述"
+                    logger.warning(f"[VISION] {model} 返回空描述（{label}，{cost:.1f}s）")
+                    model_missing = True
+                    break
+
+                body = r.text[:300]
+                low = body.lower()
+                last_err = f"HTTP {r.status_code}: {body}"
+                logger.warning(
+                    f"[VISION] {model} @ {endpoint} {label} → HTTP {r.status_code} "
+                    f"（{cost:.1f}s）: {body[:120]}"
+                )
+
+                if r.status_code == 404 or "model_not_found" in low or "model not exist" in low:
+                    model_missing = True
+                    break
+                if r.status_code in (401, 403):
+                    logger.error(f"❌ [VISION] {model} key 无权限（HTTP {r.status_code}）")
+                    bad_key = True
+                    break
+                if r.status_code in (400, 413, 422) and kind == "url":
+                    logger.info(f"[VISION] {label} 不可用（图片链接拉不到？），改用 base64 重试")
+                    continue
+                # 1210：这家模型不收图（纯文本模型）→ 换下一个模型
+                if r.status_code == 400 and ("1210" in body or "content.type" in low):
+                    model_missing = True
+                    break
+                logger.error(f"❌ [VISION] 放弃：HTTP {r.status_code}（model={model}）")
+                return ""
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+                logger.warning(
+                    f"[VISION] {model} @ {endpoint} {label} 请求异常"
+                    f"（{time.time() - t0:.1f}s）: {last_err}"
+                )
+                if kind == "url":
+                    continue
+                model_missing = True
+                break
+        if bad_key:
+            break
+        if model_missing:
+            continue
         if attempts >= VISION_MAX_ATTEMPTS:
             break
 
     logger.error(
         f"❌ [VISION] 所有组合都失败（试了 {attempts} 次）\n"
-        f"   端点：{_endpoints()}\n"
-        f"   模型：{_model_order()}\n"
+        f"   目标：{[(m, e) for e, _k, m in targets]}\n"
         f"   最后错误：{last_err}\n"
         f"   跑 `python scripts/probe_models.py` 看真实可用的模型名"
     )

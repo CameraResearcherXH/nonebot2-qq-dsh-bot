@@ -265,3 +265,31 @@ python3 scripts/dump_tuning.py --write   # 重新生成 docs/tuning.md
 - **和 self_tool 互斥**：`CODE_AGENT=harness` 时 `plugins/self_tools` 不加载。
 - **代码**：`services/harness.py`、`plugins/harness/`
 - **说明**：[harness-bridge.md](harness-bridge.md)
+## 19. 模型自由搭配（provider 注册表，2026-11-24）
+
+- **是什么**：主聊天 / 心情判读 / 收发件人审核 / 识图 / 风格学习 / 对话状态 / 档案挖掘
+  每个角色都能单独指定 provider + 模型（deepseek / glm / qwen / xai / openai / 自己的中转站）。
+- **怎么用**：`.env` 里 `<ROLE>_PROVIDER` / `<ROLE>_MODEL` / `<ROLE>_BASE_URL` / `<ROLE>_API_KEY`；
+  `/测函数 模型` 看当前每个角色落到哪家、哪个模型、key 有没有。
+- **例子**：主聊天换 `glm-5.3-flash`；识图换 `deepseek-flash`；两个检测分别用 deepseek / qwen。
+- **代码**：`services/providers.py`（`resolve` / `chat_url` / `status`）
+- **说明**：[model-providers.md](model-providers.md)
+
+## 20. 群聊「全局 / 省流」两种观察模式（`GROUP_WATCH_MODE`，2026-11-24）
+
+- **full（默认）**：所有群消息都进判定，她会关注全部群聊（现状）。
+- **lite（省流）**：消息照常记录（现场 / 白月光 / 心情都不受影响），但**只有硬信号才入队回复**：
+  @ 她 / 引用她 / 喊她名字 / 收发件人判定是她。接话时拉附近 8 条上下文 + 记忆；
+  省流模式下不主动插话、不做表达学习。
+- **私聊不受影响**；群白月光是硬逻辑统计，两种模式都在记。
+- **怎么用**：`.env` 里 `GROUP_WATCH_MODE=full|lite`，改完 `up -d --force-recreate bot`。
+- **代码**：`services/config.py`、`plugins/chat/__init__.py`（`_need_reply` 的省流分支）
+
+## 21. 引用精确到消息号 / 同一件事不回两遍（2026-11-24）
+
+- **引用**：prompt 里每行都带 `#消息号`，她写 `<reply:消息号>`（或 `<reply:#消息号>`）。
+  发送前会校验：不是这一段的真实 mid → 如果是行号（`<reply:2>`）就按段内顺序映射；
+  都不是就**不引用**，避免「引到上面/下面那条、回错人」。
+- **防重复**：刚回过这个群 `GROUP_REPLY_COOLDOWN`（默认 45s）内，没点她的消息只进上下文、
+  不单独开一轮；@ 她 / 喊名字不受影响。
+- **协议残留**：`〔引用…〕` / `〔引〕` / 半个 `〔` 一律当残留清掉，不再出现在气泡里。

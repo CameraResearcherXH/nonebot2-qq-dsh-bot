@@ -637,7 +637,7 @@ def parse_reply(text: str, quote_text: str = "") -> dict:
     for bubble in raw.split("|||"):
         part = bubble.strip()
         if not part: continue
-        regex = re.compile(r"<poke\s*/?>|<reply:\s*(\d+)\s*>|<voice>([\s\S]*?)</voice>|<sticker:([^>]+?)>(?:\s*</sticker>)?|!\[[^\]]*\]\(\s*([^)\s]+)\s*\)")
+        regex = re.compile(r"<poke\s*/?>|<reply:\s*#?(\d+)\s*>|<voice>([\s\S]*?)</voice>|<sticker:([^>]+?)>(?:\s*</sticker>)?|!\[[^\]]*\]\(\s*([^)\s]+)\s*\)")
         last = 0
         for m in regex.finditer(part):
             from_idx = len(items)
@@ -731,7 +731,9 @@ _MEDIA_SOURCE_LINE_RE = re.compile(
 
 # 引用块是给模型理解指代用的（`〔引用 谁 的消息：原文〕`）。
 # 模型偶尔会把整块照抄进回复，甚至念出来 —— 输出层整块剥掉。
-_QUOTE_ECHO_RE = re.compile(r"〔引用[^〕]*〕")
+# 2026-11-24：模型会写 `〔引〕` / `〔引用…` 各种变体，甚至只漏一个 `〔`。
+# 〔〕是我们自己的协议括号，正常聊天不会用 → 一律当残留清掉。
+_QUOTE_ECHO_RE = re.compile(r"〔[^〕]{0,300}〕")
 
 
 def strip_media_echo(text: str) -> str:
@@ -885,6 +887,8 @@ def _push_text(items: list, s: str, quote_text: str = ""):
     t = strip_markdown(re.sub(r"</?reply[^>]*>", "", str(s or "")))
     # 引用块只给模型理解指代；她照抄/朗读出来就是错的（用户 2026-11-23）。
     t = _QUOTE_ECHO_RE.sub("", t)
+    # 只剩半边括号（`〔 ` / ` 〕`）也清掉
+    t = re.sub(r"[〔〕]", "", t)
     # 不带〔〕、直接把原文开头的照抄也剥掉。
     t = _strip_quote_echo(t, quote_text)
     # 最后一道：气泡里也不能残留任何协议标记
@@ -913,6 +917,16 @@ def wants_voice(text: str) -> bool:
     return bool(re.search(r"(用|发|来|给我|录)[^，。？！\n]{0,4}语音|语音[^，。？！\n]{0,4}(说|发|讲|回|念|唱)", t))
 
 def bubble_delay(next_text: str = "") -> int:
+    """多气泡之间的停顿（毫秒）。
+
+    2026-11-24 用户「回复等太久」：原来 350 + 110/字、上限 4500ms，
+    一句 30 字就要等 3.6s（还乘 0.8~1.3 随机）。现在 base 300 + 90/字、
+    上限 1600ms —— 还是像人在打字，但不会让人等到以为掉线。
+    """
+    from core import tuning
     length = len(str(next_text or ""))
-    typing = 350 + length * 110
-    return int(min(4500, max(700, typing)) * (0.8 + random.random() * 0.5))
+    base = tuning.i("BUBBLE_DELAY_BASE_MS")
+    per = tuning.i("BUBBLE_DELAY_PER_CHAR")
+    cap = tuning.i("BUBBLE_DELAY_MAX_MS")
+    typing = base + length * per
+    return int(min(cap, max(250, typing)) * (0.85 + random.random() * 0.3))

@@ -38,6 +38,7 @@ from services.access import is_owner, display_name, nickname_variants
 from services import (profiles, memory_v2, mood, group_roster, referee,
                        dialogue_log, group_scene, scene_auditor, conv_state)
 from services import view_frequency as vf_mod
+from services.config import GROUP_WATCH_MODE  # noqa: E402
 from services import (attention, expression, chat_switch, proactive, mood_judge,
                       profile_miner, quiet_advisor, skill_switch, segments,
                       poke_guard)
@@ -1760,6 +1761,21 @@ async def _judge_focus_follow(text: str, gid: str, speaker_qq: str, event=None) 
         _focus_mark_yes(key, sq)
         return True
 
+    # ①b 心情低 → 不追着接（用户 2026-11-24：「心情没那么高但一直在接」）。
+    #    以前关注期完全不看心情：被 @ 一次之后能连着接好几轮。
+    #    现在低于 MOOD_FOLLOW_MIN 就只回「明确 @ / 喊名字」的，其余留给上下文。
+    try:
+        _mv_now = float(mood.get_mood(key).get("value") or 0.0)
+        _floor = tuning.f("MOOD_FOLLOW_MIN")
+        if _mv_now <= _floor:
+            logger.info(
+                f"[FOCUS] 心情 {_mv_now:+.0f} ≤ {_floor:.0f} → 不追「{t[:16]}」，"
+                f"只回明确叫她的")
+            _focus_penalize(key, sq)
+            return False
+    except Exception as e:
+        logger.debug(f"[FOCUS] 心情闸门失败（按老逻辑继续）: {type(e).__name__}: {e}")
+
     try:
         _f = _focus_clean(key, sq)
     except Exception:
@@ -2077,6 +2093,38 @@ async def _early_observe(event: MessageEvent) -> None:
         pass
 
 
+def _lite_hard_signal(event, gid, uid, text: str = "",
+                      reply_qq: str = "", scene_meta: dict | None = None) -> bool:
+    """省流模式：这条消息是不是「硬信号」——只有硬信号才入队回复。
+
+    2026-11-24 用户：「判定是否接话，可以根据硬逻辑来完成收发件来确定哪些是说他，
+    以及艾特。」所以这里只看结构信号，不做任何语义猜测：
+      · @ 了她
+      · 引用/回复的是她
+      · 喊了她的人格名 / 外号
+      · 收发件人判定结果是「她」
+    """
+    try:
+        if event is not None and event.is_tome():
+            return True
+    except Exception:
+        pass
+    if reply_qq:
+        try:
+            if _is_self_qq(reply_qq, event):
+                return True
+        except Exception:
+            pass
+    try:
+        if text and _calls_me_by_name(text, f"group_{gid}", str(uid)):
+            return True
+    except Exception:
+        pass
+    if str((scene_meta or {}).get("to_kind") or "") == "bot":
+        return True
+    return False
+
+
 async def _need_reply(event: MessageEvent) -> bool:
     text = event.get_plaintext().strip()
     # 破冰 / 心情观察已移到 _early_observe（priority=1, block=False），
@@ -2224,6 +2272,8 @@ async def _need_reply(event: MessageEvent) -> bool:
             _label = _msg_label(event)
             _now_ts = time.time()
             # 👇 群聊现场：补「谁 → 谁」，按回复链/提及/参与者聚线程
+            _rq = ""
+            _scene_meta = None
             try:
                 _rp = getattr(event, "reply", None)
                 _rq = str(getattr(getattr(_rp, "sender", None), "user_id", "") or "")
@@ -2295,7 +2345,7 @@ async def _need_reply(event: MessageEvent) -> bool:
             # 👇 表达学习：每攒够 N 条真人消息，后台挖一次「这个群 / 这个人怎么说话」。
             #    学的是**语气和句式**（和 lorebook 的知识互补），失败静默，不影响聊天。
             try:
-                if expression.enabled():
+                if expression.enabled() and GROUP_WATCH_MODE != "lite":
                     _EXP_COUNT[gid] = int(_EXP_COUNT.get(gid) or 0) + 1
                     if _EXP_COUNT[gid] >= expression.EVERY:
                         _EXP_COUNT[gid] = 0
@@ -2397,6 +2447,19 @@ async def _need_reply(event: MessageEvent) -> bool:
         except Exception as e:
             logger.debug(f"[SWITCH] 查询安静失败: {type(e).__name__}: {e}")
 
+            # 👇 2026-11-24 省流模式：观察/白月光/心情照记，但**只有硬信号才入队**。
+            #    用户：「让用户选择关注群消息，或者接话/回复时拉附近 8 条上下文。
+            #          判定是否接话用硬逻辑（收发件人 + 艾特）。」
+            if GROUP_WATCH_MODE == "lite":
+                _hard = _lite_hard_signal(
+                    event, gid, uid, text=_t_own,
+                    reply_qq=_rq, scene_meta=_scene_meta)
+                if not _hard:
+                    logger.debug(f"[LITE] {gid} 不是在叫她 → 只记上下文，不入队")
+                    return False
+                logger.info(f"[LITE] {gid} 硬信号命中（@/引用/喊名字/收件人是她）→ 接话")
+                return True
+
         # 👇 LATER 等消息期间已经读过的消息，不再单独回一次（用户 2026-11-12：
         #    「拉了未来记录的时候实际上是已读然后总结回复之前那条了。
         #      之后如果并非艾特就不要再对新的一句再回一次了。」）。
@@ -2411,6 +2474,26 @@ async def _need_reply(event: MessageEvent) -> bool:
                 f"她等消息时已经读过 → 不再单独回一次"
             )
             return False
+        # 👇 2026-11-24 用户：「依然有一个对话回复两次」。
+        #    真机：12:03:56 回过「唱着呢…」，12:04:46 又回一句同话题的。
+        #    原因不是发送层重复，而是**两条消息各自开了一轮**。
+        #    规则：刚回过这个群 → 冷却期内「没点她」的消息先只进上下文，不单独回；
+        #    @ 她 / 喊她名字 不受影响（那是明确的召唤）。
+        try:
+            _cool = tuning.f("GROUP_REPLY_COOLDOWN")
+            _last_reply = float(session_last_reply.get(f"group_{gid}") or 0.0)
+            _addressed_now = (event.is_tome()
+                              or _calls_me_by_name(
+                                  _t_own, f"group_{gid}", str(event.user_id)))
+            if (_cool > 0 and not _addressed_now and _last_reply > 0
+                    and (time.monotonic() - _last_reply) < _cool):
+                logger.info(
+                    f"[COOLDOWN] {gid} 刚回过 "
+                    f"{time.monotonic() - _last_reply:.0f}s，这条没点她 → 只记上下文")
+                return False
+        except Exception as e:
+            logger.debug(f"[COOLDOWN] 检查失败: {type(e).__name__}: {e}")
+
         # 👇 纯问候不接（「早安」「晚安啦」「睡了」）——
         #    很多群夜里只剩这个，她一句句接等于把人吵醒。
         # ⚠️ 但 @ 她的不拦（2026-11-17 审计）：@ 一句「晚安」是明确的社交动作，
@@ -4156,6 +4239,8 @@ async def _session_worker(bot: Bot, session_key: str):
         except asyncio.TimeoutError:
             session_workers.pop(session_key, None)
             return
+        # [LAT] 一次回复的耗时拆解（用户 2026-11-24：回复等太久）
+        _lat = {"t0": time.monotonic(), "seg": 0.0, "audit": 0.0, "llm": 0.0}
         _mid0 = str(getattr(item[0], "message_id", "") or "")
         if _already_replied(session_key, _mid0):
             logger.info(f"[DEDUP] {session_key} 消息 {_mid0} 已经处理过 → 跳过（防一张图回两条）")
@@ -4174,7 +4259,22 @@ async def _session_worker(bot: Bot, session_key: str):
         _seg_records = []
         _seg_addressed = None
         if session_key.startswith("group_"):
-            _seg_records = await segments.wait_close(session_key)
+            # 👇 2026-11-24：@ 她 / 喊她名字时不等满 SEGMENT_WAIT_SEC，
+            #    只等一小会儿就开口 —— 被叫了还慢半拍是最明显的「反应慢」。
+            _seg_fast = False
+            try:
+                _ev0 = item[0]
+                _seg_fast = bool(getattr(_ev0, "is_tome", lambda: False)()) \
+                    or _calls_me_by_name(
+                        str(item[1] or ""), session_key,
+                        str(getattr(_ev0, "user_id", "") or ""))
+            except Exception:
+                _seg_fast = False
+            _t_seg = time.monotonic()
+            _seg_records = await segments.wait_close(
+                session_key,
+                wait_sec=(tuning.f("SEGMENT_WAIT_FAST") if _seg_fast else 0))
+            _lat["seg"] = time.monotonic() - _t_seg
             if _seg_records:
                 # ⚠️ 2026-11-23 串线根因：一段 3 条消息被整段处理了一次，
                 #    但队列里还留着这 3 条各自的 item → 本轮结束后它们会被
@@ -4378,6 +4478,7 @@ async def _session_worker(bot: Bot, session_key: str):
                     #    只审 大家/不确定/低置信 的消息；@/引用 不审。
                     #    失败/超时静默退回硬逻辑，不影响回复。
                     if scene_auditor.enabled():
+                        _t_audit = time.monotonic()
                         try:
                             await asyncio.wait_for(
                                 scene_auditor.audit_recent(
@@ -4389,6 +4490,7 @@ async def _session_worker(bot: Bot, session_key: str):
                             )
                         except Exception as e:
                             _warn_audit_wire("回复前审核", e)
+                        _lat["audit"] = time.monotonic() - _t_audit
                     _snap = group_scene.snapshot(
                         _gid_now,
                         bot_qq=_self_id_now,
@@ -4521,6 +4623,7 @@ async def _session_worker(bot: Bot, session_key: str):
             _is_vision = (_media_kind == "image")
             # 私聊先挂「正在输入」，等模型回来再取消（失败静默）
             await _typing(bot, ev, True)
+            _t_llm = time.monotonic()
             try:
                 reply, is_query_image = await call_llm(
                     session_key, text_for_llm, group_context=ctx,
@@ -4529,6 +4632,7 @@ async def _session_worker(bot: Bot, session_key: str):
                     moon_target_qq=_moon_target_qq,
                 )
             finally:
+                _lat["llm"] = time.monotonic() - _t_llm
                 await _typing(bot, ev, False)
 
             # ---------- 4) 拆出 [[MEMO]] / [[CALL]] / [[FOCUS]] ----------
@@ -4951,6 +5055,7 @@ async def _session_worker(bot: Bot, session_key: str):
                     _auto_call = profiles.call_of(str(ev.user_id), speaker_name)
                 except Exception:
                     _auto_call = speaker_name or ""
+            _t_send = time.monotonic()
             for idx, item in enumerate(items):
                 # 👇 QQ 硬限制「本群每分钟只能发 10 条消息」，
                 #    多气泡回复很容易撞上，撞了就是 retcode=1200 整轮失败。
@@ -4980,6 +5085,29 @@ async def _session_worker(bot: Bot, session_key: str):
                     #    parse_reply 只负责把标记抠出来塞进 item["replyTo"]，
                     #    真正发 reply 段在这里 —— 之前这段根本没接，标记被静默丢掉了。
                     _explicit_rid = str(item.get("replyTo") or "").strip()
+                    # 👇 2026-11-24 用户：「引用回复的时候会回错人，回成上面/下面那条」。
+                    #    根因：模型常把行号 `[2]` 当成消息号写成 `<reply:2>`，
+                    #    发出去就引到一条不存在/别的消息上。
+                    #    这里做两道校验：① 必须是这一段的真实 mid；
+                    #    ② 万一是行号，按段内顺序映射成 mid；都不是就不引用。
+                    if _explicit_rid:
+                        _valid_mids = [str(r.get("mid") or "")
+                                       for r in (_seg_records or []) if r.get("mid")]
+                        if _explicit_rid not in _valid_mids:
+                            try:
+                                _ri = int(_explicit_rid.lstrip("#"))
+                            except Exception:
+                                _ri = 0
+                            if 1 <= _ri <= len(_valid_mids):
+                                logger.info(
+                                    f"[REPLY] <reply:{_explicit_rid}> 是行号 → "
+                                    f"映射到消息 {_valid_mids[_ri - 1]}")
+                                _explicit_rid = _valid_mids[_ri - 1]
+                            else:
+                                logger.warning(
+                                    f"[REPLY] <reply:{_explicit_rid}> 不在这一段里 → "
+                                    f"不引用（避免引错人）")
+                                _explicit_rid = ""
                     _rid = _explicit_rid
                     # 模型没自己引用 → 用系统兜底的「被 @ 自动引用」。
                     # 自动引用**不阻止**长文走合并转发（显式引用才阻止）。
@@ -5144,6 +5272,17 @@ async def _session_worker(bot: Bot, session_key: str):
             except Exception:
                 pass
 
+            # [LAT] 耗时拆解：段等待 / 审核 / 模型 / 发送
+            try:
+                logger.info(
+                    f"[LAT] {session_key} 段={_lat['seg']:.1f}s "
+                    f"审核={_lat['audit']:.1f}s 模型={_lat['llm']:.1f}s "
+                    f"发送={time.monotonic() - _t_send:.1f}s "
+                    f"总计={time.monotonic() - _lat['t0']:.1f}s "
+                    f"气泡={len(items)}")
+            except Exception:
+                pass
+
             # 👇 把她自己这一轮说的话也写进群聊上下文。
             #    不写的话，下一轮她完全看不到自己刚说过什么 → 会重复、会自相矛盾。
             #    注意：这里只 append，**不触发回复**（worker 内部，不经过 _need_reply），
@@ -5213,7 +5352,8 @@ async def _random_chat_loop(bot: Bot):
     await asyncio.sleep(15)
     while True:
         try:
-            if RANDOM_CHAT_ENABLED and skill_switch.is_enabled("proactive.interject"):
+            if (RANDOM_CHAT_ENABLED and GROUP_WATCH_MODE != "lite"
+                    and skill_switch.is_enabled("proactive.interject")):
                 now_ts = time.time()
                 now_ms = int(now_ts * 1000)
 
@@ -6401,6 +6541,11 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
         for _p in _paths:
             _msg += MessageSegment.image(f"file://{Path(_p).resolve()}")
         await _test_fn.finish(_msg)
+
+    if what.startswith(("模型", "provider", "model")):
+        # /测函数 模型 —— 每个角色当前用哪家 / 哪个模型 / 有没有 key
+        from services import providers as _pv
+        await _test_fn.finish(_pv.status())
 
     if what.startswith(("白月光", "月光", "moon")):
         # /测函数 白月光 [群号] —— 她在这个群最常引用/回复/@谁，以及学到的说话方式

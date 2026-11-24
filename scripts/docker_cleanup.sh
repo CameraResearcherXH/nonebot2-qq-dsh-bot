@@ -115,3 +115,4 @@ say ""
 say "提示：项目自己的临时音频也可以清"
 say "  du -sh data/temp_audio"
 say "  rm -f data/temp_audio/*.wav data/temp_audio/*.mp3"
+

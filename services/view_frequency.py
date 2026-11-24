@@ -119,3 +119,4 @@ def predict_interval(current, previous=None):
     if not vals:
         return None
     return sum(vals) / len(vals)
+

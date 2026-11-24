@@ -77,3 +77,4 @@ async def fetch_web_search(query: str) -> str:
     except Exception as e:
         logger.error(f"[WebSearch] ❌ 搜索过程中发生异常: {type(e).__name__} - {e}")
         return ""
+

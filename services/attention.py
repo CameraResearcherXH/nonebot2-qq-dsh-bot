@@ -82,3 +82,4 @@ def status() -> str:
         return f"注意力漂移：关闭（ATTENTION_DRIFT={DRIFT_LEVEL}）"
     return (f"注意力漂移：{DRIFT_LEVEL}｜回钩 {ANCHOR_POLICY}"
             f"｜短反应 {REACTION_STYLE}")
+

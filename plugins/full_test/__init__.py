@@ -747,3 +747,4 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
             f"看完整报告：私聊发 /全量测试 报告\n文件：{report}"
         )
     await full_test.finish()
+

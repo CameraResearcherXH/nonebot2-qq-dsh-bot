@@ -97,3 +97,4 @@ RUN apt-get update \
 COPY . .
 
 CMD ["python", "bot.py"]
+

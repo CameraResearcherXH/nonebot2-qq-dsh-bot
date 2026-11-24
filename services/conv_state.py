@@ -52,7 +52,14 @@ except Exception:  # pragma: no cover
 from .config import BOT_MODE, PROXY, XAI_API_KEY, XAI_BASE_URL, XAI_MODEL
 
 ENABLED = os.getenv("CONV_STATE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-MODEL = os.getenv("CONV_STATE_MODEL", "") or XAI_MODEL
+# 2026-11-24：由 providers 决定（CONV_STATE_PROVIDER / CONV_STATE_MODEL）
+from .providers import resolve as _resolve_provider  # noqa: E402
+
+_CS_P = _resolve_provider("conv_state")
+MODEL = _CS_P["model"]
+XAI_API_KEY = _CS_P["api_key"]
+XAI_BASE_URL = _CS_P["base_url"].rstrip("/")
+XAI_MODEL = _CS_P["model"]
 MIN_INTERVAL = tuning.f("CONV_STATE_MIN_INTERVAL")
 MAX_CHARS = tuning.i("CONV_STATE_MAX_CHARS")
 TIMEOUT = tuning.f("CONV_STATE_TIMEOUT")

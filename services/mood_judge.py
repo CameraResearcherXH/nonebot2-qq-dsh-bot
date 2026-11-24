@@ -34,8 +34,11 @@ except Exception:  # pragma: no cover
     logger = logging.getLogger(__name__)
 
 ENABLED = os.getenv("MOOD_JUDGE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-MODEL = (os.getenv("MOOD_JUDGE_MODEL")
-         or os.getenv("SCENE_AUDIT_MODEL") or os.getenv("XAI_MODEL") or "").strip()
+# 2026-11-24：判读用哪个模型由 providers 决定（JUDGE_PROVIDER / JUDGE_MODEL）。
+from .providers import resolve as _resolve_provider  # noqa: E402
+
+_JUDGE_P = _resolve_provider("judge")
+MODEL = _JUDGE_P["model"]
 TIMEOUT = tuning.f("MOOD_JUDGE_TIMEOUT")
 CTX_LINES = tuning.i("MOOD_JUDGE_CTX")
 MIN_INTERVAL = tuning.f("MOOD_JUDGE_MIN_INTERVAL")
@@ -163,8 +166,8 @@ def recent_think(session_key: str, n: int = 3) -> list:
 
 
 def _base() -> tuple:
-    return ((os.getenv("XAI_BASE_URL") or "").rstrip("/"),
-            (os.getenv("XAI_API_KEY") or "").strip())
+    p = _resolve_provider("judge")
+    return (p["base_url"].rstrip("/"), (p["api_key"] or "").strip())
 
 
 _LINK_RE = re.compile(r"https?://\S+")

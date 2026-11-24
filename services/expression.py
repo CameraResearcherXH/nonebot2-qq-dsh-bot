@@ -56,7 +56,14 @@ ENABLED = os.getenv("EXPRESSION_ENABLED", "true").lower() in ("1", "true", "yes"
 EVERY = tuning.i("EXPRESSION_EVERY")
 MIN_INTERVAL = tuning.f("EXPRESSION_MIN_INTERVAL")
 MAX_PER_SCOPE = tuning.i("EXPRESSION_MAX_PER_SCOPE")
-MODEL = os.getenv("EXPRESSION_MODEL", "") or XAI_MODEL
+# 2026-11-24：由 providers 决定（EXPRESSION_PROVIDER / EXPRESSION_MODEL）
+from .providers import resolve as _resolve_provider  # noqa: E402
+
+_EX_P = _resolve_provider("expression")
+MODEL = _EX_P["model"]
+XAI_API_KEY = _EX_P["api_key"]
+XAI_BASE_URL = _EX_P["base_url"].rstrip("/")
+XAI_MODEL = _EX_P["model"]
 TIMEOUT = tuning.f("EXPRESSION_TIMEOUT")
 
 EXP_DIR = Path("data/expression")

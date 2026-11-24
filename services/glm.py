@@ -63,9 +63,10 @@ def available() -> bool:
     return bool(GLM_API_KEY)
 
 
-def _model_order(prefer: str = "") -> list:
+def _model_order(prefer: str = "", extra=None) -> list:
     order = []
-    for m in ([prefer] if prefer else []) + ([_working_model] if _working_model else []) + _MODEL_CANDIDATES:
+    for m in (([prefer] if prefer else []) + list(extra or [])
+              + ([_working_model] if _working_model else []) + _MODEL_CANDIDATES):
         if m and m not in order:
             order.append(m)
     return order
@@ -78,8 +79,14 @@ async def chat(
     temperature: float = 0.6,
     max_tokens: int = 400,
     timeout: float = 0,
+    candidates: list | None = None,
+    remember: bool = True,
 ) -> str:
-    """最底层的调用。模型名按降级链逐个试，全失败返回空字符串，绝不抛。"""
+    """最底层的调用。模型名按降级链逐个试，全失败返回空字符串，绝不抛。
+
+    candidates：额外候选（视觉用，避免落到纯文本模型上）
+    remember=False：成功也不写 _working_model（视觉和文本分开记，别互相污染）
+    """
     global _working_model
     if not GLM_API_KEY:
         logger.debug("[GLM] 没有 GLM_API_KEY，跳过")
@@ -87,7 +94,7 @@ async def chat(
 
     import httpx
     last_err = ""
-    for m in _model_order(model):
+    for m in _model_order(model, candidates):
         payload = {
             "model": m,
             "messages": messages,
@@ -126,7 +133,7 @@ async def chat(
                         logger.info(f"[GLM] {m} content 为空，改用 reasoning_content")
                         text = rc
                 if text:
-                    if m != _working_model:
+                    if remember and m != _working_model:
                         logger.info(f"[GLM] ✅ 可用模型：{m}")
                         _working_model = m
                     return text
@@ -157,7 +164,9 @@ async def chat(
             logger.warning(f"[GLM] {m} 请求异常: {last_err}")
             continue
 
-    logger.error(f"[GLM] ❌ 所有候选模型都失败（试过 {_model_order(model)}），最后错误：{last_err}")
+    logger.error(
+        f"[GLM] ❌ 所有候选模型都失败"
+        f"（试过 {_model_order(model, candidates)}），最后错误：{last_err}")
     return ""
 
 
@@ -174,6 +183,37 @@ async def reply(system_prompt: str, prompt_text: str, *, max_tokens: int = 400) 
     return await chat(msgs, max_tokens=max_tokens)
 
 
+def _shrink(image_bytes: bytes) -> tuple:
+    """按 VISION_MAX_SIDE 缩图并转 JPEG（服务层自己实现，不依赖 plugins）。"""
+    if not image_bytes:
+        return image_bytes, "image/jpeg"
+    try:
+        import io
+
+        from PIL import Image
+    except Exception:
+        return image_bytes, "image/jpeg"
+    max_side = int(tuning.i("VISION_MAX_SIDE") or 1568)
+    try:
+        im = Image.open(io.BytesIO(image_bytes))
+        if getattr(im, "is_animated", False):
+            try:
+                im.seek(0)
+            except Exception:
+                pass
+        im = im.convert("RGB")
+        if max(im.size) > max_side:
+            im.thumbnail((max_side, max_side), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=90, optimize=True)
+        out = buf.getvalue()
+        if len(out) >= len(image_bytes):
+            return image_bytes, "image/jpeg"
+        return out, "image/jpeg"
+    except Exception:
+        return image_bytes, "image/jpeg"
+
+
 async def describe_image(image_bytes: bytes, prompt: str, *, max_tokens: int = 120) -> str:
     """
     让 GLM-4V 也看一眼图（参考视觉）。
@@ -183,14 +223,8 @@ async def describe_image(image_bytes: bytes, prompt: str, *, max_tokens: int = 1
         return ""
     import base64
     try:
-        # 智谱的 image_url 需要完整的 data URI，裸 base64 会报 1210「图片输入格式/解析错误」。
-        mime = "image/jpeg"
-        if image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
-            mime = "image/png"
-        elif image_bytes[:6] in (b"GIF87a", b"GIF89a"):
-            mime = "image/gif"
-        elif image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
-            mime = "image/webp"
+        # 大图先缩：7MB 原图直接 base64 → 9MB 请求体，慢且模型会自己再压（更糊）。
+        image_bytes, mime = _shrink(image_bytes)
         b64 = base64.b64encode(image_bytes).decode("utf-8")
         msgs = [{
             "role": "user",
@@ -199,8 +233,15 @@ async def describe_image(image_bytes: bytes, prompt: str, *, max_tokens: int = 1
                 {"type": "text", "text": str(prompt or "这张图里是什么？一句话说清。")},
             ],
         }]
+        # ⚠️ 2026-11-24 实测（本账号）：
+        #   · glm-5.3 / glm-4v-flash 读图直接 1210（content.type 只收 text）；
+        #   · glm-5.3-flash 能读图，但「始终思考」，900 token 要 23s，太慢；
+        #   · glm-4v-plus 4s 出正文，稳定。
+        # 所以视觉单独一条候选链，成功也不写 _working_model（那是给文本用的）。
         return await chat(msgs, model=GLM_VISION_MODEL, temperature=0.2,
-                          max_tokens=max_tokens)
+                          max_tokens=max(max_tokens, 200),
+                          candidates=["glm-4v-plus", "glm-4v-flash"],
+                          remember=False)
     except Exception as e:
         logger.warning(f"[GLM] 视觉调用异常: {type(e).__name__}: {e}")
         return ""

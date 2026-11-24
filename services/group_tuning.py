@@ -77,3 +77,4 @@ def max_hanzi(key: str, default: int) -> int:
         return int(for_key(key).get("max_hanzi", default))
     except Exception:
         return int(default)
+

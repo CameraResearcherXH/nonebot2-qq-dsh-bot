@@ -102,3 +102,4 @@ def get_recent_rows(session_key: str, limit: int = 12, days: int = 2) -> list:
 
 # （原 add_system_event 已删：空壳实现、0 引用，接线审计确认为死代码。
 #   系统事件现在走 memory_v2.remember，不需要这个占位。）
+

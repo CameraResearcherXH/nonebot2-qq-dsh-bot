@@ -219,3 +219,4 @@ async def _(event: MessageEvent, args: Message = CommandArg()):
 
 logger.info(f"🧰 [NapCat 工具] 已注册 {len(NT.TOOLS)} 个 API，"
             f"按需查说明；群聊挂载：{NT.IN_GROUP}")
+

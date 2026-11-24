@@ -229,6 +229,11 @@ DEFAULTS = {
     # ---------- 回复 / 限流 / 主动插话 ----------
     'MAX_BUBBLES': 2,
     'MAX_GROUP_RECENT': 16,
+    # 多气泡之间的「正在打字」停顿（2026-11-24 用户：回复等太久）
+    #   以前 350 + 110/字、上限 4.5s —— 一句 30 字就要等 3.6s。
+    'BUBBLE_DELAY_BASE_MS': 300,
+    'BUBBLE_DELAY_PER_CHAR': 90,
+    'BUBBLE_DELAY_MAX_MS': 1600,
 
     # ---------- 工具分发 ----------
     'MAX_REPLY_CHARS': 200,
@@ -245,7 +250,9 @@ DEFAULTS = {
     # ---------- 回复 / 限流 / 主动插话 ----------
     'MERGE_WINDOW': 0.6,
     # 群聊分段：一段话说完（安静 N 秒）再交给她，别一条一回
-    'SEGMENT_WAIT_SEC': 6.0,
+    # 2026-11-24：6 → 3.5（用户反馈等太久）。@ 她/叫名字时走 SEGMENT_WAIT_FAST。
+    'SEGMENT_WAIT_SEC': 3.5,
+    'SEGMENT_WAIT_FAST': 1.2,
     'SEGMENT_MAX_SEC': 30.0,
     'SEGMENT_MAX_MSGS': 40,
     'SEGMENT_HISTORY_KEEP': 24,
@@ -275,6 +282,9 @@ DEFAULTS = {
     'MOOD_LABEL_TTL_HOURS': 12.0,
     'MOOD_MAX_SESSIONS': 50,
     'MOOD_THINK_KEEP': 30,
+    # 心情低到这个值（-100~100 口径）以下，关注期就不再「追着接话」，
+    # 只回明确 @ 她 / 喊她名字的（用户 2026-11-24：「心情没那么高但一直在接」）。
+    'MOOD_FOLLOW_MIN': -35.0,
     # 心情回到 0 的半衰期（小时）。12h 太慢：群里一直有负向小 Δ 时，
     # 数值会钉死在 -1（用户 2026-11-22：「明明是正负 1，结果被击穿」）。
     'MOOD_HALF_LIFE_HOURS': 12.0,
@@ -394,6 +404,8 @@ DEFAULTS = {
     'REPLY_DEDUP_RATIO': 0.72,
     'REPLY_DEDUP_SEC': 60.0,
     'REPLY_INTERVAL': 10.0,
+    # 刚回过这个群 → 紧接着的非点名消息先不单独回（防「同一件事回两遍」）
+    'GROUP_REPLY_COOLDOWN': 45.0,
 
     # ---------- 记忆迁移 ----------
     'ROSTER_TTL': 600.0,
@@ -481,7 +493,9 @@ DEFAULTS = {
     'VISION_COOLDOWN': 300.0,
     'VISION_LLM_MAX_PER_HOUR': 12,
     'VISION_MAX_ATTEMPTS': 6,
-    'VISION_MAX_SIDE': 1024,
+    # 2026-11-24：1024 → 1568。截图/表格里的字 1024 长边会被压糊，
+    # 视觉模型就说「看不清」（用户实测反馈）。
+    'VISION_MAX_SIDE': 1568,
     'VISION_TIMEOUT': 40.0,
     'VISION_VERIFY_MAX_PER_HOUR': 20,
 }
@@ -575,6 +589,9 @@ DOCS = {
     'LORE_BUDGET_POST': '世界书后置注入的字数预算',
     'LORE_MAX_ENTRIES': '世界书最多命中多少条',
     'LORE_SCAN_DEPTH': '世界书扫描深度（条）',
+    'BUBBLE_DELAY_BASE_MS': '多气泡之间的基础停顿（毫秒）',
+    'BUBBLE_DELAY_PER_CHAR': '多气泡停顿按字数叠加（毫秒/字）',
+    'BUBBLE_DELAY_MAX_MS': '多气泡停顿上限（毫秒，别让人等太久）',
     'MAX_BUBBLES': '一条回复最多拆几个气泡',
     'MAX_GROUP_RECENT': '群聊上下文保留多少条消息（16 = 修过长消息被挤出窗口的问题）',
     'MAX_REPLY_CHARS': '.env 里留着 MAX_HISTORY 也不会有任何作用。',
@@ -584,7 +601,8 @@ DOCS = {
     'MEMORY_REVISIT_AGE_DAYS': '回访记忆：至少多少天前的事',
     'MEMORY_REVISIT_IDLE_DAYS': '回访记忆：至少多久没提过',
     'MERGE_WINDOW': '合并转发判定窗口（秒）',
-    'SEGMENT_WAIT_SEC': '群聊分段：安静多少秒算「这一段说完了」（默认 6）',
+    'SEGMENT_WAIT_SEC': '群聊分段：安静多少秒算「这一段说完了」（默认 3.5）',
+    'SEGMENT_WAIT_FAST': '群聊分段：@ 她 / 叫名字时只等多久（默认 1.2，别让她慢半拍）',
     'SEGMENT_MAX_SEC': '群聊分段：最长攒多久必须处理（默认 30 秒）',
     'SEGMENT_MAX_MSGS': '群聊分段：最多攒多少条（防刷屏）',
     'SEGMENT_HISTORY_KEEP': '保留多少个「处理过的段」给上下文/翻历史',
@@ -607,6 +625,7 @@ DOCS = {
     'MOOD_LABEL_TTL_HOURS': '心情词的有效期（小时），过期不再当「现在」',
     'MOOD_MAX_SESSIONS': '最多保留多少个会话的心情（防字典无限长）',
     'MOOD_THINK_KEEP': '判读心理活动保留多少条',
+    'MOOD_FOLLOW_MIN': '心情低于这个值就不再追着接话（只回明确叫她）',
     'MOOD_HALF_LIFE_HOURS': '心情回到 0 的半衰期（小时，设计默认 12）',
     'MOOD_NOISE_DELTA': 'Δ 噪音门槛：|Δ| 小于它视为 0（0.03，不动数值/好感/刻痕）',
     'MOOD_PASSIVE_MAX_DELTA': '她没说话（被动观察）时单次 Δ 上限（0.03，旁观不背锅）',
@@ -673,6 +692,7 @@ DOCS = {
     'REPLY_DEDUP_RATIO': '判定为重复的相似度阈值（0~1）',
     'REPLY_DEDUP_SEC': '重复回复去重窗口（秒）',
     'REPLY_INTERVAL': '同一会话两条回复之间最少间隔秒数（限流）',
+    'GROUP_REPLY_COOLDOWN': '群聊刚回过之后多少秒内，非点名消息不单独回（防同一件事回两遍）',
     'ROSTER_TTL': '群成员名册缓存时间（秒）',
     'RVC_INDEX_RATE_FEMALE': '女声 RVC index 权重',
     'RVC_INDEX_RATE_MALE': '男声 RVC index 权重',
@@ -732,7 +752,7 @@ DOCS = {
     'VISION_COOLDOWN': '被动识图冷却（识别成本，跟"要不要开口"是两回事）',
     'VISION_LLM_MAX_PER_HOUR': '注意这是**频率闸门**，不是「该不该说」的判断 —— 判断在模型那边。',
     'VISION_MAX_ATTEMPTS': '总尝试次数上限',
-    'VISION_MAX_SIDE': '最长边缩到多少',
+    'VISION_MAX_SIDE': '最长边缩到多少（越大越清楚、请求越大；默认 1568）',
     'VISION_TIMEOUT': '视觉模型超时（秒）',
     'VISION_VERIFY_MAX_PER_HOUR': '视觉核对每小时最多几次',
 }
@@ -826,6 +846,9 @@ FILES = {
     'LORE_BUDGET_POST': 'services/lorebook.py',
     'LORE_MAX_ENTRIES': 'services/lorebook.py',
     'LORE_SCAN_DEPTH': 'services/lorebook.py',
+    'BUBBLE_DELAY_BASE_MS': 'services/aura_logic.py',
+    'BUBBLE_DELAY_PER_CHAR': 'services/aura_logic.py',
+    'BUBBLE_DELAY_MAX_MS': 'services/aura_logic.py',
     'MAX_BUBBLES': 'services/aura_logic.py',
     'MAX_GROUP_RECENT': 'plugins/chat/__init__.py',
     'MAX_REPLY_CHARS': 'services/config.py',
@@ -836,6 +859,7 @@ FILES = {
     'MEMORY_REVISIT_IDLE_DAYS': 'services/memory_v2.py',
     'MERGE_WINDOW': 'plugins/chat/__init__.py',
     'SEGMENT_WAIT_SEC': 'services/segments.py',
+    'SEGMENT_WAIT_FAST': 'plugins/chat/__init__.py',
     'SEGMENT_MAX_SEC': 'services/segments.py',
     'SEGMENT_MAX_MSGS': 'services/segments.py',
     'SEGMENT_HISTORY_KEEP': 'services/segments.py',
@@ -858,6 +882,7 @@ FILES = {
     'MOOD_LABEL_TTL_HOURS': 'services/mood.py',
     'MOOD_MAX_SESSIONS': 'services/mood.py',
     'MOOD_THINK_KEEP': 'services/mood_judge.py',
+    'MOOD_FOLLOW_MIN': 'plugins/chat/__init__.py',
     'MOOD_HALF_LIFE_HOURS': 'services/mood.py',
     'MOOD_NOISE_DELTA': 'services/mood_judge.py',
     'MOOD_PASSIVE_MAX_DELTA': 'services/mood_judge.py',
@@ -924,6 +949,7 @@ FILES = {
     'REPLY_DEDUP_RATIO': 'plugins/chat/__init__.py',
     'REPLY_DEDUP_SEC': 'plugins/chat/__init__.py',
     'REPLY_INTERVAL': 'plugins/chat/__init__.py',
+    'GROUP_REPLY_COOLDOWN': 'plugins/chat/__init__.py',
     'ROSTER_TTL': 'services/group_roster.py',
     'RVC_INDEX_RATE_FEMALE': 'plugins/song_cover/__init__.py',
     'RVC_INDEX_RATE_MALE': 'plugins/song_cover/__init__.py',

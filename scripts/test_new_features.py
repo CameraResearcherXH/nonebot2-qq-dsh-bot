@@ -624,9 +624,9 @@ except Exception as _e:
 # ---- 角色扮演 provider（2026-11-23：DeepSeek V4.1 Flash，三方仍 chat）----
 try:
     from services import config as _cfg
-    check("角色扮演 provider 走 DeepSeek Flash",
+    check("角色扮演 provider 走 DeepSeek",
           "deepseek" in _cfg.ROLEPLAY_BASE_URL.lower()
-          and _cfg.ROLEPLAY_MODEL == "deepseek-flash",
+          and bool(_cfg.ROLEPLAY_MODEL),
           f"{_cfg.ROLEPLAY_BASE_URL} / {_cfg.ROLEPLAY_MODEL}")
     if os.getenv("XAI_BASE_URL"):
         check("三方判读仍是 DeepSeek chat",
@@ -761,7 +761,110 @@ finally:
     os.chdir(_old_cwd_h)
 
 print("-" * 60)
+# ---- 模型自由搭配（2026-11-24）----
+try:
+    from services import providers as _pv
+    # ⚠️ .env 里可能显式写了 ROLEPLAY_BASE_URL / VISION_BASE_URL，
+    #    它们优先级最高，会把 provider 默认值盖掉 → 测试前先摘掉，结束再还回去。
+    _saved_env = {}
+    for _k in ("ROLEPLAY_BASE_URL", "ROLEPLAY_API_KEY", "ROLEPLAY_MODEL",
+               "VISION_BASE_URL", "VISION_API_KEY", "VISION_MODEL",
+               "VISION_PROVIDER"):
+        if _k in os.environ:
+            _saved_env[_k] = os.environ.pop(_k)
+    _pv.reset()
+    _rp = _pv.resolve("roleplay")
+    check("providers：roleplay 默认 deepseek",
+          "deepseek" in _rp["base_url"], str(_rp))
+    check("providers：roleplay 有模型名", bool(_rp["model"]), _rp["model"])
+
+    os.environ["ROLEPLAY_PROVIDER"] = "glm"
+    os.environ["ROLEPLAY_MODEL"] = "glm-5.3-flash"
+    _pv.reset()
+    _rp2 = _pv.resolve("roleplay")
+    check("providers：主聊天可切 GLM",
+          "bigmodel" in _rp2["base_url"] and _rp2["model"] == "glm-5.3-flash",
+          str(_rp2))
+
+    os.environ["PROVIDER_MY_BASE_URL"] = "https://proxy.example/v1"
+    os.environ["PROVIDER_MY_API_KEY"] = "[REDACTED_SECRET]"
+    os.environ["PROVIDER_MY_MODEL"] = "my-model"
+    os.environ["VISION_PROVIDER"] = "my"
+    _pv.reset()
+    _v = _pv.resolve("vision")
+    check("providers：自定义中转站",
+          _v["base_url"].endswith("/v1") and _v["model"] == "my-model"
+          and _v["api_key"] == "[REDACTED_SECRET]", str(_v))
+    check("providers：chat_url 拼对",
+          _pv.chat_url("vision").endswith("/chat/completions"),
+          _pv.chat_url("vision"))
+    check("providers：status 每个角色都有",
+          all(k in _pv.status() for k in ("roleplay", "judge", "audit", "vision")))
+
+    os.environ["VISION_PROVIDER"] = "deepseek"
+    os.environ["VISION_MODEL"] = "deepseek-flash"
+    _pv.reset()
+    _dv = _pv.resolve("vision")
+    check("providers：识图可切 DeepSeek Flash",
+          "deepseek" in _dv["base_url"] and _dv["model"] == "deepseek-flash",
+          str(_dv))
+    for _k in ("ROLEPLAY_PROVIDER", "ROLEPLAY_MODEL", "PROVIDER_MY_BASE_URL",
+               "PROVIDER_MY_API_KEY", "PROVIDER_MY_MODEL", "VISION_PROVIDER",
+               "VISION_MODEL"):
+        os.environ.pop(_k, None)
+    os.environ.update(_saved_env)
+    _pv.reset()
+except Exception as _e:
+    check("providers 可导入", False, f"{type(_e).__name__}: {_e}")
+
+# ---- 省流模式 / 精确引用（2026-11-24）----
+try:
+    from services import config as _cfg2
+    check("群聊观察模式可选", _cfg2.GROUP_WATCH_MODE in ("full", "lite"),
+          _cfg2.GROUP_WATCH_MODE)
+    _chat_src = (ROOT / "plugins" / "chat" / "__init__.py").read_text(
+        encoding="utf-8", errors="ignore")
+    check("省流模式：硬信号才入队",
+          'GROUP_WATCH_MODE == "lite"' in _chat_src
+          and "硬信号命中" in _chat_src)
+    check("省流模式：不主动插话",
+          'GROUP_WATCH_MODE != "lite"' in _chat_src)
+    check("引用按消息号校验（防引错人）",
+          "_valid_mids" in _chat_src and "不在这一段里" in _chat_src)
+
+    # 省流硬信号：直接调函数，别只做静态检查
+    # ⚠️ 本地没装 nonebot 时 import 会失败 → 跳过，别算失败（容器里会跑）
+    try:
+        import plugins.chat as _C
+    except Exception as _e:
+        _C = None
+        print(f"SKIP 省流硬信号（{type(_e).__name__}: {_e}）")
+
+    if _C is not None:
+        class _FakeEv:
+            def __init__(self, tome=False):
+                self._t = tome
+
+            def is_tome(self):
+                return self._t
+
+        check("省流：@ 她是硬信号",
+              _C._lite_hard_signal(_FakeEv(True), "1", "9") is True)
+        check("省流：闲聊不是硬信号",
+              _C._lite_hard_signal(_FakeEv(False), "1", "9", text="今天好热") is False)
+        check("省流：收件人是她也算",
+              _C._lite_hard_signal(_FakeEv(False), "1", "9",
+                                   scene_meta={"to_kind": "bot"}) is True)
+
+    from services import aura_logic as _al
+    check("〔〕协议残留会被清掉",
+          _al._QUOTE_ECHO_RE.sub("", "〔引〕你好〔引用 某人 12:00 的消息〕") == "你好",
+          _al._QUOTE_ECHO_RE.sub("", "〔引〕你好〔引用 某人 12:00 的消息〕"))
+except Exception as _e:
+    check("省流/引用可导入", False, f"{type(_e).__name__}: {_e}")
+
 print("PASS %d / FAIL %d" % (len(PASS), len(FAIL)))
 if FAIL:
     print("失败：" + "、".join(FAIL))
 sys.exit(1 if FAIL else 0)
+

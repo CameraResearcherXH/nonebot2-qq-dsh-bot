@@ -1008,6 +1008,106 @@ def check_g34():
     return (not bad), "；".join(bad), "NODE_COMPUTE / CODE_AGENT / harness 桥 / self_tool 互斥"
 
 
+def check_g35():
+    """模型自由搭配（2026-11-24）。
+
+    用户：「有的用户直接用 deepseek v4 flash 做视觉，有些想换 glm 做主对话模型。
+           env 可以配各种 key 接口，自由搭配识图和对话的模型，两个 chat 检测也能选。」
+    """
+    bad = []
+    try:
+        pv = read("services/providers.py")
+    except Exception as e:
+        return False, f"读 services/providers.py 失败: {e}"
+    for k in ("ROLES", "BUILTIN", "def resolve", "def chat_url",
+              "ROLEPLAY", "JUDGE", "AUDIT", "VISION"):
+        if k not in pv:
+            bad.append(f"providers 缺 {k}")
+    if "PROVIDER_" not in pv or "_BASE_URL" not in pv:
+        bad.append("providers 不支持自定义中转站")
+
+    cfg = read("services/config.py")
+    if "_resolve_provider(\"roleplay\")" not in cfg:
+        bad.append("config 的 ROLEPLAY_* 没走 providers")
+
+    for f, role in (("services/mood_judge.py", "judge"),
+                    ("services/scene_auditor.py", "audit"),
+                    ("services/conv_state.py", "conv_state"),
+                    ("services/expression.py", "expression"),
+                    ("services/profile_miner.py", "profile")):
+        src = read(f)
+        if f'_resolve_provider("{role}")' not in src:
+            bad.append(f"{f} 没走 providers({role})")
+
+    vis = read("plugins/vision_agent/__init__.py")
+    for k in ("_vision_targets", 'providers.resolve("vision")', "_VISION_FALLBACKS"):
+        if k not in vis:
+            bad.append(f"vision_agent 缺 {k}")
+
+    env = read(".env")
+    if env and "模型自由搭配" not in env:
+        bad.append(".env 没有模型搭配说明")
+    return (not bad), "；".join(bad), "每个角色可选 provider/模型，识图与两个 chat 检测都能换"
+
+
+def check_g36():
+    """群聊全局 / 省流模式（2026-11-24）。
+
+    用户：「让用户选择关注群消息，或者接话/回复时拉附近 8 条上下文……
+           判定是否接话用硬逻辑（收发件人 + 艾特）……不影响群白月光，私聊不变。」
+    """
+    bad = []
+    cfg = read("services/config.py")
+    if "GROUP_WATCH_MODE" not in cfg:
+        bad.append("config 缺 GROUP_WATCH_MODE")
+    chat = read("plugins/chat/__init__.py")
+    if 'GROUP_WATCH_MODE == "lite"' not in chat:
+        bad.append("chat 没有省流分支")
+    if "硬信号命中" not in chat:
+        bad.append("省流分支没有硬信号判定")
+    if 'GROUP_WATCH_MODE != "lite"' not in chat:
+        bad.append("省流模式没关掉主动插话/表达学习")
+    # 省流分支必须在「白月光统计」之后、且在「安静开关」之后
+    i_moon = chat.find("_wm.note_incoming(")
+    i_lite = chat.find('GROUP_WATCH_MODE == "lite"')
+    i_switch = chat.find("chat_switch.is_off(")
+    if i_moon < 0 or i_lite < 0 or i_switch < 0:
+        bad.append("找不到白月光/省流/安静开关的位置")
+    else:
+        if not (i_moon < i_lite):
+            bad.append("省流分支跑在白月光统计之前（白月光会失效）")
+        if not (i_switch < i_lite):
+            bad.append("省流分支跑在安静开关之前（会绕过 /安静）")
+    env = read(".env")
+    if env and "GROUP_WATCH_MODE=" not in env:
+        bad.append(".env 缺 GROUP_WATCH_MODE")
+    return (not bad), "；".join(bad), "full=全部消息都判定｜lite=只回 @/引用/喊名字/收件人是她"
+
+
+def check_g37():
+    """引用精确到消息号 + 同一件事不回两遍（2026-11-24）。
+
+    用户：「回复两次」「引用回复的时候回错人，回成上面那条或者下面那条」。
+    """
+    bad = []
+    chat = read("plugins/chat/__init__.py")
+    for k in ("_valid_mids", "不在这一段里", "是行号 →"):
+        if k not in chat:
+            bad.append(f"chat 缺引用校验 {k}")
+    if "GROUP_REPLY_COOLDOWN" not in chat:
+        bad.append("chat 没有群聊回复冷却")
+    seg = read("services/segments.py")
+    if "不是方括号里的编号" not in seg:
+        bad.append("segments 没提示「用 #mid 不是行号」")
+    al = read("services/aura_logic.py")
+    if "〔[^〕]{0,300}〕" not in al:
+        bad.append("aura_logic 没清 〔…〕 协议残留")
+    if "<reply:\\s*#?(\\d+)" not in al:
+        bad.append("aura_logic 不认 <reply:#id>")
+    return (not bad), "；".join(bad), "引用按真实 mid（行号自动映射/非法丢弃）+ 群聊冷却防回两遍"
+
+
+
 CHECKS = [
     ("C1", "破冰可独立执行", "behavior", check_c1),
     ("A1", "插话设置 tool context", "behavior", check_a1),
@@ -1049,6 +1149,9 @@ CHECKS = [
     ("G32", "人格 ID 与登录 QQ 解耦（换号不丢记忆）", "record", check_g32),
     ("G33", "戳一戳次数屏蔽（2h / 3 次）", "record", check_g33),
     ("G34", "算力机开关 / Harness 桥 / self_tool 互斥", "record", check_g34),
+    ("G35", "模型自由搭配（识图/对话/两个检测都能换）", "record", check_g35),
+    ("G36", "群聊全局 / 省流模式", "record", check_g36),
+    ("G37", "引用精确到消息号 / 同一件事不回两遍", "record", check_g37),
     ("F1", "BM25 降为加分", "recall", check_f1),
     ("F2", "recall 传 gid", "recall", check_f2),
     ("F2b", "remember 带群号", "recall", check_f2b),

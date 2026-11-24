@@ -164,3 +164,4 @@ async def send_sticker_test(bot: Bot, event: MessageEvent, tag: str = "") -> dic
     if not info["ok"]:
         info["error"] = "发送接口报错（见 docker logs 的 [STICKER] 行）"
     return info
+

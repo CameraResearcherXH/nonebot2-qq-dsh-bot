@@ -24,7 +24,7 @@
 
 | 分组 | 项数 |
 |---|---|
-| 回复 / 限流 / 主动插话 | 42 |
+| 回复 / 限流 / 主动插话 | 44 |
 | 心情 | 34 |
 | 档案 / 好感 | 12 |
 | 记忆 | 16 |
@@ -41,8 +41,8 @@
 | 语音 / 音乐 | 27 |
 | 世界书 | 4 |
 | 安全 / 工具 | 10 |
-| 其他 | 5 |
-| **合计** | **239** |
+| 其他 | 15 |
+| **合计** | **251** |
 
 ## 回复 / 限流 / 主动插话
 
@@ -71,6 +71,7 @@
 | `MAX_GROUP_RECENT` | `16` | 群聊上下文保留多少条消息（16 = 修过长消息被挤出窗口的问题） | `plugins/chat/__init__.py` |
 | `MEMORY_EMOTION_MIN_DELTA` | `0.1` | 记忆刻痕门槛：|Δ| 达到多少才算（0.10 = 设计里的 💥 档） | `plugins/chat/__init__.py` |
 | `MERGE_WINDOW` | `0.6` | 合并转发判定窗口（秒） | `plugins/chat/__init__.py` |
+| `MOOD_FOLLOW_MIN` | `-35` | 心情低于这个值就不再追着接话（只回明确叫她） | `plugins/chat/__init__.py` |
 | `MOOD_WATCH_SEC` | `60` | 被动心情观察的最小间隔（秒） | `plugins/chat/__init__.py` |
 | `PEER_REPLY_COOLDOWN` | `180` | 对鱼接话的冷却（秒） | `plugins/chat/__init__.py` |
 | `PEER_REPLY_PROB` | `0.15` | 对鱼的消息接话概率（0~1） | `plugins/chat/__init__.py` |
@@ -83,6 +84,7 @@
 | `REPLY_DEDUP_RATIO` | `0.72` | 判定为重复的相似度阈值（0~1） | `plugins/chat/__init__.py` |
 | `REPLY_DEDUP_SEC` | `60` | 重复回复去重窗口（秒） | `plugins/chat/__init__.py` |
 | `REPLY_INTERVAL` | `10` | 同一会话两条回复之间最少间隔秒数（限流） | `plugins/chat/__init__.py` |
+| `SEGMENT_WAIT_FAST` | `1.2` | 群聊分段：@ 她 / 叫名字时只等多久（默认 1.2，别让她慢半拍） | `plugins/chat/__init__.py` |
 | `SHORT_QUERY_WINDOW_SEC` | `120` | 短查询上下文窗口（秒） | `plugins/chat/__init__.py` |
 | `SLEEP_HOUR_END` | `8` | 群聊免打扰结束小时（0-23） | `plugins/chat/__init__.py` |
 | `SLEEP_HOUR_START` | `0` | 群聊免打扰开始小时（0-23） | `plugins/chat/__init__.py` |
@@ -296,7 +298,7 @@
 | `VISION_COOLDOWN` | `300` | 被动识图冷却（识别成本，跟"要不要开口"是两回事） | `plugins/vision_agent/__init__.py` |
 | `VISION_LLM_MAX_PER_HOUR` | `12` | 注意这是**频率闸门**，不是「该不该说」的判断 —— 判断在模型那边。 | `plugins/vision_agent/__init__.py` |
 | `VISION_MAX_ATTEMPTS` | `6` | 总尝试次数上限 | `plugins/vision_agent/__init__.py` |
-| `VISION_MAX_SIDE` | `1024` | 最长边缩到多少 | `plugins/vision_agent/__init__.py` |
+| `VISION_MAX_SIDE` | `1568` | 最长边缩到多少（越大越清楚、请求越大；默认 1568） | `plugins/vision_agent/__init__.py` |
 | `VISION_TIMEOUT` | `40` | 视觉模型超时（秒） | `plugins/vision_agent/__init__.py` |
 | `VISION_VERIFY_MAX_PER_HOUR` | `20` | 视觉核对每小时最多几次 | `services/vision_verify.py` |
 
@@ -367,9 +369,19 @@
 
 | 参数 | 默认 | 说明 | 生效位置 |
 |---|---|---|---|
+| `BUBBLE_DELAY_BASE_MS` | `300` | 多气泡之间的基础停顿（毫秒） | `services/aura_logic.py` |
+| `BUBBLE_DELAY_MAX_MS` | `1600` | 多气泡停顿上限（毫秒，别让人等太久） | `services/aura_logic.py` |
+| `BUBBLE_DELAY_PER_CHAR` | `90` | 多气泡停顿按字数叠加（毫秒/字） | `services/aura_logic.py` |
+| `HARNESS_MAX_OUTPUT` | `3000` | Harness 桥回给 QQ 的最大字数 | `services/harness.py` |
+| `HARNESS_TIMEOUT` | `300` | Harness 桥单次调用最长秒数 | `services/harness.py` |
 | `MAX_BUBBLES` | `2` | 一条回复最多拆几个气泡 | `services/aura_logic.py` |
+| `POKE_MAX_PER_WINDOW` | `3` | 戳一戳屏蔽：窗口内最多回几次（超过就不回） | `services/poke_guard.py` |
+| `POKE_WINDOW_HOURS` | `2` | 戳一戳屏蔽的统计窗口（小时） | `services/poke_guard.py` |
 | `SEGMENT_HISTORY_KEEP` | `24` | 保留多少个「处理过的段」给上下文/翻历史 | `services/segments.py` |
 | `SEGMENT_MAX_MSGS` | `40` | 群聊分段：最多攒多少条（防刷屏） | `services/segments.py` |
 | `SEGMENT_MAX_SEC` | `30` | 群聊分段：最长攒多久必须处理（默认 30 秒） | `services/segments.py` |
-| `SEGMENT_WAIT_SEC` | `6` | 群聊分段：安静多少秒算「这一段说完了」（默认 6） | `services/segments.py` |
+| `SEGMENT_WAIT_SEC` | `3.5` | 群聊分段：安静多少秒算「这一段说完了」（默认 3.5） | `services/segments.py` |
+| `WHITE_MOON_MIN_SCORE` | `3` | 白月光：至少多少分才算「最吃这个人的说话方式」 | `services/white_moon.py` |
+| `WHITE_MOON_STYLE_ITEMS` | `3` | 白月光：注入几条学到的说法 | `services/white_moon.py` |
+| `WHITE_MOON_STYLE_TTL` | `21600` | 白月光：说话方式多久重学一次（秒） | `services/white_moon.py` |
 
