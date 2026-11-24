@@ -210,11 +210,16 @@ async def _fetch_image_bytes(bot: Bot, event: MessageEvent, seg) -> bytes | None
             res = await bot.call_api("get_image", file=file_id) or {}
             real_url = str(res.get("url") or "")
             local_path = str(res.get("file") or "")
-            if local_path and os.path.exists(local_path):
-                try:
-                    cands.append(("napcat本地", Path(local_path).read_bytes()))
-                except Exception as e:
-                    logger.debug(f"[VISION] 读 NapCat 本地文件失败: {e}")
+            # ⚠️ NapCat 在**另一个容器**里，它返回的 /app/napcat/cache/xxx 在 bot 容器里
+            #    默认不存在。docker-compose 里把 ./napcat/cache 同时挂给两个容器之后，
+            #    这里就能读到原图（比 CDN 的预览图清楚）。
+            for _p in (local_path, f"/app/napcat/cache/{Path(local_path).name}" if local_path else ""):
+                if _p and os.path.exists(_p):
+                    try:
+                        cands.append(("napcat本地", Path(_p).read_bytes()))
+                        break
+                    except Exception as e:
+                        logger.debug(f"[VISION] 读 NapCat 本地文件失败: {e}")
         except Exception as e:
             logger.warning(f"⚠️ [VISION] get_image 失败: {type(e).__name__}: {e}")
 

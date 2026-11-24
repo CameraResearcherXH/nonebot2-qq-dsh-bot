@@ -170,6 +170,12 @@ def _looks_like_chat(data: dict) -> bool:
     if "/app/documents/" in txt and not any(
             k in txt for k in ("dialogue", "chat", "聊天", "群聊", "私聊")):
         return False
+    # 2026-11-24 实测踩坑：RAG 对「白饭」会答「白饭是指煮熟的白色稻米」——
+    # 这是**通用问答**，不是她的记忆。当成记忆塞进 prompt 等于教她编。
+    # 只有答案长得像「聊天摘录」（带冒号/说/时间/人名）才收。
+    ans = str((data or {}).get("answer") or "")
+    if ans and not any(k in ans for k in ("：", ":", "说", "聊", "问", "回")):
+        return False
     return True
 
 

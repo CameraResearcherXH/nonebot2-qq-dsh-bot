@@ -40,6 +40,8 @@ services:
       - ./.env:/app/.env
       - ./data:/app/data
       - ./napcat/qq:/app/.config/QQ
+      # 👇 只读挂 NapCat 的图片缓存：识图优先读原图（见 vision_agent._fetch_image_bytes）
+      - ./napcat/cache:/app/napcat/cache:ro
       - ./scripts:/app/scripts        # 👈 排查脚本，改完不用再 docker cp
       # ⚠️ 2026-11-22：容器内自检要读文档 / 编排文件：
       #   · audit_third_party 会写 docs/third-party-audit.md
@@ -104,6 +106,10 @@ services:
     volumes:
       - ./napcat/config:/app/napcat/config
       - ./napcat/qq:/app/.config/QQ
+      # 👇 2026-11-24：把图片缓存也挂到宿主机，bot 容器只读挂同一份，
+      #    这样识图能直接读 NapCat 缓存的**原图**（CDN 的 url 常是预览图，糊）。
+      #    ⚠️ 改了这里要 `up -d --force-recreate napcat`，会重新登录（需扫码）。
+      - ./napcat/cache:/app/napcat/cache
       - ./plugins:/app/plugins
       - ./.env:/app/.env
       - ./data:/app/data             # 让 NapCat 能读语音文件

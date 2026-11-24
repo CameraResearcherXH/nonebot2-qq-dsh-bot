@@ -915,6 +915,8 @@ if _ac is not None:
           is False)
     check("图书馆：聊天语料放行",
           _ac._looks_like_chat({"answer": "阿明: 上次那个蛋糕是街角那家"}) is True)
+    check("图书馆：通用问答不当记忆",
+          _ac._looks_like_chat({"answer": "白饭是指煮熟的白色稻米。"}) is False)
     check("图书馆：有 smart-query 兜底路由",
           _ac.SMART_QUERY_ENDPOINT.endswith("/api/agent/smart-query"))
     check("图书馆：统计可读", "图书馆" in _ac.stats_text(), _ac.stats_text())

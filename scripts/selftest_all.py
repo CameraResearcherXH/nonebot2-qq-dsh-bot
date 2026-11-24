@@ -983,11 +983,13 @@ async def t_agent():
     async def _fake2(url, payload, timeout):
         if url.endswith(AC.RECALL_ENDPOINT):
             return None
-        return {"success": True, "answer": "来自 query"}
+        # 必须是「像聊天摘录」的答案，否则会被 _looks_like_chat 判成通用问答
+        return {"success": True, "answer": "阿明: 上次那个蛋糕是街角那家"}
     AC._post_json = _fake2
     r = await AC.recall("测试")
-    check(S, r["source"] in ("smart", "query") and r["facts"] == ["来自 query"],
-          f"结构化端点不可用 → 退回 smart-query/query（{r['source']}）")
+    check(S, r["source"] in ("smart", "query")
+          and r["facts"] == ["阿明: 上次那个蛋糕是街角那家"],
+          f"结构化端点不可用 → 退回 smart-query（{r['source']}）")
     # 宋词语料 → 判成「不是聊天」，直接停用 6 小时
     async def _fake3(url, payload, timeout):
         return {"answer": "参考来源: /app/documents/poet.song.rank.1.json"}
