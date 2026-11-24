@@ -358,7 +358,14 @@ async def _run_draw(bot: Bot, event: MessageEvent, mode: str, desc: str,
         _ACTIVE_USERS.add(event.user_id)
         try:
             from plugins.tool_dispatcher import STATUS as S
-            S["tasks"][task_id] = dict(payload, type="draw", status="pending", output="")
+            # deliver：重启后靠它把成品补发回原会话（2026-11-24）
+            S["tasks"][task_id] = dict(
+                payload, type="draw", status="pending", output="",
+                deliver={
+                    "gid": str(getattr(event, "group_id", "") or ""),
+                    "uid": str(getattr(event, "user_id", "") or ""),
+                    "label": str(desc or "")[:60],
+                })
         except Exception as e:
             logger.error(f"[DRAW] 建任务失败: {e}")
             await bot.send(event, "❌ 任务下发失败，请稍后再试。")

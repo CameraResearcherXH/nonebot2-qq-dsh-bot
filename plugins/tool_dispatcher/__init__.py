@@ -39,6 +39,56 @@ STATUS = {"last_heartbeat": 0.0, "tasks": {}, "caps": set()}
 WAITING_FOR_UPLOAD = set()
 USER_STATE = {}
 
+# ================= 任务落盘（2026-11-24）=================
+# 用户：「有几次的画图和翻唱都没出结果」。
+# 根因：STATUS 只在内存里，机器人一重启：
+#   ① 算力机算完回传 `/api/tasks/complete` → `task not found` → **成品直接丢**；
+#   ② 等待协程被取消，就算文件还在也没人发到群里。
+# 现在：任务表落盘 `data/node_tasks.json`，启动时恢复；
+#   带 `deliver` 信息的任务（画图/翻唱）重启后会继续等，完成后补发到原会话。
+TASKS_FILE = Path("data/node_tasks.json")
+TASK_TTL = 6 * 3600
+
+
+def save_tasks() -> None:
+    try:
+        data = {}
+        now = time.time()
+        for k, v in STATUS["tasks"].items():
+            if not isinstance(v, dict):
+                continue
+            v.setdefault("created", now)
+            data[k] = v
+        TASKS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = TASKS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, default=str),
+                       encoding="utf-8")
+        tmp.replace(TASKS_FILE)
+    except Exception as e:
+        logger.debug(f"[算力机] 任务落盘失败: {type(e).__name__}: {e}")
+
+
+def load_tasks() -> None:
+    if not TASKS_FILE.exists():
+        return
+    try:
+        data = json.loads(TASKS_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"[算力机] 任务文件读不了（忽略）: {type(e).__name__}: {e}")
+        return
+    now = time.time()
+    n = 0
+    for k, v in (data or {}).items():
+        if not isinstance(v, dict):
+            continue
+        ct = float(v.get("complete_time") or v.get("created") or 0)
+        if ct and now - ct > TASK_TTL:
+            continue
+        STATUS["tasks"][k] = v
+        n += 1
+    if n:
+        logger.info(f"[算力机] 从磁盘恢复 {n} 个任务（重启前在跑的）")
+
 # 任务被删掉之后，文件仍然要能被重试下载 → 单独记一份 task_id → input 路径
 FILE_REGISTRY: dict[str, str] = {}
 FILE_REGISTRY_MAX = 64
@@ -82,6 +132,7 @@ async def pull_task(secret: str = ""):
             task["status"] = "processing"
             # 拉走时就把输入文件登记好：即使任务对象后面被删，node.py 也能重试下载
             _registry_put(task_id, task.get("input", ""))
+            save_tasks()
             return {"has_task": True, "task_id": task_id, "task": task}
         elif task.get("status") == "completed" and time.time() - task.get("complete_time", 0) > 120:
             STATUS["tasks"].pop(task_id, None)
@@ -225,10 +276,104 @@ async def complete_task(
 
     task["status"] = "completed"
     task["complete_time"] = time.time()
+    save_tasks()
     return {"status": "success"}
 
 driver = get_driver()
 driver.server_app.include_router(router)
+
+# 启动时恢复任务表（否则重启后算力机回传会 `task not found`，成品直接丢）
+load_tasks()
+
+
+async def _send_to(bot, gid: str, uid: str, msg) -> bool:
+    try:
+        if gid:
+            await bot.send_group_msg(group_id=int(gid), message=msg)
+        elif uid:
+            await bot.send_private_msg(user_id=int(uid), message=msg)
+        else:
+            return False
+        return True
+    except Exception as e:
+        logger.warning(f"[算力机] 重启后补发失败: {type(e).__name__}: {str(e)[:120]}")
+        return False
+
+
+async def _watch_and_deliver(bot, task_id: str, deliver: dict, typ: str) -> None:
+    """重启前没发出去的任务：等算力机算完，补发到原会话。"""
+    gid = str((deliver or {}).get("gid") or "")
+    uid = str((deliver or {}).get("uid") or "")
+    label = str(deliver.get("label") or "")[:40]
+    deadline = time.time() + 900
+    while time.time() < deadline:
+        t = STATUS["tasks"].get(task_id) or {}
+        st = t.get("status")
+        if st == "completed":
+            out = t.get("output")
+            sent = False
+            if typ == "draw" and isinstance(out, str) and os.path.exists(out):
+                sent = await _send_to(
+                    bot, gid, uid,
+                    MessageSegment.image(file=f"file://{os.path.abspath(out)}"))
+            elif typ == "cover":
+                path = out if isinstance(out, str) else ""
+                if path and os.path.exists(path):
+                    sent = await _send_to(
+                        bot, gid, uid,
+                        MessageSegment.record(file=f"file://{os.path.abspath(path)}"))
+            if sent:
+                logger.info(f"[算力机] 重启后补发完成 {task_id}（{typ} {label}）")
+            STATUS["tasks"].pop(task_id, None)
+            save_tasks()
+            return
+        if st in ("failed", "timeout"):
+            await _send_to(bot, gid, uid,
+                           f"刚才那个{'画图' if typ == 'draw' else '翻唱'}没成，要不要再来一次？")
+            STATUS["tasks"].pop(task_id, None)
+            save_tasks()
+            return
+        await asyncio.sleep(3)
+    await _send_to(bot, gid, uid,
+                   f"刚才那个{'画图' if typ == 'draw' else '翻唱'}"
+                   f"{('《' + label + '》') if label else ''}被重启打断了，"
+                   f"没等到成品，你再发一次我就重来。")
+    STATUS["tasks"].pop(task_id, None)
+    save_tasks()
+
+
+async def _periodic_save_tasks():
+    while True:
+        await asyncio.sleep(5)
+        save_tasks()
+
+
+_RESUME_STARTED = False
+
+
+@driver.on_bot_connect
+async def _on_bot_connect_resume(bot):
+    """OneBot 连上后：恢复磁盘里的任务，带 deliver 的继续等结果并补发。
+
+    用 on_bot_connect 而不是 on_startup：插件是在启动过程中才 import 的，
+    on_startup 这时已经过了，注册了也不会跑（2026-11-24 实测没生成任务文件）。
+    """
+    global _RESUME_STARTED
+    if _RESUME_STARTED:
+        return
+    _RESUME_STARTED = True
+    asyncio.create_task(_periodic_save_tasks())
+    n = 0
+    for tid, t in list(STATUS["tasks"].items()):
+        d = t.get("deliver") or {}
+        if not d or t.get("status") in ("failed", "timeout"):
+            continue
+        asyncio.create_task(_watch_and_deliver(bot, tid, d, str(t.get("type") or "")))
+        n += 1
+    if n:
+        logger.info(f"[算力机] 启动恢复：{n} 个画图/翻唱任务继续等结果，完成会补发")
+    else:
+        save_tasks()
 
 async def queue_task_for_download(bot: Bot, event: MessageEvent, state_info: dict, choice: str):
     task_id = state_info["task_id"]

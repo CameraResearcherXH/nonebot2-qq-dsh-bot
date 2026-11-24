@@ -451,7 +451,8 @@ async def _(bot: Bot, event: MessageEvent):
 
 # ================= 核心流程（不依赖 bot，QQ 和外部 API 共用） =================
 async def run_cover(song_name: str, with_inst: bool = True, notify=None,
-                    gender_override: str = "", pitch_override=None) -> dict:
+                    gender_override: str = "", pitch_override=None,
+                    deliver: dict | None = None) -> dict:
     """
     跑一遍翻唱，返回成品路径。**完全不碰 QQ**，所以外部 API 能直接调。
 
@@ -688,6 +689,8 @@ async def run_cover(song_name: str, with_inst: bool = True, notify=None,
                     # 👇 低音区抬升（/翻唱 晴天 低音+2 才带，默认空 = 不抬）
                     #    算力机把它当 env 覆盖传给 RVC 子进程，pipeline.py 从 env 读。
                     "rvc_env": _low_lift_env,
+                    # 重启后靠它把成品补发回原会话（2026-11-24）
+                    "deliver": dict(deliver or {}, label=str(song_title or song_name)[:60]),
                 }
                 logger.info(
                     f"[SONG] 下发单段式任务 {task_id}"
@@ -924,8 +927,11 @@ async def process_cover_task(bot: Bot, event: MessageEvent, song_name: str,
         await notify(_off_hint())
         return
 
-    res = await run_cover(song_name, with_inst=with_inst, notify=notify,
-                          gender_override=gender_override or "")
+    res = await run_cover(
+        song_name, with_inst=with_inst, notify=notify,
+        gender_override=gender_override or "",
+        deliver={"gid": str(getattr(event, "group_id", "") or ""),
+                 "uid": str(getattr(event, "user_id", "") or "")})
     if not res["ok"]:
         return
 

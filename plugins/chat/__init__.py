@@ -8142,9 +8142,15 @@ async def _tool_sing(args: dict) -> str:
         # 👇 create_task 里抛的异常默认会被静默吞掉 —— 之前 process_cover_task
         #    签名不匹配（多传了 gender），每次她主动唱歌都 TypeError 却一点日志都没有，
         #    表现就是「她答应了但什么都没发生，只能手动 /翻唱」。
+        # ⚠️ 2026-11-24：机器人重启会把在跑的翻唱协程 cancel，
+        #    `t.exception()` 抛的是 BaseException(CancelledError)，不是 Exception，
+        #    以前会打一屏 "Exception in callback"。取消是正常现象，直接跳过。
+        if t.cancelled():
+            logger.info(f"[TOOL] 唱歌任务被取消（重启/关闭）：《{song}》")
+            return
         try:
             _exc = t.exception()
-        except Exception:
+        except BaseException:
             _exc = None
         if _exc:
             logger.warning(f"[TOOL] 唱歌任务失败《{song}》: "
