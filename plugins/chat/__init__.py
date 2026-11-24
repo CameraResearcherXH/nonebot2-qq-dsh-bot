@@ -4620,6 +4620,36 @@ async def _session_worker(bot: Bot, session_key: str):
         except Exception:
             _moon_target_qq = ""
 
+        # 👇 多人同时 @ 时，把「谁要什么」逐条钉给模型。
+        #    2026-11-24 真机：ヽ 要名片点赞、格林要画图，她画也画了、赞也点了，
+        #    但正文回到格林头上说「赞出去了」——动作对了，人和请求串了。
+        _multi_at_text = ""
+        try:
+            if _seg_records:
+                _multi = []
+                _seen_mid = set()
+                for _r in _seg_records:
+                    _rmid = str(_r.get("mid") or "")
+                    if _rmid and _rmid in _seen_mid:
+                        continue
+                    if (segments.is_addressed(_r)
+                            or _calls_me_by_name(
+                                str(_r.get("text") or ""), session_key,
+                                str(_r.get("uid") or ""))):
+                        _seen_mid.add(_rmid)
+                        _multi.append(
+                            f"· {_r.get('name') or _r.get('uid')} #{_rmid}："
+                            f"{str(_r.get('text') or '')[:80]}")
+                if len(_multi) >= 2:
+                    _multi_at_text = (
+                        "【这一段有多个人 @ 你，分别对应】\n"
+                        + "\n".join(_multi[:5])
+                        + "\n回复时每个请求对应到人：点赞别回到画图的人头上；"
+                          "每条用 <reply:消息号> 引对应那条，或至少写清「谁：什么」。"
+                    )
+        except Exception:
+            _multi_at_text = ""
+
         # 2026-11-20 记录模型 v2：每个 turn 先落一条 pending（记忆全记）。
         # 判读回来再由 mood_judge.patch_turn 补 delta/salience/valence/mood_word。
         _turn_id = "%s:%s" % (session_key, getattr(ev, "message_id", "") or int(time.time() * 1000))
@@ -4817,6 +4847,8 @@ async def _session_worker(bot: Bot, session_key: str):
                 llm_mod.set_tool_context(bot=bot, event=ev, speaker_qq=speaker_qq,
                                          addressed=_addressed,
                                          newer_count=_newer,
+                                         # 多人同时 @ 时把「谁要什么」逐条带上
+                                         multi_at=_multi_at_text,
                                          # NapCat 工具通知主人时要写清「谁」在要求做事
                                          speaker_name=str(speaker_name or ""))
             except Exception:
@@ -5373,6 +5405,7 @@ async def _session_worker(bot: Bot, session_key: str):
             _auto_rid = ""
             _quote_left = False
             _auto_call = ""
+            _auto_is_media = False
             try:
                 # 用户 2026-11-19：「她对某句话或者某图评论/吐槽的时候能引用回复」。
                 # 被 @ 时系统兜底引用（老行为）；**图片/视频**也兜底引用 ——
@@ -5391,6 +5424,10 @@ async def _session_worker(bot: Bot, session_key: str):
                     _auto_call = ""
                     if _pic_msg and _seg_records:
                         _auto_rid = str(_seg_records[-1].get("mid") or _auto_rid)
+                        # 2026-11-24 用户：「引用了下面一个群友的表情包说开会累啊」——
+                        # 这一轮其实在回更早的「在开会」，系统却把最后那张图自动引上了。
+                        # 标一下「这条引用是图」，等下只有正文真在说图时才用。
+                        _auto_is_media = True
                 _quote_left = bool(_auto_rid)
             except Exception:
                 _auto_rid, _quote_left = "", False
@@ -5457,9 +5494,19 @@ async def _session_worker(bot: Bot, session_key: str):
                     # 自动引用**不阻止**长文走合并转发（显式引用才阻止）。
                     _auto_used = False
                     if not _rid and _quote_left and _is_group:
-                        _rid = _auto_rid
-                        _quote_left = False
-                        _auto_used = True
+                        # 自动引用是图/视频时：只有这个气泡真在说图，才引那张图。
+                        # 否则宁可先不引（留给后面的气泡，或干脆不引），别把
+                        # 「开会那位更惨」挂到一张蓝猫图上（用户 2026-11-24 第二次踩）。
+                        _use_auto = True
+                        if _auto_is_media and not any(
+                                k in val for k in ("图", "猫", "这张", "这幅", "这画",
+                                                   "表情", "照片", "画面", "视频",
+                                                   "截图", "截屏", "头像")):
+                            _use_auto = False
+                        if _use_auto:
+                            _rid = _auto_rid
+                            _quote_left = False
+                            _auto_used = True
                     # 👇 先把 @ 标签摘出来：字数硬截断会把 "<at:小明>" 切一半变成乱码
                     at_names, body = _split_at_tags(val)
                     val = body
@@ -7061,9 +7108,31 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
 
     if what.startswith(("记忆", "图书馆", "memory", "library")):
         # /测函数 记忆 —— 召回/图书馆到底有没有在跑（用户 2026-11-24）
+        # /测函数 图书馆 <问题> —— 直接拿这句话问一次 RAG，看命中什么
         from services import prompt_builder as _pb2
         from services import agent_client as _ac
         from services import memory_v2 as _mv2
+        _q2 = re.sub(r"^\s*(记忆|图书馆|memory|library)\s*", "",
+                     _raw_args, flags=re.I).strip()
+        if _q2:
+            _ac._LIBRARY_DEAD_UNTIL = 0.0
+            _ac._LIBRARY_WARNED = False
+            _t02 = time.monotonic()
+            try:
+                _r2 = await _ac.recall(_q2)
+            except Exception as _e2:
+                await _test_fn.finish(
+                    f"图书馆查询失败：{type(_e2).__name__}: {_e2}")
+                return
+            _cost2 = time.monotonic() - _t02
+            _facts2 = (_r2 or {}).get("facts") or []
+            _l2 = [f"▍图书馆实测｜{_cost2:.1f}s",
+                   f"· 查询：{_q2[:80]}",
+                   f"· 来源：{(_r2 or {}).get('source')}｜命中 {len(_facts2)} 条"]
+            _l2 += [f"{i}. {str(x)[:200]}" for i, x in enumerate(_facts2[:5], 1)]
+            _l2.append(_ac.stats_text())
+            await _test_fn.finish("\n".join(_l2)[:1800])
+            return
         _out2 = ["▍记忆 / 图书馆调用"]
         try:
             _s2 = _mv2.stats()
@@ -7080,9 +7149,7 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
             _out2.append(_ac.stats_text())
         except Exception:
             pass
-        _out2.append(
-            "（图书馆要真有用，得先把 data/dialogue 归档导进算力机 RAG："
-            "/api/upload + /api/build；现在那套库里的语料不是聊天记录）")
+        _out2.append("· 想实测：/测函数 图书馆 小明是如何解决温室效应的")
         await _test_fn.finish("\n".join(_out2))
 
     if what.startswith(("模型", "provider", "model")):
@@ -8143,6 +8210,9 @@ register_tool(
         },
     },
     _tool_sing,
+    # 2026-11-24 用户：群里让她唱歌，她找不到这个工具（只在私聊挂）。
+    # 群里本来就会有人点歌，翻唱必须群聊也能用。
+    scope=("private", "group"),
 )
 
 register_tool(
@@ -8162,6 +8232,8 @@ register_tool(
         },
     },
     _tool_remember,
+    # 群聊也要能记（群里答应的事、群友的重要信息）
+    scope=("private", "group"),
 )
 
 register_tool(
@@ -8180,6 +8252,8 @@ register_tool(
         },
     },
     _tool_recall,
+    # 群聊也要能查记忆（「你还记得上次说的那件事吗」大多发生在群里）
+    scope=("private", "group"),
 )
 
 

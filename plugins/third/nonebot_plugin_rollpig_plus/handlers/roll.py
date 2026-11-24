@@ -1,332 +1,180 @@
-import random
+from __future__ import annotations
 
 from nonebot import on_command
 from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent, Message, MessageSegment
 from nonebot.log import logger
-from nonebot.matcher import Matcher
 from nonebot.params import CommandArg
 
-from ..roll_flow import (
-    RECORDED_PIG_RESOURCE_MISSING_TEXT,
-    resolve_daily_pig,
-    ensure_yesterday_pig,
+from ..data_manager import LocalStoreUnavailableError
+from ..helpers import command_has_no_argument, guard_group_enabled, guard_store_errors, is_superuser_user
+from ..jobs import latest_daily_report_query_date, render_latest_daily_report_query_card
+from ..runtime import (
+    get_daily_report_group_status,
+    set_daily_report_group_enabled,
 )
-from ..resource_manager import PIG_LIST, sync_rollpig_resources
-from ..helpers import send_rendered_pig
-from ..reservation_flow import deliver_newly_ready_reservations
-from ..pighub_service import build_pighub_image_url, pighub_service
-from ..texts import TOMORROW_TEXTS, YESTERDAY_MAKEUP_TEXTS
-from ..runtime import rollpig_date_str
-from ..store.cloud import CloudMakeupUnsupportedError
-from ..yesterday_card_renderer import render_yesterday_recap_card
-from ..yesterday_recap import (
-    YesterdayPigResourceMissingError,
-    build_yesterday_recap,
-)
-from ..helpers import command_has_no_argument, guard_group_enabled, guard_store_errors
-from ..helpers import get_event_group_id, is_superuser_user
+from ..store.cloud import CloudStoreError
 
 
-def _build_pighub_image_message(pig: dict, image_url: str, fallback_title: str) -> Message:
-    """把外部 PigHub 标题封装成纯文本消息，并追加已解析的图片段。"""
-
-    title = str(pig.get("title") or fallback_title)
-    return MessageSegment.text(title) + MessageSegment.image(image_url)
+# ================================ 猪圈日报主动查询 ================================ #
 
 
-# 0. 小猪资源同步（管理员）
-cmd_sync_resources = on_command(
-    "同步小猪资源",
-    aliases={"刷新小猪图鉴"},
-    rule=command_has_no_argument,
-    block=True,
-)
-cmd_redownload_resources = on_command(
-    "全量同步小猪资源",
-    rule=command_has_no_argument,
-    block=True,
-)
+cmd_daily_report_card = on_command("猪圈日报", rule=command_has_no_argument, block=True)
 
 
-@cmd_sync_resources.handle()
-async def _(event: Event):
-    await _sync_resources_for_event(cmd_sync_resources, event, redownload=False)
+@cmd_daily_report_card.handle()
+@guard_group_enabled(cmd_daily_report_card)
+@guard_store_errors(cmd_daily_report_card)
+async def _(bot: Bot, event: Event):
+    """查本群最近一期封版卡，不触发自动投递或保护结算。"""
 
-
-@cmd_redownload_resources.handle()
-async def _(event: Event):
-    await _sync_resources_for_event(cmd_redownload_resources, event, redownload=True)
-
-
-async def _sync_resources_for_event(matcher: type[Matcher], event: Event, *, redownload: bool) -> None:
-    """普通同步复用已校验文件；全量命令显式重下，两个入口都只允许超级用户。"""
-
-    user_id = str(event.user_id)
-    if not is_superuser_user(user_id):
-        await matcher.finish(MessageSegment.reply(event.message_id) + "只有超级用户可以同步小猪资源。")
-        return
-
-    try:
-        message = await sync_rollpig_resources(force=True, redownload=redownload)
-    except Exception as error:
-        logger.error(f"rollpig 小猪资源手动同步失败: {error}")
-        await matcher.finish(MessageSegment.reply(event.message_id) + f"小猪资源同步失败：{error}")
-        return
-
-    await matcher.finish(
-        MessageSegment.reply(event.message_id)
-        + (
-            "🐷 小猪资源同步结果\n"
-            f"{message}\n\n"
-            f"🐽 小猪数量：{len(PIG_LIST)}"
-        )
-    )
-
-
-# 1. 今日小猪
-cmd_today = on_command(
-    "今天是什么小猪",
-    aliases={"今日小猪", "猪来"},
-    rule=command_has_no_argument,
-    block=True,
-)
-
-@cmd_today.handle()
-@guard_group_enabled(cmd_today)
-@guard_store_errors(cmd_today)
-async def _(event: Event):
-    user_id = str(event.user_id)
-    group_id = get_event_group_id(event)
-    resolution = await resolve_daily_pig(user_id, group_id, include_progress=True)
-    if resolution.recorded_pig_missing:
-        await cmd_today.finish(RECORDED_PIG_RESOURCE_MISSING_TEXT)
-        return
-    if resolution.missing_resources or not resolution.pig:
-        await cmd_today.finish("猪圈塌房了（数据缺失）")
-        return
-
-    await send_rendered_pig(
-        cmd_today,
-        event,
-        resolution.pig,
-        extra_text=resolution.growth_text,
-        ex_level=resolution.ex_level or 0,
-        after_send=(
-            (lambda: deliver_newly_ready_reservations(str(event.self_id)))
-            if resolution.was_auto_created
-            else None
-        ),
-    )
-
-
-# 2. 随机小猪
-cmd_roll = on_command("随机小猪", block=True)
-
-@cmd_roll.handle()
-@guard_group_enabled(cmd_roll)
-async def _(bot: Bot, event: Event, args: Message | None = CommandArg()):
-    if not await pighub_service.ensure_ready():
-        await cmd_roll.finish("连不上 PigHub，请稍后再试。")
-        return
-
-    # 2026-11-16 适配：无参数命令时 CommandArg() 可能给 None。
-    text = (args or Message()).extract_plain_text().strip()
-    try:
-        count = int(text) if text else 1
-    except ValueError:
-        count = 1
-    count = max(1, min(count, 10))
-
-    selected = pighub_service.sample(count)
-    if not selected:
-        await cmd_roll.finish("PigHub 图片索引为空，请稍后再试。")
-        return
-
-    pig = selected[0]
-    image_url = build_pighub_image_url(pig)
-    if not image_url:
-        await cmd_roll.finish("PigHub 返回了异常图片数据，请稍后再试。")
-        return
-
-    if count == 1:
-        await cmd_roll.finish(MessageSegment.reply(event.message_id) + MessageSegment.image(image_url))
-        return
-
-    # 私聊不支持合并转发，降级为单张
+    reply = _event_reply(event)
     if not isinstance(event, GroupMessageEvent):
-        await cmd_roll.finish(
-            MessageSegment.reply(event.message_id)
-            + "私聊暂不支持多张连发，先给你一张：\n"
-            + MessageSegment.image(image_url)
-        )
+        await cmd_daily_report_card.finish(reply + "请在群里发送「猪圈日报」。")
         return
 
-    # 多图去重：用 sample 避免重复（若图库数量不足则取全部）
-    messages = []
-    for pig in selected:
-        url = build_pighub_image_url(pig)
-        if not url:
-            continue
-        messages.append({
-            "type": "node",
-            "data": {
-                "name": "随机小猪Bot",
-                "uin": event.self_id,
-                # PigHub 标题属于外部数据，必须作为纯文本，不能让其中的 CQ 码变成消息段。
-                "content": _build_pighub_image_message(pig, url, "随机小猪"),
-            },
-        })
-
-    if not messages:
-        await cmd_roll.finish("PigHub 图片数据异常，请稍后再试。")
+    report_date = latest_daily_report_query_date()
+    if report_date is None:
+        await cmd_daily_report_card.finish(reply + "本期日报正在出刊，00:10 后再来翻报纸。")
         return
 
     try:
-        await bot.send_group_forward_msg(group_id=event.group_id, messages=messages)
+        image, protection_unconfirmed = await render_latest_daily_report_query_card(
+            bot, str(event.group_id), report_date,
+        )
+    except (CloudStoreError, LocalStoreUnavailableError):
+        raise
     except Exception as error:
-        # OneBot 合并转发会让接入端预取远程图片；PigHub 抖动或图片过慢时可能超时。
-        # 显式告诉用户当前外部图源或转发链路超时。
-        logger.warning(f"随机小猪合并转发超时: {error}")
-        await cmd_roll.finish(
-            MessageSegment.reply(event.message_id)
-            + "PigHub 图片加载或合并转发超时了，请稍后再试。"
-        )
-
-
-# 2.5 找猪
-cmd_find = on_command("找猪", aliases={"搜猪"}, block=True)
-
-@cmd_find.handle()
-@guard_group_enabled(cmd_find)
-async def _(bot: Bot, event: Event, args: Message | None = CommandArg()):
-    if not await pighub_service.ensure_ready():
-        await cmd_find.finish("连不上 PigHub，请稍后再试。")
+        logger.exception(f"猪圈日报查卡失败: group={event.group_id} date={report_date} error={error}")
+        await cmd_daily_report_card.finish(reply + "猪圈日报暂时查不到，请稍后再试。")
         return
 
-    # 2026-11-16 适配：无参数命令时 CommandArg() 可能给 None。
-    keyword = (args or Message()).extract_plain_text().strip()
-    if not keyword:
-        await cmd_find.finish("请加上关键词，如：/找猪 玩偶")
+    if image is None:
+        await cmd_daily_report_card.finish(reply + "这期猪圈休刊，没攒出一张日报。")
         return
-
-    found_pigs = pighub_service.search(keyword)
-    if not found_pigs:
-        await cmd_find.finish(f"没找到叫「{keyword}」的猪。")
-        return
-
-    if isinstance(event, GroupMessageEvent):
-        messages = []
-        count = min(len(found_pigs), 10)
-        for i in range(count):
-            pig = found_pigs[i]
-            image_url = build_pighub_image_url(pig)
-            if not image_url:
-                continue
-            messages.append({
-                "type": "node",
-                "data": {
-                    "name": "搜猪小助手",
-                    "uin": event.self_id,
-                    "content": _build_pighub_image_message(pig, image_url, "未命名小猪"),
-                },
-            })
-        if not messages:
-            await cmd_find.finish("搜索结果数据异常，请稍后再试。")
-            return
-        try:
-            await bot.send_group_forward_msg(group_id=event.group_id, messages=messages)
-        except Exception as error:
-            # 群转发失败时必须显式回消息；否则用户只会看到“找猪没反应”。
-            logger.warning(f"找猪合并转发超时: keyword={keyword}, error={error}")
-            await cmd_find.finish(
-                MessageSegment.reply(event.message_id)
-                + "PigHub 图片加载或合并转发超时了，请稍后再试。"
-            )
-        return
-
-    # 私聊降级：展示首条匹配
-    pig = found_pigs[0]
-    image_url = build_pighub_image_url(pig)
-    if not image_url:
-        await cmd_find.finish("搜索结果数据异常，请稍后再试。")
-        return
-    msg = _build_pighub_image_message(pig, image_url, "未命名小猪")
-    if len(found_pigs) > 1:
-        msg += MessageSegment.text(f"\n共找到 {len(found_pigs)} 张，私聊仅展示第 1 张。")
-    await cmd_find.finish(MessageSegment.reply(event.message_id) + msg)
+    message = reply + MessageSegment.image(image)
+    if protection_unconfirmed:
+        message += MessageSegment.text("次日保护结算暂未确认。")
+    await cmd_daily_report_card.finish(message)
 
 
-# 3. 明日小猪
-cmd_tmr = on_command("明日小猪", rule=command_has_no_argument, block=True)
+# ================================ 小猪日报推送开关 ================================ #
+# 控制单群日报定时推送，不影响主动查询。
 
-@cmd_tmr.handle()
-@guard_group_enabled(cmd_tmr)
-async def _(event: Event):
-    await cmd_tmr.finish(MessageSegment.reply(event.message_id) + random.choice(TOMORROW_TEXTS))
+cmd_daily_report_switch = on_command(
+    "小猪日报",
+    aliases={"每日总结设置", "rollpig日报"},
+    force_whitespace=True,
+    block=True,
+)
+
+ENABLE_WORDS = {"开启", "打开", "启用", "开", "on", "enable", "true"}
+DISABLE_WORDS = {"关闭", "停用", "关", "off", "disable", "false"}
+STATUS_WORDS = {"状态", "查看", "查询", "status", "info"}
 
 
-# 4. 昨日小猪
-cmd_yest = on_command("昨日小猪", rule=command_has_no_argument, block=True)
+def _event_reply(event: Event) -> MessageSegment:
+    message_id = getattr(event, "message_id", None)
+    return MessageSegment.reply(message_id) if message_id is not None else MessageSegment.text("")
 
 
-async def _handle_yesterday_pig(event: Event) -> None:
-    """生成昨日回顾卡；失败时只返回错误，不再进入旧版普通卡流程。"""
+def _is_group_manager(event: Event) -> bool:
+    """检查是否具备管理当前群日报推送开关的权限。"""
 
-    user_id = str(event.user_id)
-    group_id = get_event_group_id(event)
-    makeup_created = False
-    try:
-        target_date = rollpig_date_str(-1)
-        recap = await build_yesterday_recap(user_id, group_id=group_id, date_str=target_date)
-        if recap is None:
-            if not PIG_LIST:
-                await cmd_yest.finish(MessageSegment.reply(event.message_id) + "小猪资源暂时不可用，无法补签。")
-                return
-            makeup_created = await ensure_yesterday_pig(user_id, target_date)
-            recap = await build_yesterday_recap(user_id, group_id=group_id, date_str=target_date)
-    except CloudMakeupUnsupportedError as error:
-        await cmd_yest.finish(MessageSegment.reply(event.message_id) + str(error))
-        return
-    except YesterdayPigResourceMissingError as error:
-        logger.warning(f"rollpig 昨日身份无法解析: user={user_id} pig_id={error}")
-        await cmd_yest.finish(
-            MessageSegment.reply(event.message_id)
-            + "昨天那只猪暂时不在当前资源包里。"
-        )
-        return
+    if is_superuser_user(str(event.user_id)):
+        return True
+    if not isinstance(event, GroupMessageEvent):
+        return False
+    return getattr(event.sender, "role", "") in {"admin", "owner"}
 
-    if recap is None:
-        await cmd_yest.finish(MessageSegment.reply(event.message_id) + "补签结果暂时无法读取，请稍后再试。")
-        return
 
-    try:
-        render_result = await render_yesterday_recap_card(recap)
-    except Exception as error:
-        logger.error(
-            "rollpig 昨日回顾卡片生成失败: "
-            f"user={user_id} pig_id={recap.roll.pig_id} error={error}"
-        )
-        await cmd_yest.finish(
-            MessageSegment.reply(event.message_id)
-            + "昨日回顾卡生成失败，请稍后再试。"
-        )
-        return
+def _parse_action_and_group_id(raw_text: str, event: Event) -> tuple[str, str]:
+    """解析开关动作与目标群号。"""
 
-    logger.info(
-        "rollpig yesterday card rendered: "
-        f"user={user_id} pig_id={recap.roll.pig_id} "
-        f"renderer={render_result.renderer} format={render_result.image_format} "
-        f"size={render_result.width}x{render_result.height} "
-        f"bytes={len(render_result.data)} image_fallback={render_result.used_fallback_image}"
+    tokens = raw_text.split()
+    action = "status"
+    target_group_id = ""
+
+    for token in tokens:
+        normalized = token.lower()
+        if normalized in ENABLE_WORDS:
+            action = "enable"
+        elif normalized in DISABLE_WORDS:
+            action = "disable"
+        elif normalized in STATUS_WORDS:
+            action = "status"
+        elif token.isdigit():
+            target_group_id = token
+
+    if not target_group_id and isinstance(event, GroupMessageEvent):
+        target_group_id = str(event.group_id)
+    return action, target_group_id
+
+
+def _can_control_target_group(event: Event, target_group_id: str) -> bool:
+    """检查对目标群的管理权限。"""
+
+    if is_superuser_user(str(event.user_id)):
+        return True
+    if not isinstance(event, GroupMessageEvent):
+        return False
+    return str(event.group_id) == target_group_id and _is_group_manager(event)
+
+
+def _format_status(group_id: str) -> str:
+    """格式化单群日报状态文本。"""
+
+    enabled, source = get_daily_report_group_status(group_id)
+    return (
+        f"小猪日报推送状态：{'开启' if enabled else '关闭'}\n"
+        f"群号：{group_id}\n"
+        f"来源：{source}"
     )
-    message = MessageSegment.reply(event.message_id)
-    if makeup_created:
-        message += MessageSegment.text(random.choice(YESTERDAY_MAKEUP_TEXTS))
-    await cmd_yest.finish(message + MessageSegment.image(render_result.data))
 
 
-@cmd_yest.handle()
-@guard_group_enabled(cmd_yest)
-@guard_store_errors(cmd_yest)
-async def _(event: Event):
-    await _handle_yesterday_pig(event)
+@cmd_daily_report_switch.handle()
+async def _(event: Event, args: Message | None = CommandArg()):
+    # 2026-11-16 适配：无参数命令时新版 NoneBot 的 CommandArg() 可能给 None，
+    # 旧写法 `Message = CommandArg()` 会被 pydantic v2 判 TypeMisMatch。
+    raw_text = (args or Message()).extract_plain_text().strip()
+    action, target_group_id = _parse_action_and_group_id(raw_text, event)
+
+    if not target_group_id:
+        await cmd_daily_report_switch.finish(
+            _event_reply(event)
+            + "请在群内使用，或由超级用户指定群号：小猪日报 开启 123456"
+        )
+        return
+
+    if action == "status":
+        if not isinstance(event, GroupMessageEvent) or str(event.group_id) != target_group_id:
+            if not is_superuser_user(str(event.user_id)):
+                await cmd_daily_report_switch.finish(_event_reply(event) + "只有超级用户可以查看其他群的日报推送状态。")
+                return
+        await cmd_daily_report_switch.finish(_event_reply(event) + _format_status(target_group_id))
+        return
+
+    if not _can_control_target_group(event, target_group_id):
+        await cmd_daily_report_switch.finish(
+            _event_reply(event)
+            + "只有本群群主/管理员可以控制本群；控制其他群需要超级用户权限。"
+        )
+        return
+
+    if action == "enable":
+        try:
+            await set_daily_report_group_enabled(target_group_id, True)
+        except Exception as error:
+            await cmd_daily_report_switch.finish(_event_reply(event) + f"日报推送开启失败：{error}")
+            return
+        await cmd_daily_report_switch.finish(_event_reply(event) + f"已开启群 {target_group_id} 的猪圈日报推送。\n{_format_status(target_group_id)}")
+        return
+
+    if action == "disable":
+        try:
+            await set_daily_report_group_enabled(target_group_id, False)
+        except Exception as error:
+            await cmd_daily_report_switch.finish(_event_reply(event) + f"日报推送关闭失败：{error}")
+            return
+        await cmd_daily_report_switch.finish(_event_reply(event) + f"已关闭群 {target_group_id} 的猪圈日报推送。\n{_format_status(target_group_id)}")
+        return
+

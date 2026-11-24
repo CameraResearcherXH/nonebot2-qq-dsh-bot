@@ -1971,7 +1971,11 @@ def _post_rules(key: str, speaker_qq: str = "", gid: str = "") -> str:
     lines.append("· 数字/单位按字面理解，别自己补成关卡/等级；拿不准就问。")
     lines.append("· 有【链接内容】就直接用，别说点不开。")
     if is_group:
-        lines.append("· 多条 ⭐/@ 用一条答完；被 @ 不许沉默；别点评对话本身。")
+        lines.append("· 多条 ⭐/@：**同一件事**可以一条答完；**不同人/不同事**就分气泡"
+                     "（用 |||），每个气泡用 <reply:消息号> 引自己回的那条，别把两件事塞进一个引用里。")
+        lines.append("· 被 @ 不许沉默；别点评对话本身。")
+        if str(TOOL_CTX.get("multi_at") or "").strip():
+            lines.append("· 多人同时 @：每个请求对应到人，点赞/画图别串。")
     if call:
         lines.append(f"· 称呼他：{call}。")
     try:
@@ -1984,7 +1988,8 @@ def _post_rules(key: str, speaker_qq: str = "", gid: str = "") -> str:
                 _types = set()
             _auto_quote = bool(_types & {"image", "video"})
         if _auto_quote:
-            lines.append("· 系统会自动引用这条。")
+            lines.append("· 系统会自动引用这条 —— 但**只在你这句是在说它（这张图/这句话）时**；"
+                         "如果你回的是另一件事/另一个人，就别把两件事写在一起，分气泡写。")
     except Exception:
         pass
     lines.append("· 最后写 [[THINK|20 字内心里话]]；写了 [[MOOD]] 也不能省掉 THINK。")
@@ -2154,6 +2159,9 @@ def _dynamic_sections(key: str, *, is_group: bool) -> list:
     _reply = _reply_protocol(is_group)
     if _reply:
         secs.append(("12 引用回复", _reply.strip()))
+    _multi = str(TOOL_CTX.get("multi_at") or "").strip()
+    if _multi:
+        secs.append(("12b 多人同时 @", _multi))
     _missed = _missed_at_hint(key)
     if _missed:
         secs.append(("13 @ 没成功", _missed))

@@ -48,10 +48,9 @@ EXCLUDE_FILES = {
     "t_api_zh.txt", "t_hdr_zh.txt", "t_iqtuning_zh.txt",
 }
 EXCLUDE_GLOBS = ("*.working", "*.bak", "*.old", "*.orig", "*.log", "*.pyc",
-                 ".env.*", "docs/review-*.md", "docs/agent-pipeline.md",
+                 ".env.*", "docs/review-*.md",
                  "scripts/_*.py",
-                 "scripts/xray_proxy.py", "scripts/pixiv_*.py",
-                 "scripts/*cookie*.py", "scripts/*token*.py")
+                 "scripts/xray_proxy.py")
 
 SECRET_PATTERNS = [
     (re.compile(r"sk-[A-Za-z0-9._-]{10,}"), "API key (sk-)"),
@@ -92,7 +91,13 @@ def _num_placeholder(num: str) -> str:
 
 def is_excluded(rel: Path) -> bool:
     parts = rel.parts
-    if any(p in EXCLUDE_DIRS for p in parts):
+    for i, p in enumerate(parts):
+        if p not in EXCLUDE_DIRS:
+            continue
+        # 只排除仓库根目录的 patches/（里面有 .env diff，绝不能发）；
+        # plugins/third/**/patches/*.patch 是第三方插件自带的补丁，要保留。
+        if p == "patches" and i > 0:
+            continue
         return True
     if rel.name in EXCLUDE_FILES:
         return True

@@ -59,6 +59,26 @@ def _hdr(name: str) -> str:
     return f"▍{name}｜{SUMMARY.get(name, '')}".rstrip("｜")
 
 
+_LIB_QUESTION_HINTS = (
+    "？", "?", "吗", "呢", "谁", "什么", "怎么", "为什么", "为啥", "哪",
+    "多少", "记得", "之前", "上次", "以前", "曾经", "说过", "知道",
+    "是不是", "有没有", "还记得", "那个", "那件事", "后来",
+)
+
+
+def _want_library(text: str) -> bool:
+    """这条消息值不值得花 5~14s 查图书馆（久远归档）。
+
+    RAG 一次要 5~14s；对「哈哈哈」「好」这种没必要。只在像问事/提旧事时查。
+    """
+    t = str(text or "").strip()
+    if len(t) < 4:
+        return False
+    if any(k in t for k in _LIB_QUESTION_HINTS):
+        return True
+    return len(t) >= 12
+
+
 def _mark(name: str, t0: float) -> None:
     ms = (time.monotonic() - t0) * 1000
     d = STATS["stage_ms"].setdefault(name, {"n": 0, "ms": 0.0})
@@ -200,7 +220,7 @@ async def build(
     except Exception as e:
         fail("档案", e)
 
-    # ---------- ④ 心情 LLM 对这段话的总结 ----------
+    # ---------- ④ 总结 + 图书馆：并行启动 ----------
     summary = ""
     # ⚠️ 2026-11-24：图片/视频的 text 里带着完整视觉报告（[图片识别结果]…），
     # 再让总结 LLM 压一遍，会把「画面描述」重新塞回 prompt —— 她就会先描述图再回答。
@@ -212,6 +232,20 @@ async def build(
         or _txt_s.strip() in ("[图片]", "[表情]", "[视频]")
         or "【对方发了一个表情包" in _txt_s
     )
+    # 图书馆（RAG v3）实测 5~14s：串在总结后面就必然超时（以前写死 2.5s，
+    # 结果「图书馆=0」10/10）。这里先发出去，跟总结/记忆并行，最后再收。
+    _lib_task = None
+    try:
+        from . import agent_client as _ac0
+        _lib_seed = (f"{speaker_name or '对方'} 图片" if _is_media
+                     else _txt_s.strip()[:120])
+        # 只对「像在问事/提旧事」的消息查图书馆；纯插科打诨不花这 5~14s。
+        if _want_library(_lib_seed):
+            _lib_task = asyncio.create_task(
+                _ac0.recall(_lib_seed, speaker_qq=speaker_qq, recent_ctx=[]))
+    except Exception:
+        _lib_task = None
+
     if _is_media:
         stages["总结"] = "—(媒体，不总结画面)"
     else:
@@ -275,12 +309,12 @@ async def build(
 
     async def _lib_stage():
         try:
-            from . import agent_client
-            # 图书馆在关键路径上：最多 3s；不可用会自己暂停（见 agent_client）
-            _lib = await _step(
-                "图书馆",
-                agent_client.recall(query, speaker_qq=speaker_qq, recent_ctx=[]),
-                min(3.0, left()), default=None)
+            if _lib_task is None:
+                stages["图书馆"] = "—(不是问事，不查)"
+                return ""
+            # 任务已经在 ④ 之前发出去了，这里只等结果：最多 14s（RAG 实测 5~14s）。
+            # 不跟 left() 抢预算：它和总结/记忆是并行的，不是串行叠加。
+            _lib = await _step("图书馆", _lib_task, 15.0, default=None)
             _facts = (_lib or {}).get("facts") or []
             if not _facts:
                 stages["图书馆"] = "0"
@@ -289,7 +323,7 @@ async def build(
             return (_hdr("图书馆") + "\n"
                     "（**语料库里的「我/你/他」不是现在的你我他**，只当参考线索，"
                     "别照抄、别当成现在发生的事）\n"
-                    + "\n".join(f"· {str(x)[:60]}" for x in _facts[:3]))
+                    + "\n".join(f"· {str(x)[:100]}" for x in _facts[:3]))
         except Exception as e:
             fail("图书馆", e)
             return ""

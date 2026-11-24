@@ -80,6 +80,8 @@ DEFAULTS = {
 
     # ---------- 算力机 ----------
     'AGENT_RECALL_TIMEOUT': 3.0,
+    # 图书馆（RAG v3）单次检索上限：实测 5~14s，2.5s 会把所有检索都判超时。
+    'AGENT_LIBRARY_TIMEOUT': 14.0,
     'AGENT_REFLECT_QUEUE_TIMEOUT': 600.0,
     'AGENT_REFLECT_TIMEOUT': 180.0,
 
@@ -211,9 +213,9 @@ DEFAULTS = {
     # ---------- 模型调用 ----------
     'LIBRARY_COOLDOWN': 600.0,
     # 回复前「动态取数」流水线的总预算（秒）：到点就带着已拿到的部分回复。
-    # 2026-11-24 用户：「pipeline 一定要完整去调一遍」→ 7s 提到 12s，
-    # 让总结（最多 6s）+ 记忆/图书馆（并行各 3s）有足够时间跑完。
-    'PIPELINE_BUDGET': 12.0,
+    # 2026-11-24 用户：「pipeline 一定要完整去调一遍」→ 7s 提到 12s；
+    # 图书馆（RAG v3）实测 5~14s，再提到 16s，让它在问题类消息上真的能返回。
+    'PIPELINE_BUDGET': 16.0,
 
     # ---------- 用量监测 ----------
     'LLM_DAILY_BUDGET': 0.0,
@@ -519,6 +521,7 @@ DOCS = {
     'BOND_EVENT_MIN_DELTA': '「印象最深的一件事」的门槛：记忆 |Δ| 达到多少才算（0.15）',
     'AFFINITY_TREND_WINDOW_SEC': '好感走势的统计窗口（秒）',
     'AGENT_RECALL_TIMEOUT': '算力机回忆接口超时（秒，默认 3；它在回复关键路径上）',
+    'AGENT_LIBRARY_TIMEOUT': '图书馆 RAG 单次检索上限（秒，默认 14；实测 5~14s）',
     'AGENT_REFLECT_QUEUE_TIMEOUT': '算力机反思任务排队超时（秒）',
     'AGENT_REFLECT_TIMEOUT': '算力机反思任务执行超时（秒）',
     'API_USAGE_KEEP_DAYS': '旧版用量记录保留天数',
@@ -781,6 +784,7 @@ FILES = {
     'BOND_EVENT_MIN_DELTA': 'services/profiles.py',
     'AFFINITY_TREND_WINDOW_SEC': 'services/profiles.py',
     'AGENT_RECALL_TIMEOUT': 'services/agent_client.py',
+    'AGENT_LIBRARY_TIMEOUT': 'services/agent_client.py',
     'AGENT_REFLECT_QUEUE_TIMEOUT': 'services/agent_client.py',
     'AGENT_REFLECT_TIMEOUT': 'services/agent_client.py',
     'API_USAGE_KEEP_DAYS': 'services/api_usage.py',

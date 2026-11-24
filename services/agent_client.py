@@ -22,6 +22,7 @@ from core import tuning
 import asyncio
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -48,13 +49,14 @@ _LIBRARY_WARNED = False
 # /api/agent/recall 不存在时记一下，别每条消息都白打一次 404
 _RECALL_ENDPOINT_MISSING = False
 
-_RECALL_PROMPT = (
-    "从知识库的历史聊天记录里，找出和这句话最相关的 3 条原话：{q}\n"
-    "要求：只列「谁说过什么」，一条一行；没有就只回「没有」。"
-    "不要解释、不要总结、不要编。"
-)
+# ⚠️ 2026-11-24 实测：给 RAG 加「只列谁说过什么」这类指令，反而让它更容易回「没有」
+# （它把这句当成要检索的内容，检索不到就放弃）。直接送原话，命中最稳、也最快。
+_RECALL_PROMPT = "{q}"
 
 RECALL_TIMEOUT = tuning.f("AGENT_RECALL_TIMEOUT")
+# 图书馆（RAG v3）实测一次 5~14s：2.5s 超时 = 每条消息都白等然后判「不可用」。
+# 2026-11-24 用户实测「小明是如何解决温室效应的」→ 13.4s 才返回弱智吧内容。
+LIB_TIMEOUT = tuning.f("AGENT_LIBRARY_TIMEOUT")
 REFLECT_HTTP_TIMEOUT = tuning.f("AGENT_REFLECT_TIMEOUT")
 REFLECT_QUEUE_TIMEOUT = tuning.f("AGENT_REFLECT_QUEUE_TIMEOUT")
 
@@ -65,6 +67,16 @@ EMPTY_RECALL = {"facts": [], "events": [], "emotions": [], "self_state": "", "so
 
 # 图书馆调用统计（给 `/测函数 记忆` 用）
 STATS = {"calls": 0, "ok": 0, "empty": 0}
+
+# 同一条/相似的问题 10 分钟内不重复问 RAG（一次 5~14s，太贵）。
+# key = 去掉空白的 query 前 60 字；空结果只缓存 2 分钟，避免把「暂时没命中」钉死。
+_CACHE: dict = {}
+_CACHE_TTL_OK = 600.0
+_CACHE_TTL_EMPTY = 120.0
+
+
+def _cache_key(q: str) -> str:
+    return re.sub(r"\s+", "", str(q or "").lower())[:60]
 
 
 def stats_text() -> str:
@@ -144,7 +156,16 @@ def _normalize_recall(data: dict, source: str) -> dict:
 
     facts = _as_list(data.get("facts"))
     if not facts and data.get("answer"):
-        facts = _as_list(data.get("answer"))
+        ans = str(data.get("answer") or "").strip()
+        # RAG 的 answer 往往是一整段 + 「**参考来源**」；按行拆开，
+        # 去掉来源行，保留真正的结论行（否则 [:60] 会把结论截掉）。
+        lines = []
+        for ln in ans.splitlines():
+            ln = ln.strip().strip("*#-· ").strip()
+            if not ln or "参考来源" in ln or ln.startswith("来源"):
+                continue
+            lines.append(ln)
+        facts = lines[:5] or ([ans] if ans else [])
 
     return {
         "facts": facts,
@@ -155,32 +176,94 @@ def _normalize_recall(data: dict, source: str) -> dict:
     }
 
 
-def _looks_like_chat(data: dict) -> bool:
-    """答案/来源像不像「聊天记录」而不是别的语料。
+_NO_ANSWER_KEYS = (
+    "没有找到", "没有提到", "没有提供", "没有关于", "没有相关信息",
+    "无法回答", "无法作答", "无法根据", "问题不完整", "信息不足",
+    "上下文中没有", "知识库中没有", "未找到", "无法确定",
+)
 
-    实测那套 RAG 的库里是 `poet.song.rank.*.json`（宋词排行），
+
+def is_no_answer(text: str) -> bool:
+    """RAG 的「没检索到」也算空结果：别把「没有」当事实塞进 prompt。"""
+    a = str(text or "").strip()
+    if not a:
+        return True
+    # 先砍掉「**参考来源**: …」尾巴，否则整段很长，短答案判定会失效
+    a = re.split(r"\*{0,2}参考来源\s*[:：]?", a, maxsplit=1)[0]
+    a = a.strip().strip("*#-· ").strip()
+    if not a:
+        return True
+    if len(a) <= 8 and a.strip("。.!！?？ ") in (
+            "没有", "无", "不知道", "未找到", "没有找到"):
+        return True
+    head = a[:80]
+    return any(k in head for k in _NO_ANSWER_KEYS)
+
+
+# 通用定义句：「白饭是指煮熟的白色稻米。」这类是知识库百科，不是她的记忆。
+# 只认「短主语 + 是指/指的是/是」且**没有**聊天痕迹（冒号/说/问/回/聊）的句子。
+_GENERIC_DEF_RE = re.compile(
+    r"^[\u4e00-\u9fa5A-Za-z0-9]{1,12}(?:是指|指的是|是一种|是一个|是|指)"
+    r"[^。！？!?\n]{0,40}[。！？!?]?$")
+
+
+def _looks_like_chat(data: dict) -> bool:
+    """答案/来源像不像「聊天记录/群归档」而不是别的语料。
+
+    实测那套 RAG 的库里还有 `poet.song.rank.*.json`（宋词排行），
     跟她的记忆完全无关；这种情况继续问只会白等 6~13 秒。
+
+    ⚠️ 2026-11-24 修正：以前只要来源是 `/app/documents/*.json` 就判「不是聊天」，
+    结果把 `documents/xiaoming.txt`（弱智吧段子）这类正常归档也丢了；
+    而且「小明为了光合作用变成了植物人。」没有冒号/「说」也会被误杀。
+    现在只排除明确的诗词语料 + 空答案。
     """
     try:
         txt = json.dumps(data, ensure_ascii=False)[:3000].lower()
     except Exception:
         return True
-    if "poet.song" in txt or "poetry" in txt:
+    if "poet.song" in txt or "poet.tang" in txt or "poetry" in txt:
         return False
-    if "/app/documents/" in txt and not any(
-            k in txt for k in ("dialogue", "chat", "聊天", "群聊", "私聊")):
+    ans = str((data or {}).get("answer") or "").strip()
+    if is_no_answer(ans):
         return False
-    # 2026-11-24 实测踩坑：RAG 对「白饭」会答「白饭是指煮熟的白色稻米」——
-    # 这是**通用问答**，不是她的记忆。当成记忆塞进 prompt 等于教她编。
-    # 只有答案长得像「聊天摘录」（带冒号/说/时间/人名）才收。
-    ans = str((data or {}).get("answer") or "")
-    if ans and not any(k in ans for k in ("：", ":", "说", "聊", "问", "回")):
+    # 百科式定义（「白饭是指煮熟的白色稻米」）不是记忆；带聊天痕迹的放行。
+    _a1 = ans.splitlines()[0].strip().strip("*#-· ")
+    if (_GENERIC_DEF_RE.match(_a1)
+            and not any(k in _a1 for k in ("：", ":", "说", "问", "回", "聊"))):
         return False
     return True
 
 
 # ================= ① recall =================
 async def recall(
+    query: str,
+    *,
+    speaker_qq: str = "",
+    mood_value: float = 0.0,
+    recent_ctx: list | None = None,
+    timeout: float | None = None,
+) -> dict:
+    """带缓存的入口：同一条/相似问题 10 分钟内直接复用上次结果。"""
+    q = str(query or "").strip()
+    if not q:
+        return empty_recall()
+    ck = _cache_key(q)
+    hit = _CACHE.get(ck)
+    if hit and time.time() - float(hit[0]) < float(hit[2]):
+        return dict(hit[1])
+    out = await _recall_impl(
+        q, speaker_qq=speaker_qq, mood_value=mood_value,
+        recent_ctx=recent_ctx, timeout=timeout)
+    ttl = _CACHE_TTL_OK if (out or {}).get("facts") else _CACHE_TTL_EMPTY
+    _CACHE[ck] = (time.time(), dict(out or empty_recall()), ttl)
+    if len(_CACHE) > 300:
+        for k in list(_CACHE)[:100]:
+            _CACHE.pop(k, None)
+    return out
+
+
+async def _recall_impl(
     query: str,
     *,
     speaker_qq: str = "",
@@ -232,18 +315,24 @@ async def recall(
         )
         return out
 
-    # 兜底 1：/api/agent/smart-query（RAG v3 上有，实测 3~13s）
-    # ⚠️ 它在回复关键路径上，超时必须收紧：实测复杂问句要 12s+，
-    #    所以这里最多等 2.5s；超时就当「图书馆暂时不可用」，10 分钟内不再试。
-    #    （必须先于流水线的 3s 兜底超时，否则暂停标记永远设不上，每条消息白等 3s。）
+    # 兜底 1：/api/agent/smart-query（RAG v3 上有，实测 3~14s）
+    # ⚠️ 2026-11-24 修正：以前写死 2.5s，而 RAG 实测要 5~14s →
+    #    每条消息都在 2.5s 超时、然后判「图书馆不可用 10 分钟」，所以永远 0 条。
+    #    现在按 AGENT_LIBRARY_TIMEOUT（默认 8.5s）等；流水线那边给 9s。
     data = await _post_json(
         f"{AGENT_BASE_URL}{SMART_QUERY_ENDPOINT}",
         {"question": _RECALL_PROMPT.format(q=query)},
-        min(2.5, to + 1),
+        max(3.0, LIB_TIMEOUT),
     )
     if data is None:
         _LIBRARY_DEAD_UNTIL = time.time() + 600
         logger.info("[AGENT] 图书馆暂时不可用（超时/失败）→ 10 分钟内不再试")
+        return empty_recall()
+    # 「没检索到」不是语料问题：图书馆是通的，这次就是没命中，不要暂停。
+    if is_no_answer(str((data or {}).get("answer") or "")):
+        _LIBRARY_DEAD_UNTIL = 0.0
+        STATS["empty"] = int(STATS.get("empty") or 0) + 1
+        logger.info("[AGENT] 图书馆没有命中（RAG 回「没有」）")
         return empty_recall()
     if not _looks_like_chat(data):
         _LIBRARY_DEAD_UNTIL = time.time() + 6 * 3600
