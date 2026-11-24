@@ -35,6 +35,8 @@ import asyncio
 import json
 import os
 import shlex
+import shutil
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -202,9 +204,15 @@ async def _call_cli(prompt: str, sess: dict) -> str:
         r = await asyncio.to_thread(_run)
     except Exception as e:
         # ⚠️ subprocess 超时抛的是 TimeoutExpired，不是 asyncio.TimeoutError
-        import subprocess as _sp
-        if isinstance(e, _sp.TimeoutExpired):
+        if isinstance(e, subprocess.TimeoutExpired):
             return f"harness 超时（>{_timeout():.0f}s），已终止。"
+        if isinstance(e, FileNotFoundError):
+            exe = (shlex.split(tmpl) or ["?"])[0]
+            return (f"找不到命令 `{exe}`（HARNESS_CLI 第一段）。\n"
+                    f"· 桌面版一般**不往 PATH 装 CLI**；先在终端敲 `{exe} --help` 看有没有。\n"
+                    f"· 没有的话：要么在桌面版设置里打开「命令行 / API」，要么改用 MCP 路线"
+                    f"（docs/harness-bridge.md §9）。\n"
+                    f"· 也可以先 `/h 自检` 看缺哪一项。")
         return f"harness 启动失败：{type(e).__name__}: {e}"
     out = (r.stdout or "").strip()
     err = (r.stderr or "").strip()
@@ -263,6 +271,67 @@ async def ask(session_key: str, prompt: str, *, speaker_qq: str = "",
     if len(out) > _max_output():
         out = out[: _max_output()] + f"\n…（输出太长，截到 {_max_output()} 字）"
     return out or "（harness 没有输出）"
+
+
+def probe() -> str:
+    """`/h 自检`：一条命令看清「这个 harness 到底能不能接」。
+
+    2026-11-24 用户：很多人用的是 **桌面版**，桌面版通常
+      · 不往 PATH 装 `dsh` CLI；
+      · 登录 token 存在它自己的配置里，不导出给第三方；
+      · 不一定开 HTTP 接口。
+    所以桥接前先探一遍，别让用户对着「退出码 127」猜。
+    """
+    backend = _env("HARNESS_BACKEND", "cli").lower()
+    tmpl = _env("HARNESS_CLI")
+    url = _env("HARNESS_URL")
+    token = _env("HARNESS_TOKEN")
+    lines = ["🧰 Harness 自检", f"· 后端：{backend}"]
+
+    exe = ""
+    if tmpl:
+        try:
+            exe = (shlex.split(tmpl) or [""])[0]
+        except Exception:
+            exe = ""
+    path = shutil.which(exe) if exe else ""
+    if not tmpl:
+        lines.append("· CLI 模板：❌ 没配 HARNESS_CLI")
+    elif not exe:
+        lines.append("· CLI 模板：❌ 解析不出命令")
+    else:
+        lines.append(f"· CLI 命令 `{exe}`：{path or '❌ 找不到（桌面版通常不带 CLI，或没加进 PATH）'}")
+        if path:
+            try:
+                r = subprocess.run([exe, "--help"], capture_output=True,
+                                   text=True, timeout=10)
+                head = (r.stdout or r.stderr or "").strip().splitlines()[:2]
+                lines.append(f"· `{exe} --help`：退出码 {r.returncode}｜"
+                             + " / ".join(head)[:160])
+            except Exception as e:
+                lines.append(f"· `{exe} --help` 失败：{type(e).__name__}: {str(e)[:100]}")
+
+    lines.append(f"· HTTP 地址：{url or '❌ 没配 HARNESS_URL'}")
+    lines.append(f"· Token：{'✅ 已配' if token else '❌ 没配（桌面版一般不在设置里给 token）'}")
+    if url:
+        try:
+            r = httpx.get(url, timeout=5)
+            lines.append(f"· 探测 {url}：HTTP {r.status_code}"
+                         + ("（405 也算通，只是只收 POST）" if r.status_code == 405 else ""))
+        except Exception as e:
+            lines.append(f"· 探测 {url} 失败：{type(e).__name__}")
+
+    ok_cli = bool(path)
+    ok_http = bool(url and token)
+    if backend == "http":
+        lines.append("→ " + ("HTTP 看起来可用，可以发 `/h 测试一下`"
+                             if ok_http else
+                             "HTTP 缺地址或 token；改用 cli，或按 docs/harness-bridge.md §9 走 MCP"))
+    else:
+        lines.append("→ " + ("CLI 看起来可用，可以发 `/h 测试一下`"
+                             if ok_cli else
+                             "CLI 找不到命令。桌面版只能走 MCP/文件桥，见 docs/harness-bridge.md §9"))
+    return "\n".join(lines)
 
 
 def status(session_key: str) -> str:

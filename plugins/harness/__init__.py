@@ -50,6 +50,9 @@ if HARNESS_ENABLED:
         q = str(arg or "").strip()
         key = f"private_{uid}" if not getattr(event, "group_id", None) else \
             f"group_{getattr(event, 'group_id')}#{uid}"
+        if q in ("自检", "测试", "doctor", "probe"):
+            # 桌面版用户最先卡这里：先看清缺 CLI 还是缺 token/URL
+            await _h.finish(harness.probe())
         if not q or q in ("状态", "status"):
             await _h.finish(harness.status(key))
         if q in ("新", "new", "重置", "reset"):

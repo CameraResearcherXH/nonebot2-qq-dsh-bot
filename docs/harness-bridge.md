@@ -122,7 +122,8 @@ HARNESS_OWNER_ONLY=1
 ## 8. 常见问题
 
 **Q：DSH 没装 / 命令写错？**
-`/h 测试` 会返回「harness 启动失败：…」或「退出码 N」，按提示改 `HARNESS_CLI`。
+先 `/h 自检`（看缺 CLI 还是缺 URL/token）；再 `/h 测试一下` 会真的跑一次，
+返回「找不到命令 / 退出码 N / HTTP 401」，按提示改 `HARNESS_CLI` / `HARNESS_URL`。
 
 **Q：能群聊里用吗？**
 可以，但建议只在私聊。群聊里别人也能看到 diff，且 `scope` 默认只挂私聊工具。
@@ -134,3 +135,50 @@ HARNESS_OWNER_ONLY=1
 **Q：能双向吗（DSH 主动发 QQ）？**
 本桥目前是 QQ → DSH → QQ 的请求/响应。要让 DSH 主动推送，需要 DSH 调本项目的
 HTTP 接口（可以后续加一个 `/api/harness/push`）。
+
+## 9. 桌面版（dsh-desktop）怎么接
+
+> 2026-11-24 用户提问：「用户用的 harness 是桌面版，他们拿不到 token、也拿不到我们要的内容吧？」
+> 结论：**对，大概率接不上**，桌面版和 CLI/HTTP 版不是一回事。
+
+本桥只认两种后端，都需要 DSH 主动暴露一个「非交互入口」：
+
+| 后端 | 需要 DSH 提供 | 桌面版通常有没有 |
+|---|---|---|
+| `cli` | PATH 里能跑 `dsh run --cwd … --prompt …` | ❌ 一般不装 CLI，只装 GUI |
+| `http` | 一个 HTTP 接口 + Bearer token | ❌ 登录 token 存在它自己配置里，不导出；接口多半也没开 |
+
+所以桌面版用户直接填 `HARNESS_BACKEND=cli` 会得到「找不到命令 `dsh`」，
+填 `http` 会卡在「没有 URL / token」。
+
+**先自检**（新版）：
+
+```text
+/h 自检
+```
+
+会逐项告诉你：CLI 命令找不找得到、`--help` 能不能跑、HTTP 地址通不通、token 配没配。
+
+### 桌面版用户的三条路（按推荐顺序）
+
+1. **不用 harness，用 self_tool（默认）**
+   `.env` 保持 `CODE_AGENT=self_tool`。她能写小脚本、查文件，只是不能改仓库代码。
+   对普通用户够用，也不会因为桌面版接不上而报错。
+
+2. **MCP 路线（推荐给「想让它改代码」的桌面版用户）**
+   让桌面版 DSH 直接打开这个仓库目录，靠 `AGENTS.md` + MCP 工具去读代码/跑命令。
+   QQ 侧不需要 harness 桥 —— 相当于「DSH 自己在电脑上改，QQ 只负责聊天」。
+   这也是 `docs/harness_stack_selection.md` 里 L1/L2 的方案（不自研 IDE，直接用 dsh-desktop）。
+
+3. **桌面版开了「本地 API / 命令行」再用本桥**
+   如果你们那版桌面版设置里能打开：
+   - 本地 HTTP API（给出端口和 token）→ `HARNESS_BACKEND=http` + `HARNESS_URL` + `HARNESS_TOKEN`；
+   - 或者安装 CLI 组件 → `HARNESS_BACKEND=cli` + `HARNESS_CLI`。
+   两个都没有，就只能走第 1/2 条。
+
+### 关于 token 和「我们要的内容」
+
+- **token**：本桥不生产 token，只是把 DSH 给的 token 放进 `Authorization: Bearer`。
+  桌面版不导出 token，就没有可填的东西 —— 这不是配置写错。
+- **内容**：本桥只把「人格/心情/好感/白月光/3 条记忆 + 需求」这 ≤800 字带过去（`HARNESS_CONTEXT=1`），
+  不传聊天记录。桌面版如果只能人工复制粘贴，那这些上下文得用户自己贴。
