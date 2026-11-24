@@ -1181,6 +1181,64 @@ def check_g40():
 
 
 
+def check_g41():
+    """称呼统一入口（2026-11-24）。
+
+    用户：「/叫我 /叫你 /叫他 人称混淆，写不进档案；LLM 的工具也写不稳，
+          反而偶尔写到注意里；他叫你什么可以硬逻辑匹配。」
+    """
+    bad = []
+    try:
+        cn = read("services/callname.py")
+    except Exception as e:
+        return False, f"读 services/callname.py 失败: {e}"
+    for k in ("set_bot_call", "set_user_call", "bot_names", "who_calls_me",
+              "normalize_pair", "parse_direction", "user_call_of"):
+        if k not in cn:
+            bad.append(f"callname 缺 {k}")
+    chat = read("plugins/chat/__init__.py")
+    for k in ("callname.set_bot_call", "callname.set_user_call",
+              "callname.normalize_pair", "callname.bot_names", "_tool_set_call"):
+        if k not in chat:
+            bad.append(f"chat 缺 {k}")
+    if 'name": "set_call"' not in chat:
+        bad.append("没注册 set_call 工具")
+    # profile_update 里要把「叫我/叫你」救回 callname，别写进 depth_note
+    if "从档案备注里救回称呼" not in chat:
+        bad.append("profile_update 还会把称呼写进备注")
+    return (not bad), "；".join(bad), "称呼唯一入口 + 群级硬匹配 + 方向纠错 + set_call 工具"
+
+
+def check_g42():
+    """回复前动态取数流水线（2026-11-24）。
+
+    用户：「默认固定只给 人设卡+tool+标签上下文+你叫他什么；
+           要回的那句再按顺序拉 心情→档案→总结→记忆→图书馆→是否回过。」
+    """
+    bad = []
+    try:
+        rp = read("services/reply_pipeline.py")
+    except Exception as e:
+        return False, f"读 services/reply_pipeline.py 失败: {e}"
+    for k in ("async def build", "PIPELINE_BUDGET", "图书馆", "已回", "白月光"):
+        if k not in rp:
+            bad.append(f"reply_pipeline 缺 {k}")
+    mj = read("services/mood_judge.py")
+    if "async def summarize" not in mj:
+        bad.append("mood_judge 缺 summarize（这段话的总结）")
+    llm = read("services/llm.py")
+    for k in ("staged_text", "_staged", "已用动态流水线取数"):
+        if k not in llm:
+            bad.append(f"llm 缺 {k}")
+    chat = read("plugins/chat/__init__.py")
+    if "reply_pipeline.build" not in chat:
+        bad.append("chat 没接流水线")
+    if "stats_text" not in chat:
+        bad.append("没接 /测函数 流水线")
+    return (not bad), "；".join(bad), "按消息动态取数（心情/档案/总结/记忆/图书馆/已回）+ 预算与降级"
+
+
+
 CHECKS = [
     ("C1", "破冰可独立执行", "behavior", check_c1),
     ("A1", "插话设置 tool context", "behavior", check_a1),
@@ -1228,6 +1286,8 @@ CHECKS = [
     ("G38", "记忆召回（干净 query / 人物兜底 / 已回标记）", "record", check_g38),
     ("G39", "@ 插队 / 唱歌去重", "record", check_g39),
     ("G40", "图书馆路由 / 识图原图 / 调用可见", "record", check_g40),
+    ("G41", "称呼统一入口（方向纠错 + 硬匹配）", "record", check_g41),
+    ("G42", "回复前动态取数流水线", "record", check_g42),
     ("F1", "BM25 降为加分", "recall", check_f1),
     ("F2", "recall 传 gid", "recall", check_f2),
     ("F2b", "remember 带群号", "recall", check_f2b),

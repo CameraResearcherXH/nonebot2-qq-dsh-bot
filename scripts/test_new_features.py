@@ -932,6 +932,51 @@ if _ac is not None:
     check("识图会报告「拿到的可能还是压缩图」",
           "可能还是压缩图" in _vis_src)
 
+
+# ---- 称呼统一入口 / 动态流水线（2026-11-24 第六轮）----
+try:
+    from services import callname as _cn
+    from pathlib import Path as _P
+
+    check("称呼：我叫你X = 她叫他",
+          ("user", "阿明") in _cn.parse_direction("我叫你阿明"),
+          str(_cn.parse_direction("我叫你阿明")))
+    check("称呼：你叫我X = 他叫她",
+          ("bot", "小鱼") in _cn.parse_direction("你叫我小鱼"),
+          str(_cn.parse_direction("你叫我小鱼")))
+    check("称呼：一句话两个方向都能抽",
+          set(_cn.parse_direction("我叫你阿明，你叫我小鱼")) ==
+          {("user", "阿明"), ("bot", "小鱼")},
+          str(_cn.parse_direction("我叫你阿明，你叫我小鱼")))
+
+    _bot, _user = _cn.normalize_pair("阿明", "小鱼", speaker_name="阿明",
+                                     bot_names={"小鱼", "小鲸鱼"})
+    check("称呼：模型写反了会自动换回来",
+          (_bot, _user) == ("小鱼", "阿明"), f"{_bot}/{_user}")
+    _bot2, _user2 = _cn.normalize_pair("小鱼", "阿明", speaker_name="阿明",
+                                       bot_names={"小鱼", "小鲸鱼"})
+    check("称呼：写对了不动", (_bot2, _user2) == ("小鱼", "阿明"), f"{_bot2}/{_user2}")
+
+    _old = _cn.FILE
+    _cn.FILE = _P(_tmp) / "callname.json"
+    _cn.reset()
+    _cn.set_bot_call("10001", "小鱼", "g1")
+    _cn.set_user_call("10001", "阿明", "g1")
+    check("称呼：群级索引能读回", "小鱼" in _cn.bot_names("g1"), str(_cn.bot_names("g1")))
+    check("称呼：喊这个名字能认出是谁起的名",
+          _cn.who_calls_me("小鱼你在吗", "g1") == "10001",
+          _cn.who_calls_me("小鱼你在吗", "g1"))
+    check("称呼：她叫他读回", _cn.user_call_of("10001", "g1") == "阿明",
+          _cn.user_call_of("10001", "g1"))
+    check("称呼：别的群不串", "小鱼" not in _cn.bot_names("g2"))
+    _cn.FILE = _old
+    _cn.reset()
+
+    from services import reply_pipeline as _rp
+    check("流水线：统计可读", "流水线" in _rp.stats_text(), _rp.stats_text())
+except Exception as _e:
+    check("称呼/流水线可导入", False, f"{type(_e).__name__}: {_e}")
+
 print("PASS %d / FAIL %d" % (len(PASS), len(FAIL)))
 if FAIL:
     print("失败：" + "、".join(FAIL))

@@ -3166,7 +3166,8 @@ async def t_timing():
     # 2026-11-22：13 处 —— 人设/规矩/现在时间/人称/收件人/现场/历史/状态/
     #            人物卡/表达/设定/动态规矩/post-rules（focus 卡去重后仍是 1 处）
     # 2026-11-23：+1 心情/好感 depth 注入、+1 白月光 → 上限 16。
-    check(S, _np <= 16, f"system 块数量受控（实际 {_np} 处 append）")
+    # 2026-11-24：+1 动态流水线块（staged_text）→ 上限 17。
+    check(S, _np <= 17, f"system 块数量受控（实际 {_np} 处 append）")
     check(S, '"content": _proto' in llm_src, "固定区仍合成 1 条 system（不吃 8 条）")
 
     check(S, "def _split_prompt" in llm_src, "_split_prompt 把背景/当前消息拆开")
@@ -4541,7 +4542,9 @@ async def t_static():
     check(S, "def _my_names" in cc, "有 _my_names（她的名字/外号）")
     check(S, "def _calls_me_by_name" in cc, "有 _calls_me_by_name")
     # /改名 存 bot_alias（用户给她起的名字），喊这个名字就等于 @ 她
-    check(S, "set_call_names(qq, bot_alias=new_name)" in cc, "/改名 存 bot_alias 到档案")
+    # 2026-11-24：改走 callname（群级索引 + 档案），不再是直接 set_call_names
+    check(S, "callname.set_bot_call(qq, new_name" in cc,
+          "/改名 存 bot_alias（走 callname）")
     check(S, 'get("bot_alias")' in cc, "_my_names 读 bot_alias")
     # 自然语言里的称呼由 DeepSeek 自己判断（[[CALL]]），不再靠正则猜句式
     check(S, "set_call_names(\n                        speaker_qq" in cc or "profiles.set_call_names" in cc,

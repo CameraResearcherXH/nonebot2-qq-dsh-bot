@@ -165,6 +165,72 @@ def recent_think(session_key: str, n: int = 3) -> list:
     return [x["text"] for x in recent_think_items(session_key, n)]
 
 
+_SUM_CACHE: dict = {}
+
+
+async def summarize(text: str, session_key: str = "") -> str:
+    """把「要回的那句话」压成一句事实（给记忆/图书馆当检索词）。
+
+    2026-11-24 用户流水线：心情 LLM 对这段话的总结 → 用总结查记忆 → 查图书馆。
+    所以这里只做**事实摘要**，不判心情、不写库：
+      「他问上次那家蛋糕店叫什么，顺带吐槽自己又胖了」
+    """
+    t = str(text or "").strip()
+    if not t:
+        return ""
+    key = f"{session_key}|{t[:60]}|{len(t)}"
+    hit = _SUM_CACHE.get(key)
+    if hit and time.time() - float(hit[1]) < 600:
+        return str(hit[0])
+
+    base, key_api = _base()
+    if not base or not key_api:
+        return ""
+    prompt = (
+        "把下面这段话压成一句客观事实（给检索用）：\n"
+        "· 不超过 40 字；\n"
+        "· 保留具体名词（人名/东西/地点/事件）；\n"
+        "· 不要评价、不要回答它、不要用「我」；\n"
+        "· 只输出这一句。\n\n"
+        f"{t[:600]}"
+    )
+    payload = {
+        "model": MODEL or "deepseek-chat",
+        "messages": [
+            {"role": "system", "content": "你只输出一句中文事实摘要，不加引号。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 80,
+    }
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=min(6.0, TIMEOUT)) as c:
+            r = await c.post(f"{base}/chat/completions",
+                             headers={"Authorization": f"Bearer {key_api}"},
+                             json=payload)
+            r.raise_for_status()
+            data = r.json()
+            try:
+                from . import llm_usage as _lu
+                _lu.record_from_response(data, purpose="judge",
+                                         provider="judge", model=MODEL or "deepseek-chat")
+            except Exception:
+                pass
+        txt = str(((((data or {}).get("choices") or [{}])[0]
+                    .get("message") or {}).get("content")) or "")
+        txt = re.sub(r"\s+", " ", txt).strip("「」『』“”\"'。，,")
+        if txt:
+            _SUM_CACHE[key] = (txt[:80], time.time())
+            if len(_SUM_CACHE) > 500:
+                for k in list(_SUM_CACHE)[:100]:
+                    _SUM_CACHE.pop(k, None)
+        return txt[:80]
+    except Exception as e:
+        logger.debug(f"[MOOD-JUDGE] 摘要失败: {type(e).__name__}: {e}")
+        return ""
+
+
 def _base() -> tuple:
     p = _resolve_provider("judge")
     return (p["base_url"].rstrip("/"), (p["api_key"] or "").strip())

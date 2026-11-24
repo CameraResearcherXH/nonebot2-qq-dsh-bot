@@ -30,7 +30,7 @@ CORE_SKILLS = frozenset({
     "pipeline.observe", "send.basic",
     # 工具级（对话/记忆/发送/安静/档案，关了她就不成立）
     "recall", "remember", "stay_silent", "send", "chat_switch",
-    "profile_card", "profile_update", "api_usage",
+    "profile_card", "profile_update", "api_usage", "set_call",
 })
 
 # 分组：/技能 关 搜索  → 关掉整组

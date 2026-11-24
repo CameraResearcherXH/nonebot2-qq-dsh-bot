@@ -11,6 +11,7 @@ from nonebot.adapters.onebot.v11 import (
 from nonebot.rule import Rule
 from nonebot.params import CommandArg
 
+from services import callname
 from services import llm as llm_mod
 from services import group_tuning
 from services.llm import call_llm, register_tool
@@ -1158,7 +1159,14 @@ def _my_names(session_key: str = "", speaker_qq: str = "") -> set:
         except Exception:
             pass
 
-    # ③ 只有「本人」的专属称呼：靠 speaker_qq 隔离，别人喊同一个词不会被唤醒
+    # ③ 群级称呼索引（callname）：这个群里「他叫她」的名字都算
+    try:
+        _gid_n = session_key.split("_", 1)[1] if str(session_key).startswith("group_") else ""
+        names |= set(callname.bot_names(_gid_n))
+    except Exception:
+        pass
+
+    # ④ 只有「本人」的专属称呼：靠 speaker_qq 隔离，别人喊同一个词不会被唤醒
     if speaker_qq:
         try:
             alias = str(profiles.get_profile(str(speaker_qq)).get("bot_alias") or "").strip()
@@ -2963,9 +2971,9 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
         await bot.send(event, "名字太长了，短一点吧。")
         return
     qq = str(event.user_id)
-    # bot_alias：这个人怎么叫她。写进档案后，喊这个名字就等于 @ 她
-    # （`_my_names` 会读 bot_alias），所以不用每次真 @。
-    profiles.set_call_names(qq, bot_alias=new_name)
+    _gid_cn = str(getattr(event, "group_id", "") or "")
+    # 2026-11-24：称呼统一走 callname（群级索引 + 档案），喊这个名字 = 在叫她
+    callname.set_bot_call(qq, new_name, _gid_cn)
     await bot.send(event, f"好呀，那你就叫我「{new_name}」吧～以后喊我就行。")
 
 
@@ -2983,9 +2991,10 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
         await bot.send(event, "名字太长了，短一点吧。")
         return
     qq = str(event.user_id)
+    _gid_cn2 = str(getattr(event, "group_id", "") or "")
     # 存 call_name（「她怎么叫他」），不覆盖 nickname —— nickname 是群名片，
     # 每轮都会被写回，存不住约定。
-    profiles.set_call_names(qq, call_name=new_name)
+    callname.set_user_call(qq, new_name, _gid_cn2)
     _clear_label(qq)
     await bot.send(event, f"（点头）好的，以后我就叫你「{new_name}」啦。")
 
@@ -4643,6 +4652,32 @@ async def _session_worker(bot: Bot, session_key: str):
             #    否则会出现「这段视频…这张图…」自相矛盾（2026-11-17）。
             _media_kind = llm_mod.media_kind_of(text_for_llm)
             _is_vision = (_media_kind == "image")
+
+            # ---------- 3.5) 动态取数流水线（2026-11-24） ----------
+            # 用户：「默认固定只给 人设卡 + tool + 标签处理过的上下文 + 你叫他什么；
+            #        要回的那句再按顺序拉 心情/档案/总结/记忆/图书馆/是否回过」。
+            # 这一段就是那个「按顺序拉」，产出交给 call_llm 当最高 recency 的数据块。
+            _staged = ""
+            try:
+                from services import reply_pipeline
+                _pl = await reply_pipeline.build(
+                    session_key=session_key,
+                    gid=str(getattr(ev, "group_id", "") or ""),
+                    text=text,
+                    speaker_qq=speaker_qq,
+                    speaker_name=speaker_name,
+                    seg_mids=[str(r.get("mid") or "")
+                              for r in (_seg_records or []) if r.get("mid")],
+                    replied_mids=_replied_mids_of(session_key),
+                    moon_target_qq=_moon_target_qq,
+                )
+                _staged = str((_pl or {}).get("text") or "")
+                if (_pl or {}).get("replied"):
+                    logger.info(f"[PIPE] {session_key} 这条已经回过 → 只补一句")
+            except Exception as _pe:
+                logger.debug(f"[PIPE] 流水线失败（走静态拼装）: "
+                             f"{type(_pe).__name__}: {_pe}")
+
             # 私聊先挂「正在输入」，等模型回来再取消（失败静默）
             await _typing(bot, ev, True)
             _t_llm = time.monotonic()
@@ -4652,6 +4687,7 @@ async def _session_worker(bot: Bot, session_key: str):
                     speaker_qq=speaker_qq, speaker_name=speaker_name,
                     is_vision=_is_vision, media_kind=_media_kind,
                     moon_target_qq=_moon_target_qq,
+                    staged_text=_staged,
                 )
             finally:
                 _lat["llm"] = time.monotonic() - _t_llm
@@ -4759,9 +4795,16 @@ async def _session_worker(bot: Bot, session_key: str):
                         continue
                     # ⚠️ 用 call_name 而不是 nickname：nickname 每轮都会被群名片
                     #    覆盖写回（worker 第 1 步），存不住聊出来的称呼。
-                    profiles.set_call_names(
-                        speaker_qq, call_name=user_name, bot_alias=bot_alias
-                    )
+                    # 2026-11-24：模型经常把两个方向写反（人称混淆）→ 先纠正
+                    bot_alias, user_name = callname.normalize_pair(
+                        bot_alias, user_name,
+                        speaker_name=speaker_name,
+                        bot_names=_my_names(session_key, speaker_qq))
+                    _gid_cn3 = str(getattr(ev, "group_id", "") or "")
+                    if bot_alias:
+                        callname.set_bot_call(speaker_qq, bot_alias, _gid_cn3)
+                    if user_name:
+                        callname.set_user_call(speaker_qq, user_name, _gid_cn3)
                     # 称呼变了 → 群聊标签缓存作废，否则上下文里还是旧名字
                     if user_name:
                         _clear_label(speaker_qq)
@@ -6564,6 +6607,17 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
             _msg += MessageSegment.image(f"file://{Path(_p).resolve()}")
         await _test_fn.finish(_msg)
 
+    if what.startswith(("称呼", "call", "名字")):
+        # /测函数 称呼 —— 这个群/全局的称呼索引到底写进去没有
+        _cg = _tgt_gid or (
+            str(event.group_id) if isinstance(event, GroupMessageEvent) else "")
+        await _test_fn.finish(callname.status(_tgt_qq or "", _cg))
+
+    if what.startswith(("流水线", "pipeline", "取数")):
+        # /测函数 流水线 —— 每一步耗时 + 上次拉了哪些块
+        from services import reply_pipeline as _rpl
+        await _test_fn.finish("▍动态取数流水线\n" + _rpl.stats_text())
+
     if what.startswith(("记忆", "图书馆", "memory", "library")):
         # /测函数 记忆 —— 召回/图书馆到底有没有在跑（用户 2026-11-24）
         from services import prompt_builder as _pb2
@@ -7776,8 +7830,22 @@ async def _tool_profile_update(args: dict) -> str:
     fields = {}
     for k in ("identity", "personality", "scenario", "depth_note"):
         v = str(args.get(k) or "").strip()
-        if v:
-            fields[k] = v
+        if not v:
+            continue
+        # 2026-11-24 用户：「偶尔多出来写到注意里」——
+        # 称呼不是「备注」，看到「叫我/叫你/称呼」就转给 callname，别塞进 depth_note。
+        if k in ("depth_note", "identity") and re.search(r"(叫我|叫你|称呼)", v):
+            _pairs = callname.parse_direction(v)
+            _gid_pu = str(getattr(llm_mod.TOOL_CTX.get("event"), "group_id", "") or "")
+            for _dir, _nm in _pairs:
+                if _dir == "user":
+                    callname.set_user_call(target, _nm, _gid_pu)
+                else:
+                    callname.set_bot_call(target, _nm, _gid_pu)
+            if _pairs:
+                logger.info(f"[CALLNAME] 从档案备注里救回称呼 {_pairs}（{target}）")
+                continue
+        fields[k] = v
     ex = str(args.get("mes_example") or "").strip()
     if ex:
         fields["mes_example"] = ex
@@ -7796,6 +7864,29 @@ async def _tool_profile_update(args: dict) -> str:
         return f"写档案失败：{type(e).__name__}"
     return (f"写进 {profiles.call_of(target, target)} 的档案了"
             + (f"（你在他面前：{stance}）" if stance else ""))
+
+
+async def _tool_set_call(args: dict) -> str:
+    """设置称呼（方向显式，不再靠模型自己分你我）。"""
+    who = str(args.get("who") or "").strip().lower()
+    name = str(args.get("name") or "").strip()
+    if who not in ("user", "bot") or not name:
+        return "要说明是哪个方向：who=user（你怎么叫他）/ bot（他怎么叫你），还要给 name"
+    ev = llm_mod.TOOL_CTX.get("event")
+    gid = str(getattr(ev, "group_id", "") or "")
+    speaker = str(llm_mod.TOOL_CTX.get("speaker_qq") or "")
+    target = speaker
+    tname = str(args.get("target") or "").strip()
+    if tname:
+        try:
+            target = await _resolve_target_qq(tname) or speaker
+        except Exception:
+            target = speaker
+    if who == "bot":
+        callname.set_bot_call(target, name, gid)
+        return f"记下了：他叫你「{name}」（{gid or '全局'}）"
+    callname.set_user_call(target, name, gid)
+    return f"记下了：你叫他「{name}」（{gid or '全局'}）"
 
 
 async def _tool_lore_add(args: dict) -> str:
@@ -8412,6 +8503,33 @@ register_tool(
         },
     },
     _tool_profile_update,
+    scope=("private", "group"),
+)
+
+register_tool(
+    {
+        "type": "function",
+        "function": {
+            "name": "set_call",
+            "description": (
+                "记下你俩的称呼（这个群里生效）。who=user 表示「你该怎么叫他」，"
+                "who=bot 表示「他该怎么叫你」。"
+                "⚠️ 用户说「我叫你 X」→ who=bot、name=X；"
+                "用户说「你叫我 Y」→ who=user、name=Y。别写反。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "who": {"type": "string", "enum": ["user", "bot"]},
+                    "name": {"type": "string", "description": "称呼，12 字以内"},
+                    "target": {"type": "string",
+                               "description": "给谁设（名字/@/QQ）；不填=当前说话人"},
+                },
+                "required": ["who", "name"],
+            },
+        },
+    },
+    _tool_set_call,
     scope=("private", "group"),
 )
 

@@ -2593,8 +2593,11 @@ async def call_llm(
     no_tools: bool = False,
     no_library: bool = False,
     moon_target_qq: str = "",
+    staged_text: str = "",
 ) -> tuple:
     logger.info(f"[LLM] 开始生成回复 key={key}")
+    # 动态流水线（reply_pipeline）产出的数据块；空 = 走原来的静态拼装
+    _staged = str(staged_text or "").strip()
     if BOT_MODE == "mock":
         return MOCK_REPLY, False
 
@@ -2880,10 +2883,18 @@ async def call_llm(
         # 先只查一次记忆，拿到「到底搜到几条」再决定要不要问图书馆。
         # ⚠️ 以前这里用 bool(packet["memory_index"]) 判断 —— 那个块里只要有一行
         #    「当前说话人」就非空，于是「本地没搜到 → 问图书馆」几乎永远走不到。
-        _hits = recall_hits(
-            key, text, speaker_qq,
-            limit=5, max_age_days=_max_age,
-        )
+        # 2026-11-24：如果调用方已经跑过动态流水线（reply_pipeline），
+        # 这里就不再重复召回/查图书馆 —— 流水线已经把记忆、图书馆、
+        # 心情、档案都按「这句消息」取过了。
+        _staged = str(staged_text or "").strip()
+        if _staged:
+            _hits = []
+            _max_age = _max_age
+        else:
+            _hits = recall_hits(
+                key, text, speaker_qq,
+                limit=5, max_age_days=_max_age,
+            )
         _addressed_flag = bool(TOOL_CTX.get("addressed", True))
         _scan_text = "\n".join(str(x) for x in (group_context or [])[-6:]) + "\n" + str(text or "")
         packet = build_packet(
@@ -2893,13 +2904,16 @@ async def call_llm(
             speaker_name=speaker_name,
             max_age_days=_max_age,
             hits=_hits,
+            memory_limit=(0 if _staged else 5),
             gid=_gid,
             addressed=_addressed_flag,
             scan_text=_scan_text,
         )
 
         library_text = ""
-        if no_library:
+        if _staged:
+            logger.info("[LLM] 🧩 已用动态流水线取数 → 跳过静态图书馆")
+        elif no_library:
             logger.info("[LLM] 📚 跳过图书馆（调用方指定 no_library，如自检）")
         elif _need_library(
                 text, key,
@@ -3037,7 +3051,7 @@ async def call_llm(
         #    排在通用表达学习之后（更具体、recency 更高）。
         try:
             from . import white_moon
-            _moon_tq = str(moon_target_qq or "").strip()
+            _moon_tq = "" if _staged else str(moon_target_qq or "").strip()
             _moon_tn = ""
             if _moon_tq:
                 try:
@@ -3059,12 +3073,18 @@ async def call_llm(
         if _dyn_proto:
             msgs.append({"role": "system", "content": _dyn_proto})
 
-        # 👇 心情 / 好感放到 depth 区最靠后的位置（2026-11-23 用户：
-        #    「心情和好感并没有关注太多」）。relation = 长期底色，mood = 此刻状态；
-        #    mood 放最后，紧挨 post_rules 和当前消息，recency 最高。
-        for _key in ("relation", "mood"):
-            if packet.get(_key):
-                msgs.append({"role": "system", "content": packet[_key]})
+        # 👇 2026-11-24 动态流水线：它按「这句消息」取的心情/档案/好感/记忆/图书馆/
+        #    已回标记/白月光，全在这一个块里，放在最靠后的位置（recency 最高）。
+        #    有它就不再注入静态的 relation / mood（避免同一件事说两遍）。
+        if _staged:
+            msgs.append({"role": "system", "content": _staged})
+        else:
+            # 👇 心情 / 好感放到 depth 区最靠后的位置（2026-11-23 用户：
+            #    「心情和好感并没有关注太多」）。relation = 长期底色，mood = 此刻状态；
+            #    mood 放最后，紧挨 post_rules 和当前消息，recency 最高。
+            for _key in ("relation", "mood"):
+                if packet.get(_key):
+                    msgs.append({"role": "system", "content": packet[_key]})
 
         # 👇 post-history：最后一句硬提醒（recency 权重最高，比写在开头有效）
         _post = _post_rules(key, speaker_qq, _gid)

@@ -203,6 +203,8 @@ DEFAULTS = {
 
     # ---------- 模型调用 ----------
     'LIBRARY_COOLDOWN': 600.0,
+    # 回复前「动态取数」流水线的总预算（秒）：到点就带着已拿到的部分回复
+    'PIPELINE_BUDGET': 7.0,
 
     # ---------- 用量监测 ----------
     'LLM_DAILY_BUDGET': 0.0,
@@ -579,6 +581,7 @@ DOCS = {
     'HIST_TOTAL_BUDGET': '历史总字数预算',
     'IMAGE_DEDUP_HOURS': '群友：「这肥鱼魔了」。60 秒 DEDUP 拦不住这种跨 20 分钟的复读。',
     'LIBRARY_COOLDOWN': '同一梗/素材的冷却时间（秒）',
+    'PIPELINE_BUDGET': '回复前动态取数（心情/档案/记忆/图书馆）的总预算（秒）',
     'LLM_DAILY_BUDGET': '每日 token 预算（0 = 不告警）',
     'LLM_TRACE_KEEP_DAYS': '模型调用 trace 保留天数',
     'LLM_TRACE_MAX_CHARS': '单条 trace 最大字符数',
@@ -836,6 +839,7 @@ FILES = {
     'HIST_TOTAL_BUDGET': 'services/llm.py',
     'IMAGE_DEDUP_HOURS': 'plugins/vision_agent/__init__.py',
     'LIBRARY_COOLDOWN': 'services/llm.py',
+    'PIPELINE_BUDGET': 'services/reply_pipeline.py',
     'LLM_DAILY_BUDGET': 'services/llm_usage.py',
     'LLM_TRACE_KEEP_DAYS': 'services/llm.py',
     'LLM_TRACE_MAX_CHARS': 'services/llm.py',

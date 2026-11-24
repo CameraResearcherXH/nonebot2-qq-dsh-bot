@@ -202,6 +202,9 @@ async def recall(
     if time.time() < _LIBRARY_DEAD_UNTIL:
         return empty_recall()
     STATS["calls"] = int(STATS.get("calls") or 0) + 1
+    # 先假定「这次可能失败」：调用方（流水线）超时会把协程直接取消，
+    # 那样下面设置暂停的代码永远跑不到 → 每条消息都白等。先占位，成功再清掉。
+    _LIBRARY_DEAD_UNTIL = time.time() + 600
 
     # 优先：结构化端点（第一次 404 之后就不再打）
     data = None
@@ -231,11 +234,12 @@ async def recall(
 
     # 兜底 1：/api/agent/smart-query（RAG v3 上有，实测 3~13s）
     # ⚠️ 它在回复关键路径上，超时必须收紧：实测复杂问句要 12s+，
-    #    所以这里最多等 6s；超时就当「图书馆暂时不可用」，10 分钟内不再试。
+    #    所以这里最多等 2.5s；超时就当「图书馆暂时不可用」，10 分钟内不再试。
+    #    （必须先于流水线的 3s 兜底超时，否则暂停标记永远设不上，每条消息白等 3s。）
     data = await _post_json(
         f"{AGENT_BASE_URL}{SMART_QUERY_ENDPOINT}",
         {"question": _RECALL_PROMPT.format(q=query)},
-        min(6.0, to + 3),
+        min(2.5, to + 1),
     )
     if data is None:
         _LIBRARY_DEAD_UNTIL = time.time() + 600
@@ -253,6 +257,7 @@ async def recall(
 
     out = _normalize_recall(data, "smart")
     if out["facts"]:
+        _LIBRARY_DEAD_UNTIL = 0.0
         STATS["ok"] = int(STATS.get("ok") or 0) + 1
         logger.info(f"[AGENT] 🧠 recall 走 smart-query，拿到 {len(out['facts'])} 条")
         return out

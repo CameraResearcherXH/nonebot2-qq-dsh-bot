@@ -199,9 +199,24 @@ def _texts_of(gid: str, qq: str) -> list:
     return out[-80:]
 
 
+_STYLE_NOISE = re.compile(
+    r"〔[^〕]{0,200}〕|<reply:[^>]*>|<at:[^>]*>|\[\[.*?\]\]|⭐|#\d+|"
+    r"\[表情[^\]]*\]|\[图片\]|\[语音\]|\[视频\]")
+
+
+def _clean_style_text(t: str) -> str:
+    """去掉协议残留再学风格。
+
+    2026-11-24 真机：白月光画像把 `〔引`、`引用` 当成了「常挂嘴边的口头禅」——
+    那其实是我们自己的引用标记漏进历史里。学风格前必须先洗掉。
+    """
+    return _STYLE_NOISE.sub("", str(t or "")).strip()
+
+
 def _style_from_texts(texts: list) -> str:
     """不调模型的轻量风格画像：长短 / 标点 / 表情 / 口头禅。"""
-    texts = [str(t or "").strip() for t in (texts or []) if str(t or "").strip()]
+    texts = [_clean_style_text(t) for t in (texts or [])]
+    texts = [t for t in texts if t]
     if len(texts) < 5:
         return ""
     n = len(texts)
@@ -240,6 +255,9 @@ def _style_from_texts(texts: list) -> str:
         parts.append("经常不打标点")
     if emoji >= 0.2:
         parts.append("爱带表情")
+    # 口头禅里再挡一道：引用/回复/协议词不是说话风格
+    _bad = ("引用", "回复", "消息", "reply", "〔", "〕", "⭐")
+    phrases = [x for x in phrases if x and not any(b in x for b in _bad)]
     if phrases:
         parts.append("常挂嘴边：" + "、".join(f"「{x}」" for x in phrases))
     return "、".join(parts) or "说话比较随意"
