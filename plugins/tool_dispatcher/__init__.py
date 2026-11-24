@@ -365,8 +365,15 @@ async def _on_bot_connect_resume(bot):
     asyncio.create_task(_periodic_save_tasks())
     n = 0
     for tid, t in list(STATUS["tasks"].items()):
+        st = t.get("status")
+        # ⚠️ 已完成的**不补发**：原流程在重启前已经发过了，
+        #    再补一次就是重复音频（2026-11-24 实测差点把《喜帖街》又发一遍）。
+        #    只有 pending / processing 才继续等。
+        if st == "completed":
+            STATUS["tasks"].pop(tid, None)
+            continue
         d = t.get("deliver") or {}
-        if not d or t.get("status") in ("failed", "timeout"):
+        if not d or st in ("failed", "timeout"):
             continue
         asyncio.create_task(_watch_and_deliver(bot, tid, d, str(t.get("type") or "")))
         n += 1

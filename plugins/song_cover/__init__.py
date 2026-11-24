@@ -381,10 +381,25 @@ def _spawn(coro):
     return t
 
 
-async def _expire_pending(user_id: int, seconds: float):
+def _pkey(event: MessageEvent) -> str:
+    """整首请求按**会话**存，不按人。
+
+    2026-11-24 用户：「两个音频 + 连续两条消息」。
+    根因之一：提示是发到群里的，但 `PENDING_FULL` 只按「点歌那个人」的 user_id 存；
+    别人回「要」匹配不上 → 落到聊天 → 她又调了一次 sing → 同一首重唱一遍。
+    """
+    gid = getattr(event, "group_id", None)
+    return f"group_{gid}" if gid else f"private_{getattr(event, 'user_id', '')}"
+
+
+# 群里只认明确的「要」，别把日常的「好 / 行 / 1」也拦下来
+_YES_WORDS_GROUP = {"要", "整首", "要整首", "要听", "听整首"}
+
+
+async def _expire_pending(key: str, seconds: float):
     """到点自动清掉没回应的整首请求，别让文件一直躺在磁盘上。"""
     await asyncio.sleep(seconds)
-    item = PENDING_FULL.pop(user_id, None)
+    item = PENDING_FULL.pop(key, None)
     if not item:
         return
     try:
@@ -394,12 +409,12 @@ async def _expire_pending(user_id: int, seconds: float):
         pass
 
 
-def _pending_item(user_id: int):
-    item = PENDING_FULL.get(user_id)
+def _pending_item(key: str):
+    item = PENDING_FULL.get(key)
     if not item:
         return None
     if time.time() - item["ts"] > FULL_TTL:
-        PENDING_FULL.pop(user_id, None)
+        PENDING_FULL.pop(key, None)
         try:
             Path(item["path"]).unlink(missing_ok=True)
         except Exception:
@@ -409,9 +424,13 @@ def _pending_item(user_id: int):
 
 
 async def _is_full_reply(event: MessageEvent) -> bool:
-    if event.user_id not in PENDING_FULL:
+    key = _pkey(event)
+    if key not in PENDING_FULL:
         return False
-    return event.get_plaintext().strip().lower() in _ALL_WORDS
+    txt = event.get_plaintext().strip().lower()
+    if getattr(event, "group_id", None):
+        return txt in (_YES_WORDS_GROUP | _NO_WORDS)
+    return txt in _ALL_WORDS
 
 
 # priority=1：比所有对话/指令都高，问完立刻拦，避免「要」被别的插件吃掉
@@ -420,8 +439,9 @@ full_reply = on_message(rule=Rule(_is_full_reply), priority=1, block=True)
 
 @full_reply.handle()
 async def _(bot: Bot, event: MessageEvent):
-    item = _pending_item(event.user_id)
-    PENDING_FULL.pop(event.user_id, None)
+    key = _pkey(event)
+    item = _pending_item(key)
+    PENDING_FULL.pop(key, None)
     if not item:
         await full_reply.finish()
 
@@ -440,8 +460,13 @@ async def _(bot: Bot, event: MessageEvent):
             "file", {"file": f"file://{os.path.abspath(p)}", "name": p.name}
         ))
     except Exception as e:
-        logger.warning(f"[SONG] 整首文件发送失败: {type(e).__name__}: {e}")
-        await full_reply.finish("整首太大发不出去……你先听短的算了。")
+        # 2026-11-24：文件其实常已进队列，只是 NapCat 等 ACK 超时。
+        # 以前一律当失败，还会补一句「整首太大发不出去」→ 群里看着像没发出去。
+        if _is_ack_timeout(e):
+            logger.info("[SONG] 整首文件已发出（ACK 超时，按成功处理）")
+        else:
+            logger.warning(f"[SONG] 整首文件发送失败: {type(e).__name__}: {e}")
+            await full_reply.finish("整首太大发不出去……你先听短的算了。")
     try:
         p.unlink(missing_ok=True)
     except Exception:
@@ -1038,13 +1063,14 @@ async def process_cover_task(bot: Bot, event: MessageEvent, song_name: str,
         if trimmed_path or full_path:
             # 完整版留给用户，语音版发完就删
             keep = full_path if (full_path and full_path.exists()) else final_path
-            PENDING_FULL[event.user_id] = {
+            _pk = _pkey(event)
+            PENDING_FULL[_pk] = {
                 "path": str(keep),
                 "title": res.get("title") or "",
                 "ts": time.time(),
                 "with_inst": with_inst,
             }
-            _spawn(_expire_pending(event.user_id, FULL_TTL))
+            _spawn(_expire_pending(_pk, FULL_TTL))
             try:
                 await bot.send(
                     event,

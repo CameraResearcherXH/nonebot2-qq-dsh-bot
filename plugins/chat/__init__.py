@@ -8113,7 +8113,11 @@ async def _tool_sing(args: dict) -> str:
     #      · 同一首歌 15 分钟内点过 → 不重复唱。
     _qq_s = str(llm_mod.TOOL_CTX.get("speaker_qq") or "")
     _gid_s = str(getattr(ev, "group_id", "") or "")
-    _sing_key = f"{_gid_s or 'private'}#{_qq_s}"
+    # ⚠️ 2026-11-24 用户：「两个音频 + 连续两条消息」——同一首《喜帖街》被唱了三遍。
+    #    以前 key 是「会话#人」：三个人分别点同一首 → 各跑一次，成品完全一样。
+    #    现在群里按「群#歌名」去重（私聊仍按人），同一首 15 分钟内只跑一次。
+    _sing_key = (f"group_song#{_gid_s}#{song}" if _gid_s
+                 else f"private#{_qq_s}#{song}")
     _now_s = time.time()
     _prev_s = _SING_RECENT.get(_sing_key)
     if _prev_s:
