@@ -50,6 +50,8 @@ scripts/.xray_runtime/
 *.tar
 *.tar.gz
 *.7z
+# 例外：rollpig 表情卡片渲染要用的资源（5.4MB，缺了卡片上的 emoji 会丢）
+!plugins/third/nonebot_plugin_rollpig_plus/resource/emoji/google-emoji.zip
 
 # ============================================================
 # 编辑器 / AI 助手本地数据
