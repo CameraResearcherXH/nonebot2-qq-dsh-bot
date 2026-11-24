@@ -1154,6 +1154,33 @@ def check_g39():
 
 
 
+def check_g40():
+    """图书馆路由 + 识图原图 + 调用可见性（2026-11-24）。
+
+    用户：「napcat 已登录，我需要查看对图书馆和记忆的调用。这两项感觉她根本不用。」
+    """
+    bad = []
+    ac = read("services/agent_client.py")
+    for k in ("SMART_QUERY_ENDPOINT", "_looks_like_chat", "stats_text",
+              "_RECALL_ENDPOINT_MISSING"):
+        if k not in ac:
+            bad.append(f"agent_client 缺 {k}")
+    if "/api/agent/smart-query" not in ac:
+        bad.append("agent_client 没有 smart-query 兜底")
+    pb = read("services/prompt_builder.py")
+    if "RECALL_STATS" not in pb or "recall_stats_text" not in pb:
+        bad.append("prompt_builder 没有召回统计")
+    vis = read("plugins/vision_agent/__init__.py")
+    for k in ("优先原图", "get_image", "可能还是压缩图"):
+        if k not in vis:
+            bad.append(f"vision_agent 缺 {k}")
+    chat = read("plugins/chat/__init__.py")
+    if "recall_stats_text" not in chat or "stats_text" not in chat:
+        bad.append("/测函数 记忆 没接统计")
+    return (not bad), "；".join(bad), "图书馆走真实路由 + 语料不匹配自动暂停；识图多源取原图；/测函数 记忆"
+
+
+
 CHECKS = [
     ("C1", "破冰可独立执行", "behavior", check_c1),
     ("A1", "插话设置 tool context", "behavior", check_a1),
@@ -1200,6 +1227,7 @@ CHECKS = [
     ("G37", "引用精确到消息号 / 同一件事不回两遍", "record", check_g37),
     ("G38", "记忆召回（干净 query / 人物兜底 / 已回标记）", "record", check_g38),
     ("G39", "@ 插队 / 唱歌去重", "record", check_g39),
+    ("G40", "图书馆路由 / 识图原图 / 调用可见", "record", check_g40),
     ("F1", "BM25 降为加分", "recall", check_f1),
     ("F2", "recall 传 gid", "recall", check_f2),
     ("F2b", "remember 带群号", "recall", check_f2b),

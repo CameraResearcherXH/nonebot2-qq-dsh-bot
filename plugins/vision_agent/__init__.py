@@ -172,42 +172,77 @@ def _compress(image_bytes: bytes, max_side: int = 0) -> tuple:
         return image_bytes, _sniff_mime(image_bytes)
 
 
-async def _fetch_image_bytes(bot: Bot, event: MessageEvent, seg) -> bytes | None:
-    """把图片段变成 bytes。依次尝试：url → NapCat get_image → 本地 file。"""
-    img_url = (seg.data.get("url") or "").strip()
-    if img_url:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    img_url, timeout=aiohttp.ClientTimeout(total=20)
-                ) as resp:
-                    if resp.status == 200:
-                        return await resp.read()
-                    logger.warning(f"⚠️ [VISION] 图片下载 HTTP {resp.status}")
-        except Exception as e:
-            logger.warning(f"⚠️ [VISION] 图片 url 下载失败: {type(e).__name__}: {e}")
+async def _download(url: str, timeout: float = 20) -> bytes:
+    """下载一张图；失败返回 b""。"""
+    url = str(url or "").strip()
+    if not url:
+        return b""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=timeout)
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.read()
+                logger.warning(f"⚠️ [VISION] 图片下载 HTTP {resp.status}: {url[:80]}")
+    except Exception as e:
+        logger.warning(f"⚠️ [VISION] 图片下载失败: {type(e).__name__}: {e}")
+    return b""
 
-    # 兜底 1：问 NapCat 要图片真实地址
+
+async def _fetch_image_bytes(bot: Bot, event: MessageEvent, seg) -> bytes | None:
+    """把图片段变成 bytes —— **优先原图**。
+
+    2026-11-24 用户：「她说图片糊很可能是 QQ 压缩，没有查看原图再下载。」
+    真机确实如此：QQ 消息段里的 `url` 经常是**预览/压缩版**（`term=2`），
+    原图要问 NapCat `get_image`（它缓存的是原文件）。
+
+    做法：把所有能拿到的候选都下一遍，**取字节数最大的那份**；
+    如果消息段自报的 `file_size` 比我们拿到的大很多，日志里直接标出来。
+    """
+    cands = []          # [(来源, bytes)]
+
+    # ① NapCat get_image：url + 本地缓存文件（缓存的是原图）
     file_id = seg.data.get("file") or seg.data.get("file_id")
+    real_url = ""
     if file_id:
         try:
-            res = await bot.call_api("get_image", file=file_id)
-            real_url = (res or {}).get("url") or ""
-            local_path = (res or {}).get("file") or ""
-            if real_url:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        real_url, timeout=aiohttp.ClientTimeout(total=20)
-                    ) as resp:
-                        if resp.status == 200:
-                            return await resp.read()
-            # 兜底 2：NapCat 就在本机/同容器，直接读文件
+            res = await bot.call_api("get_image", file=file_id) or {}
+            real_url = str(res.get("url") or "")
+            local_path = str(res.get("file") or "")
             if local_path and os.path.exists(local_path):
-                return Path(local_path).read_bytes()
+                try:
+                    cands.append(("napcat本地", Path(local_path).read_bytes()))
+                except Exception as e:
+                    logger.debug(f"[VISION] 读 NapCat 本地文件失败: {e}")
         except Exception as e:
-            logger.warning(f"⚠️ [VISION] get_image 兜底失败: {type(e).__name__}: {e}")
+            logger.warning(f"⚠️ [VISION] get_image 失败: {type(e).__name__}: {e}")
 
-    return None
+    # ② 两个 url 都试（NapCat 返回的通常是原图地址）
+    for tag, u in (("get_image_url", real_url),
+                   ("seg_url", str(seg.data.get("url") or ""))):
+        if u:
+            data = await _download(u)
+            if data:
+                cands.append((tag, data))
+
+    if not cands:
+        return None
+
+    tag, best = max(cands, key=lambda x: len(x[1]))
+    try:
+        declared = int(seg.data.get("file_size") or 0)
+    except Exception:
+        declared = 0
+    detail = "｜".join(f"{t}={len(d) // 1024}KB" for t, d in cands)
+    if declared and len(best) * 1.15 < declared:
+        logger.warning(
+            f"[VISION] 拿到的可能还是压缩图：原图报 {declared // 1024}KB，"
+            f"最大只有 {len(best) // 1024}KB（{detail}）")
+    else:
+        logger.info(f"[VISION] 取图 {len(best) // 1024}KB（{tag}；{detail}）")
+    return best
+
 
 # 被动识图冷却（识别成本，跟"要不要开口"是两回事）
 VISION_COOLDOWN = tuning.f("VISION_COOLDOWN")

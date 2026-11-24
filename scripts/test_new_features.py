@@ -900,6 +900,36 @@ try:
 except Exception as _e:
     check("插队/唱歌可读源码", False, f"{type(_e).__name__}: {_e}")
 
+
+# ---- 图书馆路由 / 原图 / 调用统计（2026-11-24 第五轮）----
+try:
+    from services import agent_client as _ac
+except Exception as _e:
+    # 本地可能没装 aiohttp（容器里有）→ 跳过，别算失败
+    print(f"SKIP 图书馆/识图（{type(_e).__name__}: {_e}）")
+    _ac = None
+
+if _ac is not None:
+    check("图书馆：宋词语料会被判成「不是聊天」",
+          _ac._looks_like_chat({"answer": "参考来源: /app/documents/poet.song.rank.1.json"})
+          is False)
+    check("图书馆：聊天语料放行",
+          _ac._looks_like_chat({"answer": "阿明: 上次那个蛋糕是街角那家"}) is True)
+    check("图书馆：有 smart-query 兜底路由",
+          _ac.SMART_QUERY_ENDPOINT.endswith("/api/agent/smart-query"))
+    check("图书馆：统计可读", "图书馆" in _ac.stats_text(), _ac.stats_text())
+    check("图书馆：recall 404 只试一次", hasattr(_ac, "_RECALL_ENDPOINT_MISSING"))
+
+    from services import prompt_builder as _pb3
+    check("记忆召回统计可读", "记忆召回" in _pb3.recall_stats_text())
+
+    _vis_src = (ROOT / "plugins" / "vision_agent" / "__init__.py").read_text(
+        encoding="utf-8", errors="ignore")
+    check("识图优先原图（多源取最大）",
+          "优先原图" in _vis_src and "max(cands" in _vis_src)
+    check("识图会报告「拿到的可能还是压缩图」",
+          "可能还是压缩图" in _vis_src)
+
 print("PASS %d / FAIL %d" % (len(PASS), len(FAIL)))
 if FAIL:
     print("失败：" + "、".join(FAIL))

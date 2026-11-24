@@ -2901,9 +2901,14 @@ async def call_llm(
         library_text = ""
         if no_library:
             logger.info("[LLM] 📚 跳过图书馆（调用方指定 no_library，如自检）")
-        elif _need_library(text, key, len(_hits) > 0):
+        elif _need_library(
+                text, key,
+                # ⚠️ 2026-11-24：`recent_about` 的兜底命中不算「本地搜到了」——
+                #    否则每条消息都 local_hit=True，图书馆几乎永远不触发。
+                len([h for h in _hits if not h.get("fallback")]) > 0):
             logger.info(
-                f"[LLM] 📚 询问图书馆（算力机 Agent，久远记忆；本地命中 {len(_hits)} 条）…"
+                f"[LLM] 📚 询问图书馆（算力机 Agent，久远记忆；"
+                f"本地真命中 {len([h for h in _hits if not h.get('fallback')])} 条）…"
             )
             try:
                 recall_data = await fetch_agent_recall(

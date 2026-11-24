@@ -962,8 +962,13 @@ async def t_agent():
     check(S, r == AC.empty_recall(), "两条通道都挂 → 返回空模板且不抛异常")
     check(S, await AC.recall("") == AC.empty_recall(), "空 query 直接返回空模板")
     AC._post_json = orig
+    # 失败会让「图书馆暂停」，后面的用例先复位（否则全是假失败）
+    AC._LIBRARY_DEAD_UNTIL = 0.0
 
-    # 结构化通道优先
+    # 结构化通道优先（前面的失败用例会把「端点不存在 / 暂停」标记置上，先复位）
+    AC._RECALL_ENDPOINT_MISSING = False
+    AC._LIBRARY_DEAD_UNTIL = 0.0
+
     async def _fake(url, payload, timeout):
         if url.endswith(AC.RECALL_ENDPOINT):
             return {"facts": ["来自 recall"]}
@@ -971,14 +976,29 @@ async def t_agent():
     AC._post_json = _fake
     r = await AC.recall("测试")
     check(S, r["source"] == "recall" and r["facts"] == ["来自 recall"], "优先走结构化端点")
-    # recall 端点 404 → 退回 query
+    # recall 端点 404 → 先退 smart-query（RAG v3 的真实路由）
+    AC._RECALL_ENDPOINT_MISSING = False
+    AC._LIBRARY_DEAD_UNTIL = 0.0
+
     async def _fake2(url, payload, timeout):
         if url.endswith(AC.RECALL_ENDPOINT):
             return None
         return {"success": True, "answer": "来自 query"}
     AC._post_json = _fake2
     r = await AC.recall("测试")
-    check(S, r["source"] == "query" and r["facts"] == ["来自 query"], "结构化端点不可用 → 退回 /query")
+    check(S, r["source"] in ("smart", "query") and r["facts"] == ["来自 query"],
+          f"结构化端点不可用 → 退回 smart-query/query（{r['source']}）")
+    # 宋词语料 → 判成「不是聊天」，直接停用 6 小时
+    async def _fake3(url, payload, timeout):
+        return {"answer": "参考来源: /app/documents/poet.song.rank.1.json"}
+    AC._post_json = _fake3
+    AC._RECALL_ENDPOINT_MISSING = True
+    AC._LIBRARY_DEAD_UNTIL = 0.0
+    r = await AC.recall("测试")
+    check(S, r == AC.empty_recall() and AC._LIBRARY_DEAD_UNTIL > 0,
+          "图书馆语料不是聊天 → 返回空并暂停")
+    AC._LIBRARY_DEAD_UNTIL = 0.0
+    AC._RECALL_ENDPOINT_MISSING = False
     AC._post_json = orig
 
 

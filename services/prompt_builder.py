@@ -319,6 +319,19 @@ def _recall_query(text: str, limit: int = 180) -> str:
     return q or raw[:limit]
 
 
+# 召回统计（给 `/测函数 记忆` 用）
+RECALL_STATS = {"calls": 0, "hit": 0, "fallback": 0}
+
+
+def recall_stats_text() -> str:
+    c = RECALL_STATS["calls"]
+    h = RECALL_STATS["hit"]
+    f = RECALL_STATS["fallback"]
+    rate = (h / c * 100) if c else 0.0
+    return (f"· 记忆召回：{c} 次｜关键词命中 {h} 次（{rate:.0f}%）｜"
+            f"人物兜底 {f} 次")
+
+
 def recall_hits(
     session_key: str = "",
     user_text: str = "",
@@ -347,6 +360,9 @@ def recall_hits(
         )
     except Exception:
         hits = []
+    RECALL_STATS["calls"] = int(RECALL_STATS.get("calls") or 0) + 1
+    if hits:
+        RECALL_STATS["hit"] = int(RECALL_STATS.get("hit") or 0) + 1
     if not hits and speaker_qq:
         # 关键词没命中 ≠ 没有记忆：至少把「关于这个人的最近几条」带上，
         # 让她不至于像失忆一样（用户 2026-11-24）。
@@ -355,6 +371,8 @@ def recall_hits(
                 str(speaker_qq), gid=_gid_of(session_key), limit=3)
             for _h in hits:
                 _h["fallback"] = True
+            if hits:
+                RECALL_STATS["fallback"] = int(RECALL_STATS.get("fallback") or 0) + 1
         except Exception:
             hits = []
     return hits

@@ -6564,6 +6564,32 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
             _msg += MessageSegment.image(f"file://{Path(_p).resolve()}")
         await _test_fn.finish(_msg)
 
+    if what.startswith(("记忆", "图书馆", "memory", "library")):
+        # /测函数 记忆 —— 召回/图书馆到底有没有在跑（用户 2026-11-24）
+        from services import prompt_builder as _pb2
+        from services import agent_client as _ac
+        from services import memory_v2 as _mv2
+        _out2 = ["▍记忆 / 图书馆调用"]
+        try:
+            _s2 = _mv2.stats()
+            _out2.append(
+                f"· 记忆库：共 {_s2['total']} 条（活跃 {_s2['active']}，"
+                f"过时 {_s2['outdated']}，情绪刻痕 {_s2['emotional']}）")
+        except Exception as e:
+            _out2.append(f"· 记忆库统计失败：{type(e).__name__}")
+        try:
+            _out2.append(_pb2.recall_stats_text())
+        except Exception:
+            pass
+        try:
+            _out2.append(_ac.stats_text())
+        except Exception:
+            pass
+        _out2.append(
+            "（图书馆要真有用，得先把 data/dialogue 归档导进算力机 RAG："
+            "/api/upload + /api/build；现在那套库里的语料不是聊天记录）")
+        await _test_fn.finish("\n".join(_out2))
+
     if what.startswith(("模型", "provider", "model")):
         # /测函数 模型 —— 每个角色当前用哪家 / 哪个模型 / 有没有 key
         from services import providers as _pv

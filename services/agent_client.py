@@ -36,6 +36,23 @@ AGENT_BASE_URL = os.getenv("AGENT_BASE_URL", "http://127.0.0.1:8001").rstrip("/"
 RECALL_ENDPOINT = os.getenv("AGENT_RECALL_ENDPOINT", "/api/agent/recall")
 QUERY_ENDPOINT = os.getenv("AGENT_QUERY_ENDPOINT", "/api/agent/query")
 REFLECT_ENDPOINT = os.getenv("AGENT_REFLECT_ENDPOINT", "/api/agent/reflection")
+# 2026-11-24 实测：算力机那套是 Agentic RAG v3，路由是 /api/agent/query 和
+# /api/agent/smart-query，**没有** /api/agent/recall、/api/agent/reflection。
+# 所以默认按「结构化 → smart-query → query」三级降级，别再打不存在的端点。
+SMART_QUERY_ENDPOINT = os.getenv("AGENT_SMART_QUERY_ENDPOINT", "/api/agent/smart-query")
+
+# 知识库里如果根本不是聊天记录（实测是 poet.song.rank.* 宋词数据），
+# 就别每条消息都去问一次（一次 6~13s，纯浪费）。6 小时内不再试。
+_LIBRARY_DEAD_UNTIL = 0.0
+_LIBRARY_WARNED = False
+# /api/agent/recall 不存在时记一下，别每条消息都白打一次 404
+_RECALL_ENDPOINT_MISSING = False
+
+_RECALL_PROMPT = (
+    "从知识库的历史聊天记录里，找出和这句话最相关的 3 条原话：{q}\n"
+    "要求：只列「谁说过什么」，一条一行；没有就只回「没有」。"
+    "不要解释、不要总结、不要编。"
+)
 
 RECALL_TIMEOUT = tuning.f("AGENT_RECALL_TIMEOUT")
 REFLECT_HTTP_TIMEOUT = tuning.f("AGENT_REFLECT_TIMEOUT")
@@ -45,6 +62,16 @@ QUEUE_DIR = Path("data/temp_files")
 QUEUE_DIR.mkdir(parents=True, exist_ok=True)
 
 EMPTY_RECALL = {"facts": [], "events": [], "emotions": [], "self_state": "", "source": "none"}
+
+# 图书馆调用统计（给 `/测函数 记忆` 用）
+STATS = {"calls": 0, "ok": 0, "empty": 0}
+
+
+def stats_text() -> str:
+    left = max(0.0, _LIBRARY_DEAD_UNTIL - time.time()) / 3600
+    tail = f"｜已暂停 {left:.1f}h（语料不匹配）" if left > 0 else ""
+    return (f"· 图书馆：调用 {STATS['calls']} 次｜有结果 {STATS['ok']} 次｜"
+            f"空 {STATS['empty']} 次{tail}")
 
 
 def empty_recall() -> dict:
@@ -128,6 +155,24 @@ def _normalize_recall(data: dict, source: str) -> dict:
     }
 
 
+def _looks_like_chat(data: dict) -> bool:
+    """答案/来源像不像「聊天记录」而不是别的语料。
+
+    实测那套 RAG 的库里是 `poet.song.rank.*.json`（宋词排行），
+    跟她的记忆完全无关；这种情况继续问只会白等 6~13 秒。
+    """
+    try:
+        txt = json.dumps(data, ensure_ascii=False)[:3000].lower()
+    except Exception:
+        return True
+    if "poet.song" in txt or "poetry" in txt:
+        return False
+    if "/app/documents/" in txt and not any(
+            k in txt for k in ("dialogue", "chat", "聊天", "群聊", "私聊")):
+        return False
+    return True
+
+
 # ================= ① recall =================
 async def recall(
     query: str,
@@ -147,17 +192,29 @@ async def recall(
 
     to = timeout or RECALL_TIMEOUT
 
-    # 优先：结构化端点
-    data = await _post_json(
-        f"{AGENT_BASE_URL}{RECALL_ENDPOINT}",
-        {
-            "query": query,
-            "user_qq": str(speaker_qq or ""),
-            "mood": float(mood_value or 0.0),
-            "recent_ctx": list(recent_ctx or [])[-8:],
-        },
-        to,
-    )
+    global _LIBRARY_DEAD_UNTIL, _LIBRARY_WARNED, _RECALL_ENDPOINT_MISSING
+    if time.time() < _LIBRARY_DEAD_UNTIL:
+        return empty_recall()
+    STATS["calls"] = int(STATS.get("calls") or 0) + 1
+
+    # 优先：结构化端点（第一次 404 之后就不再打）
+    data = None
+    if not _RECALL_ENDPOINT_MISSING:
+        data = await _post_json(
+            f"{AGENT_BASE_URL}{RECALL_ENDPOINT}",
+            {
+                "query": query,
+                "user_qq": str(speaker_qq or ""),
+                "mood": float(mood_value or 0.0),
+                "recent_ctx": list(recent_ctx or [])[-8:],
+            },
+            to,
+        )
+        if data is None:
+            _RECALL_ENDPOINT_MISSING = True
+            logger.info(
+                f"[AGENT] {RECALL_ENDPOINT} 不可用（404/超时）→ 之后直接用 "
+                f"{SMART_QUERY_ENDPOINT}")
     if data is not None:
         out = _normalize_recall(data, "recall")
         logger.info(
@@ -166,21 +223,35 @@ async def recall(
         )
         return out
 
-    # 兜底：现有 RAG 的 /api/agent/query（这条链路已经在跑）
+    # 兜底 1：/api/agent/smart-query（RAG v3 上有，实测 3~13s）
+    # ⚠️ 它在回复关键路径上，超时必须收紧：实测复杂问句要 12s+，
+    #    所以这里最多等 6s；超时就当「图书馆暂时不可用」，10 分钟内不再试。
     data = await _post_json(
-        f"{AGENT_BASE_URL}{QUERY_ENDPOINT}",
-        {"question": query, "agent_type": "full", "provider": "ollama", "max_iterations": 1},
-        to + 8,
+        f"{AGENT_BASE_URL}{SMART_QUERY_ENDPOINT}",
+        {"question": _RECALL_PROMPT.format(q=query)},
+        min(6.0, to + 3),
     )
-    if data is not None:
-        if data.get("success") is False:
-            return empty_recall()
-        out = _normalize_recall(data, "query")
-        if out["facts"]:
-            logger.info(f"[AGENT] 🧠 recall 退回 /query，拿到 {len(out['facts'])} 条事实")
-        return out
+    if data is None:
+        _LIBRARY_DEAD_UNTIL = time.time() + 600
+        logger.info("[AGENT] 图书馆暂时不可用（超时/失败）→ 10 分钟内不再试")
+        return empty_recall()
+    if not _looks_like_chat(data):
+        _LIBRARY_DEAD_UNTIL = time.time() + 6 * 3600
+        if not _LIBRARY_WARNED:
+            _LIBRARY_WARNED = True
+            logger.warning(
+                "[AGENT] ⚠️ 知识库里不是聊天记录（来源看起来是别的语料），"
+                "图书馆暂停 6 小时；要恢复请先把 data/dialogue 归档导入 RAG"
+                "（scripts/library_sync.py）")
+        return empty_recall()
 
-    return dict(EMPTY_RECALL)
+    out = _normalize_recall(data, "smart")
+    if out["facts"]:
+        STATS["ok"] = int(STATS.get("ok") or 0) + 1
+        logger.info(f"[AGENT] 🧠 recall 走 smart-query，拿到 {len(out['facts'])} 条")
+        return out
+    STATS["empty"] = int(STATS.get("empty") or 0) + 1
+    return empty_recall()
 
 
 # ================= ② reflection =================

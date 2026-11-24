@@ -79,7 +79,7 @@ DEFAULTS = {
     'AFFINITY_TREND_WINDOW_SEC': 1800.0,
 
     # ---------- 算力机 ----------
-    'AGENT_RECALL_TIMEOUT': 6.0,
+    'AGENT_RECALL_TIMEOUT': 3.0,
     'AGENT_REFLECT_QUEUE_TIMEOUT': 600.0,
     'AGENT_REFLECT_TIMEOUT': 180.0,
 
@@ -507,7 +507,7 @@ DOCS = {
     'AFFINITY_DAILY_CAP': '同一个人每天好感净变化上限（0.15，防「持续跌」一天到底）',
     'BOND_EVENT_MIN_DELTA': '「印象最深的一件事」的门槛：记忆 |Δ| 达到多少才算（0.15）',
     'AFFINITY_TREND_WINDOW_SEC': '好感走势的统计窗口（秒）',
-    'AGENT_RECALL_TIMEOUT': '算力机回忆接口超时（秒）',
+    'AGENT_RECALL_TIMEOUT': '算力机回忆接口超时（秒，默认 3；它在回复关键路径上）',
     'AGENT_REFLECT_QUEUE_TIMEOUT': '算力机反思任务排队超时（秒）',
     'AGENT_REFLECT_TIMEOUT': '算力机反思任务执行超时（秒）',
     'API_USAGE_KEEP_DAYS': '旧版用量记录保留天数',
