@@ -13,10 +13,12 @@
 
 设计：
   · 每一步都**独立降级**：超时/异常只丢那一步，不影响回复；
-  · 总耗时预算 `PIPELINE_BUDGET`（默认 9s），到点就带着已拿到的部分走；
+  · 总耗时预算 `PIPELINE_BUDGET`（默认 7s），到点就带着已拿到的部分走；
   · 产出是一段紧凑文本（`render()`），由 llm.call_llm 作为最高 recency 的数据块注入，
     同时主 prompt 不再重复注入 心情/好感/记忆目录/图书馆/白月光。
-  · 每一步都记 `[PIPE]` 日志，`/测函数 链路` 能看到这次到底拉了什么。
+  · **每一块的第一行都是「▍块名｜≤30 字说明」**，方便 /测函数 模板 一眼对照；
+  · 每一步都在 `stages` 里留状态（✓ / 数字 / — / ×异常），
+    `/测函数 流水线` 直接能看到「到底哪一步没拿到」。
 """
 from __future__ import annotations
 
@@ -34,6 +36,27 @@ except Exception:  # pragma: no cover
 
 BUDGET = tuning.f("PIPELINE_BUDGET")
 STATS: dict = {"runs": 0, "stage_ms": {}, "last": {}}
+
+# 每一步的小标题（≤30 字，用户 2026-11-24：每块要有清晰总结，方便检查）
+SUMMARY = {
+    "称呼": "固定区已给，这里再钉一句",
+    "状态": "心情值 · 当前状态 · 那件事的心理",
+    "档案": "称呼 · 身份 · 好感 · 印象最深的事",
+    "总结": "判读模型：这句在接哪句、到底在说什么",
+    "记忆": "按这句话检索到的旧事",
+    "图书馆": "久远归档，人称仅供参考",
+    "已回": "这条回过没有，别回第二遍",
+    "白月光": "借他习惯的说话方式，不做他",
+}
+# 打印顺序（也是 /测函数 流水线 的顺序）
+STAGE_ORDER = ("称呼", "状态", "档案", "总结", "记忆", "图书馆", "已回", "白月光")
+# 单独一个块标题：/看模板 里一眼能认出「这是流水线取回来的数据」，
+# 而不是混在人格/规矩/历史里找（用户 2026-11-24）。
+PIPE_HEADER = "▍PIPELINE｜回复前动态取数（优先参考，别复述块名；某步失败只丢那步）"
+
+
+def _hdr(name: str) -> str:
+    return f"▍{name}｜{SUMMARY.get(name, '')}".rstrip("｜")
 
 
 def _mark(name: str, t0: float) -> None:
@@ -77,41 +100,63 @@ async def build(
     def left() -> float:
         return max(0.2, deadline - time.monotonic())
 
+    def fail(name: str, e: BaseException) -> None:
+        """失败也要留痕：不然「没拿到」和「没跑」看起来一样。"""
+        stages[name] = f"×{type(e).__name__}"
+        logger.debug(f"[PIPE] {name} 失败：{type(e).__name__}: {e}")
+
     # ---------- ① 称呼（固定区已经给了，这里补一句硬约定） ----------
     try:
         from . import callname
         _c = callname.render(speaker_qq, gid, speaker_name)
         if _c:
-            blocks.append(_c)
-            stages["称呼"] = _c
-    except Exception:
-        pass
+            blocks.append(_hdr("称呼") + "\n" + _c.strip())
+            stages["称呼"] = "✓"
+        else:
+            stages["称呼"] = "—"
+    except Exception as e:
+        fail("称呼", e)
 
-    # ---------- ② 心情值 + 当前状态 + 心理状态 ----------
+    # ---------- ② 心情值 + 当前状态 + 那件事的心理状态 ----------
+    # 用 mood.status_block：它一次给全「心情词 / 数值 / 刚才那下 / 心里话 /
+    # 峰值事件 + 当时的心理 / 群聊总结 / 对他的好感走势」。
+    # 拿不到就退到最小的一行数值 —— 保证「此刻状态」这一块永远在。
     try:
         from . import mood
-        _m = mood.get_mood(session_key) or {}
-        _jd = mood.get_judge(session_key) or {}
-        _v = float(_m.get("value") or 0.0)
-        _lab = str(_m.get("label") or "").strip()
-        _mind = str(_jd.get("mind") or "").strip()
-        _why = str(_jd.get("why") or "").strip()
-        _parts = [f"心情值 {_v:+.0f}（-100~100，只影响语气浓淡）"]
-        if _lab:
-            _parts.append(f"她的心情原话：{_lab}")
-        if _mind:
-            _parts.append(f"刚才那件事她心里：{_mind}")
-        if _why:
-            _parts.append(f"原因：{_why[:60]}")
-        blocks.append("▍此刻状态\n" + "\n".join(f"· {p}" for p in _parts))
-        stages["状态"] = _parts
-    except Exception:
-        pass
+        _body = str(mood.status_block(session_key, speaker_qq=speaker_qq) or "").strip()
+        # 去掉结尾那段 chat_switch 操作说明（固定区 ▍02b 已经有，别重复）
+        _body = _body.split("\n（这些不用说出来")[0].strip()
+        # 「刚刚群里在聊」prompt 末尾还会单独给一条【最近这段在聊什么】，
+        # 这里去掉，避免同一段总结在一份 prompt 里出现两遍。
+        _body = "\n".join(
+            ln for ln in _body.splitlines()
+            if not ln.strip().startswith("· 刚刚群里在聊")).strip()
+        if not _body:
+            _m = mood.get_mood(session_key) or {}
+            _v = float(_m.get("value") or 0.0)
+            _lb = str(_m.get("label") or "").strip()
+            _body = f"· 心情值 {_v:+.0f}（-100~100，只影响语气浓淡）"
+            if _lb:
+                _body += f"\n· 她自己写的感觉：{_lb}"
+        blocks.append(_hdr("状态") + "\n" + _body[:460])
+        stages["状态"] = "✓"
+    except Exception as e:
+        fail("状态", e)
+        # 连 mood 模块都挂了，也给她一句中性状态，别整块消失
+        blocks.append(_hdr("状态") + "\n· 心情值 +0（暂时读不到，按平常语气说话）")
 
-    # ---------- ③ 对方档案 + 好感词 + 印象最深的一件事 ----------
+    # ---------- ③ 对方档案 + 好感词 + 印象最深的一件事 + 他的白月光 ----------
     try:
         from . import profiles
-        _nm = profiles.call_of(speaker_qq, speaker_name or speaker_qq, gid) or speaker_name
+        try:
+            from . import callname
+            _nm = (callname.user_call_of(
+                speaker_qq, gid, fallback=speaker_name or speaker_qq)
+                or profiles.call_of(speaker_qq, speaker_name or speaker_qq, gid)
+                or speaker_name)
+        except Exception:
+            _nm = (profiles.call_of(speaker_qq, speaker_name or speaker_qq, gid)
+                   or speaker_name)
         _p = profiles.get_profile(speaker_qq) or {}
         _bond = ""
         try:
@@ -137,21 +182,55 @@ async def build(
                 _lines.append(f"· 你俩印象最深的一件事：{_top}")
         except Exception:
             pass
-        blocks.append("▍这个人\n" + "\n".join(_lines))
-        stages["档案"] = {"name": _nm, "bond": _bond, "top": _top}
-    except Exception:
-        pass
+        # 🌙 白月光是谁：写进「这个人」块（用户 2026-11-24：
+        #    「白月光是谁以及风格并没有写到档案里」）。
+        _moon_who = ""
+        try:
+            from . import white_moon
+            _wn = str(white_moon.profile_note(speaker_qq, gid) or "").strip()
+            if _wn:
+                _moon_who = _wn.replace("· 白月光：", "· 他的白月光：", 1)
+                if "还没统计出来" in _moon_who:
+                    _moon_who = "· 他的白月光：还没统计出来（他 @/引用谁最多就会记）"
+                _lines.append(_moon_who)
+        except Exception:
+            pass
+        blocks.append(_hdr("档案") + "\n" + "\n".join(_lines))
+        stages["档案"] = "✓"
+    except Exception as e:
+        fail("档案", e)
 
     # ---------- ④ 心情 LLM 对这段话的总结 ----------
     summary = ""
     try:
         from . import mood_judge
+        # 只喂当前一句会把「身高 192」猜成「192 关」——必须带上最近聊天，
+        # 让判读先判断「这句在接哪句」。用户 2026-11-24 真机踩过。
+        _ctx4 = []
+        if gid:
+            try:
+                from . import group_scene
+                _ctx4 = group_scene.history_lines(
+                    gid, 10, width=140, exclude_mids=seg_mids)
+                # 审核 LLM 已经有一份「这段在聊什么」的滚动总结，先当背景给它，
+                # 避免只看到最后几条时把「192」这种数字接错话题。
+                _sm4 = (group_scene.snapshot(gid).get("summary") or {}).get("text") or ""
+                if _sm4:
+                    _ctx4 = [f"（之前群里在聊：{str(_sm4)[:120]}）"] + _ctx4
+            except Exception:
+                _ctx4 = []
         summary = await _step(
-            "总结", mood_judge.summarize(text, session_key), min(6.0, left())) or ""
+            "总结",
+            mood_judge.summarize(text, session_key, _ctx4,
+                                 speaker=speaker_name),
+            min(6.0, left())) or ""
         if summary:
-            blocks.append(f"▍这句话在说什么（判读模型总结）\n· {summary}")
-            stages["总结"] = summary
-    except Exception:
+            blocks.append(_hdr("总结") + "\n· " + summary)
+            stages["总结"] = "✓"
+        else:
+            stages["总结"] = "—"
+    except Exception as e:
+        fail("总结", e)
         summary = ""
 
     # 总结失败就用原话当检索词（去掉 @/引用噪音）
@@ -167,12 +246,14 @@ async def build(
                                   speaker_qq=speaker_qq, gid=gid),
                 min(3.0, left()), default=[]) or []
             if not _hits:
+                stages["记忆"] = "0"
                 return ""
             _lines = [f"{i}. {str(h.get('ago') or '')}｜{str(h.get('summary') or '')[:40]}"
                       for i, h in enumerate(_hits, 1)]
-            stages["记忆"] = len(_hits)
-            return "▍相关记忆（按这句话找的）\n" + "\n".join(_lines)
-        except Exception:
+            stages["记忆"] = str(len(_hits))
+            return _hdr("记忆") + "\n" + "\n".join(_lines)
+        except Exception as e:
+            fail("记忆", e)
             return ""
 
     async def _lib_stage():
@@ -185,12 +266,15 @@ async def build(
                 min(3.0, left()), default=None)
             _facts = (_lib or {}).get("facts") or []
             if not _facts:
+                stages["图书馆"] = "0"
                 return ""
-            stages["图书馆"] = len(_facts)
-            return ("▍图书馆·久远归档（**语料库里的「我/你/他」不是现在的你我他**，"
-                    "只当参考线索，别照抄、别当成现在发生的事）\n"
+            stages["图书馆"] = str(len(_facts))
+            return (_hdr("图书馆") + "\n"
+                    "（**语料库里的「我/你/他」不是现在的你我他**，只当参考线索，"
+                    "别照抄、别当成现在发生的事）\n"
                     + "\n".join(f"· {str(x)[:60]}" for x in _facts[:3]))
-        except Exception:
+        except Exception as e:
+            fail("图书馆", e)
             return ""
 
     _got = await asyncio.gather(_mem_stage(), _lib_stage())
@@ -203,35 +287,90 @@ async def build(
         _rs = {str(x) for x in (replied_mids or [])}
         replied = bool(_mid and _mid in _rs)
         if replied:
-            blocks.append("▍注意\n· 这条消息你已经回过了，**别再回一遍**；"
+            blocks.append(_hdr("已回") + "\n· 这条消息你已经回过了，**别再回一遍**；"
                           "如果确实还要补充，就只补一句新的。")
-            stages["已回"] = True
-    except Exception:
-        pass
+            stages["已回"] = "是"
+        else:
+            stages["已回"] = "否"
+    except Exception as e:
+        fail("已回", e)
 
     # ---------- ⑧ 白月光说话风格 ----------
+    # 「是谁」已经在 ③ 档案块里；这里只给「怎么借他的说话方式」，避免同一件事说两遍。
     try:
         from . import white_moon
-        _wm = white_moon.render(gid, moon_target_qq or speaker_qq,
-                                speaker_name, speaker_name)
-        if _wm:
-            blocks.append(_wm.strip()[:300])
-            stages["白月光"] = True
-    except Exception:
-        pass
+        if not getattr(white_moon, "ENABLED", True):
+            stages["白月光"] = "关"
+        else:
+            _tq = str(moon_target_qq or speaker_qq or "").strip()
+            _m = white_moon.person_moon(gid, _tq) if (_tq and gid) else {}
+            if not _m:
+                stages["白月光"] = "—(分不够)"
+            else:
+                _wm = white_moon.render_style_only(gid, _tq, speaker_name)
+                if _wm:
+                    # 自定义风格可能是一整套样本，给足 900 字；普通风格摘要很短
+                    blocks.append(_wm.strip()[:900])
+                    stages["白月光"] = "✓"
+                else:
+                    stages["白月光"] = "—(没样本)"
+    except Exception as e:
+        fail("白月光", e)
 
-    text_out = "\n\n".join(b for b in blocks if b).strip()
+    _body = "\n\n".join(b for b in blocks if b).strip()
+    text_out = (PIPE_HEADER + ("\n\n" + _body if _body else "")).strip()
     cost = time.monotonic() - t_all
-    STATS["last"] = {"stages": list(stages), "cost": round(cost, 2),
-                     "chars": len(text_out)}
+    STATS["last"] = {"stages": dict(stages), "cost": round(cost, 2),
+                     "chars": len(text_out), "text": text_out,
+                     "session": str(session_key or ""),
+                     "speaker_qq": str(speaker_qq or ""),
+                     "speaker_name": str(speaker_name or ""),
+                     "src_text": str(text or "")[:120]}
     logger.info(
-        f"[PIPE] {session_key} {cost:.1f}s｜拉了 {','.join(stages) or '无'}"
-        f"｜{len(text_out)} 字")
+        f"[PIPE] {session_key} {cost:.1f}s｜拉了 {','.join(k for k in STAGE_ORDER if k in stages) or '无'}"
+        f"｜{len(text_out)} 字｜{stages}")
     return {"text": text_out, "stages": stages, "summary": summary,
             "replied": replied, "cost": cost}
 
 
+def last_text() -> str:
+    """上一次流水线真正注入 prompt 的完整文本（给 /看模板 流水线 用）。"""
+    return str((STATS.get("last") or {}).get("text") or "")
+
+
+def dump_text() -> str:
+    """把「状态 + 完整块」打在一起；单独一个标签，不和模板刷屏混在一起。"""
+    last = STATS.get("last") or {}
+    if not last:
+        return "· 流水线：还没跑过（先让她回一句）"
+    lines = [PIPE_HEADER]
+    _st = last.get("stages") or {}
+    _who = str(last.get("speaker_name") or "").strip()
+    _qq = str(last.get("speaker_qq") or "").strip()
+    _sess = str(last.get("session") or "").strip()
+    if _who or _qq:
+        lines.append(f"· 这次是回：{_who or '?'}（{_qq or '?'}）"
+                     + (f"｜会话 {_sess}" if _sess else ""))
+    _src = str(last.get("src_text") or "").strip().replace("\n", " ")
+    if _src:
+        lines.append(f"· 要回的原话：{_src[:80]}")
+    lines.append(f"· 上次耗时 {last.get('cost')}s｜{last.get('chars')} 字")
+    lines.append("· 各步：" + "｜".join(
+        f"{k}={_st.get(k, '（没跑）')}" for k in STAGE_ORDER))
+    body = str(last.get("text") or "").strip()
+    if body.startswith(PIPE_HEADER):
+        body = body[len(PIPE_HEADER):].strip()
+    if body:
+        lines.append("")
+        lines.append(body)
+    lines.append("")
+    lines.append("（这是「上一条要回的消息」的取数，不是 /档案；"
+                 "查某个人请用 /档案 @人 文字 或 /测函数 档案 QQ号）")
+    return "\n".join(lines)
+
+
 def stats_text() -> str:
+    """`/测函数 流水线`：每一步的耗时 + 上次到底拿到了什么。"""
     if not STATS["runs"]:
         return "· 流水线：还没跑过"
     parts = [f"· 流水线：跑了 {STATS['runs']} 次"]
@@ -239,5 +378,8 @@ def stats_text() -> str:
         parts.append(f"    {k}: {v['ms']:.0f}ms（{v['n']} 次）")
     last = STATS.get("last") or {}
     if last:
-        parts.append(f"· 上次：{last.get('cost')}s｜{','.join(last.get('stages') or [])}")
+        _st = last.get("stages") or {}
+        parts.append(f"· 上次：{last.get('cost')}s｜{last.get('chars')} 字")
+        for k in STAGE_ORDER:
+            parts.append(f"    {k}: {_st.get(k, '（没跑）')}")
     return "\n".join(parts)

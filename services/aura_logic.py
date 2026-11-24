@@ -262,6 +262,15 @@ def parse_think(text: str) -> tuple:
             r"[\[【]{1,3}\s*THINK\s*[|｜:：]\s*(.+)$", raw, re.IGNORECASE)
         if _m:
             think = str(_m.group(1) or "").strip().strip("[]【】")
+    # 模型手滑写成 `[[THINK]] 心里话`（没有竖线/冒号）：把紧跟的这段当心里话，
+    # 否则标记被清掉、心里话正文会漏给用户（用户 2026-11-24：「又开始说心里话了」）。
+    if not think:
+        _m2 = re.search(
+            r"[\[【]{1,3}\s*THINK\s*[\]】]{1,3}\s*([^\n]{1,120})",
+            raw, re.IGNORECASE)
+        if _m2:
+            think = str(_m2.group(1) or "").strip().strip("[]【】")
+            raw = raw[:_m2.start()] + raw[_m2.end():]
     # 不管有没有抠到，标记本身都不能留
     raw = THINK_RE.sub("", raw)
     # 被截断的半截标签也清掉，别让它漏给用户
@@ -469,7 +478,7 @@ CALL_MAX_PER_REPLY = 2
 def parse_calls(text: str) -> tuple:
     """
     抠出所有 [[CALL|...]]。返回 (清理后的正文, [call dict, ...])
-    call dict: {bot, user, note}
+    call dict: {bot, user, target, del, note}
     """
     raw = str(text or "")
     calls = []
@@ -477,15 +486,21 @@ def parse_calls(text: str) -> tuple:
         f = _parse_memo_fields(m.group(1))
         bot_alias = (f.get("bot") or f.get("me") or f.get("叫我") or "").strip()
         user_name = (f.get("user") or f.get("him") or f.get("叫他") or "").strip()
+        # target：给第三个人定称呼时必须写（2026-11-24 真机：把别人记成了说话人）
+        target = (f.get("target") or f.get("to") or f.get("给") or "").strip()
+        del_what = (f.get("del") or f.get("delete") or f.get("删") or "").strip().lower()
         note = (f.get("note") or f.get("text") or "").strip()
         # 去掉模型可能顺手加的引号/书名号
         bot_alias = bot_alias.strip("「」『』\"'“” ")
         user_name = user_name.strip("「」『』\"'“” ")
-        if not bot_alias and not user_name:
+        target = target.strip("「」『』\"'“” @＠")
+        if not bot_alias and not user_name and not del_what:
             continue
         calls.append({
             "bot": bot_alias[:12],
             "user": user_name[:12],
+            "target": target[:40],
+            "del": del_what[:10],
             "note": note[:60],
         })
     clean = CALL_RE.sub("", raw)
@@ -790,7 +805,45 @@ def strip_stage_direction(text: str) -> str:
     m = _STAGE_HEAD_RE.match(t)
     if m and any(v in m.group(0) for v in _STAGE_VERBS):
         t = t[m.end():].strip()
-    return t
+    return strip_inner_thought(t)
+
+
+# 2026-11-24 用户：「他又开始说心里话了。」
+# 模型有时不写 [[THINK]]，而是在正文里写「（心里话：…）」「内心：…」「OS：…」。
+# 这些是给她自己看的，绝不能发到群里；这里按显式标签清理，不动正常口语。
+_INNER_LABEL_RE = re.compile(
+    r"[（(]\s*(?:心里话|内心(?:\s*OS)?|心里想|心想|心声|脑内|独白|旁白|OS)"
+    r"\s*[：:，,、]?\s*[^（）()]{0,100}?[）)]",
+    re.IGNORECASE)
+_INNER_LINE_RE = re.compile(
+    r"^\s*(?:心里话|内心(?:\s*OS)?|心里想|心想|心声|脑内|独白|旁白|OS)"
+    r"\s*[：:，,]\s*.*$",
+    re.IGNORECASE)
+_INNER_BRACKET_RE = re.compile(
+    r"[【\[]\s*(?:心里话|内心|心里想|心想|心声|脑内|独白|旁白|OS)\s*[】\]]"
+    r"\s*[：:]?\s*",
+    re.IGNORECASE)
+_INNER_BRACKET_LINE_RE = re.compile(
+    r"^\s*[【\[]\s*(?:心里话|内心|心里想|心想|心声|脑内|独白|旁白|OS)\s*[】\]]"
+    r"\s*[：:]?\s*.*$",
+    re.IGNORECASE)
+
+
+def strip_inner_thought(text: str) -> str:
+    """删掉正文里的「心里话/内心/OS」旁白（显式标签才删，避免误伤正常说话）。"""
+    t = str(text or "")
+    if not t:
+        return t
+    # 先按整行删（【心里话】/内心：…），再删句中的括号旁白。
+    keep = []
+    for ln in t.splitlines():
+        if _INNER_LINE_RE.match(ln) or _INNER_BRACKET_LINE_RE.match(ln):
+            continue
+        keep.append(ln)
+    t = "\n".join(keep)
+    t = _INNER_LABEL_RE.sub("", t)
+    t = _INNER_BRACKET_RE.sub("", t)
+    return t.strip()
 
 
 # ================= 三-0e2、点评对话本身 / 心里话（2026-11-23） =================

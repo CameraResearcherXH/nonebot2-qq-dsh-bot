@@ -610,7 +610,7 @@ def check_g21():
         bad.append("parse_reply 的 voice 分支没清洗")
     if "def clean_voice_text" not in al or "stick" not in al:
         bad.append("缺 clean_voice_text / stick 清洗")
-    if "不要在回复里复述、朗读引用内容" not in llm:
+    if "引用只用来理解指代" not in llm:
         bad.append("末尾硬要求缺引用复述禁令")
     if "clean_voice_text(text)" not in chat:
         bad.append("speak_voice 没做最后清洗")
@@ -766,8 +766,8 @@ def check_g28():
         bad.append("history_lines 没打 ⭐")
     if "只接一个线程" in llm or "只接**一个**线程" in llm:
         bad.append("prompt 仍写「只接一个线程」")
-    if "多条 @ 你" not in llm:
-        bad.append("prompt 缺「多条 @ 你」规矩")
+    if "多条用一条答完" not in llm:
+        bad.append("prompt 缺「多条 @ 用一条答完」规矩")
     if 'session_key.startswith("group_") and not _seg_records' not in chat:
         bad.append("群聊无分段时没回退到处理过的历史")
     return (not bad), "；".join(bad), "@ 消息逐条回应 / 上下文只用处理过的历史"
@@ -1129,7 +1129,7 @@ def check_g38():
     if "replied_mids" not in gs or "〔已回〕" not in gs:
         bad.append("history_lines 没标〔已回〕")
     llm = read("services/llm.py")
-    if "[[MEMORY|关键词]]" not in llm or "提到往事就必须回想" not in llm:
+    if "[[MEMORY|" not in llm or "往事 [[MEMORY|" not in llm:
         bad.append("规矩里没要求「提到往事先翻记忆」")
     return (not bad), "；".join(bad), "干净召回 query / 人物近期兜底 / 上下文标〔已回〕/ 规矩要求回想"
 

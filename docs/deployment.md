@@ -139,6 +139,36 @@ docker logs -f napcat
 
 > 本项目的 bot 是 **WS 服务端**（监听 8080），NapCat 是客户端。
 
+### 3.1 掉线自动登录 / 自动重启（2026-11-24）
+
+腾讯会周期性把快速登录 token 作废（日志：`快速登录错误：你的用户身份已失效`），
+只靠 `restart: always` 不够。现在有两层：
+
+1. **密码回退**：`.env` 里二选一填
+   ```ini
+   NAPCAT_QUICK_PASSWORD=你的QQ密码
+   # 或者
+   NAPCAT_QUICK_PASSWORD_MD5=密码的32位小写MD5
+   ```
+   改完必须 `sudo docker compose up -d --force-recreate napcat`（会重建容器并重新登录）。
+   配了密码后，NapCat 掉线会优先用密码快速登录；没配就只会换一张二维码。
+2. **宿主机看门狗**：`scripts/napcat_watchdog.sh`，建议 cron 每 2 分钟跑一次：
+   ```bash
+   chmod +x ~/qq-grok-bot/scripts/napcat_watchdog.sh
+   crontab -e
+   */2 * * * * /home/admin/qq-grok-bot/scripts/napcat_watchdog.sh
+   ```
+   - 容器没跑 → `docker start napcat`；
+   - 登录失效 + **已配密码** → `docker restart napcat`（冷却 10 分钟，避免死循环）；
+   - 日志出现「需要验证码 / 短信验证 / proofWaterUrl」→ **只记日志、不重启**，
+     等你在 NapCat WebUI 完成验证（否则每次重启都会换一张验证码，永远追不上）；
+   - 没配密码 → 只写 `data/napcat_watchdog.log`，不反复重启（否则二维码一直被作废）。
+   - 同时把 `napcat/config/webui.json` 的 `autoLoginAccount` 设成当前 QQ，
+     下次重启会优先尝试该账号。
+
+> ⚠️ 密码登录也可能被腾讯要求设备验证 / 短信；看门狗能减少手动重启，但不能绕过风控。
+> 根治仍是把 NapCat 放到国内 IP，并避免手机端和容器同时登录同一个号。
+
 ## 4. 启动 bot
 
 ```bash

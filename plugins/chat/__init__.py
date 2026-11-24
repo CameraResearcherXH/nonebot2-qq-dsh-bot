@@ -2319,6 +2319,16 @@ async def _need_reply(event: MessageEvent) -> bool:
                         to_conf=float((_scene_meta or {}).get("to_conf") or 0.0))
                 except Exception:
                     pass
+                # 🎭 说话样本库（2026-11-24）：每个人的原话都记一条。
+                #    放在省流模式 return 之前 → **省流模式也会收**；
+                #    只写文本，不调模型，不影响回复速度。
+                try:
+                    from services import style_vault as _sv
+                    _sv.note_sample(
+                        gid, uid, _t_own,
+                        profiles.call_of(uid, display_name(event), gid) or _label)
+                except Exception:
+                    pass
                 # 🌙 白月光统计（群友之间，不是她自己）：
                 #    A @ 了谁 / 引用回复了谁 / 没 @ 但在接谁的话。
                 try:
@@ -3056,6 +3066,69 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
     await bot.send(event, f"好的，以后我管 QQ {target_qq} 叫「{new_name}」。")
 
 
+# ================= /删称呼 [@人 / QQ]：删掉记错的称呼 =================
+# 用户 2026-11-24：「别人让她叫阿明，结果她把我记成了阿明，然后让她删还删不掉。」
+# 这里给一条硬命令：两个方向一起清，并清 aliases / 名册缓存，避免删了又被找回来。
+forget_call_cmd = on_command("删称呼", aliases={"忘记称呼", "清除称呼"},
+                             priority=5, block=True)
+
+
+@forget_call_cmd.handle()
+async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
+    gid = str(getattr(event, "group_id", "") or "")
+    target = ""
+    for seg in args:
+        if seg.type == "at":
+            target = str(seg.data.get("qq") or "")
+    raw = args.extract_plain_text().strip()
+    m = re.search(r"(?<!\d)(\d{5,12})(?!\d)", raw)
+    if not target and m:
+        target = m.group(1)
+    # 支持 `/删称呼 100000003 阿明`：点名删一个别名，而不是把两个方向全清。
+    _name = ""
+    if m:
+        _name = raw.replace(m.group(1), "", 1).strip(" \t，,：:、")
+        _name = _name.strip("「」『』\"'")
+    if not target:
+        target = str(event.user_id)
+        if not _name:
+            _name = raw.strip("「」『』\"' ")
+    if target != str(event.user_id) and not is_owner(str(event.user_id)):
+        await bot.send(event, "只能删自己的称呼；删别人的要主人来。")
+        return
+    _old = ""
+    try:
+        _old = profiles.call_of(target, "", gid)
+    except Exception:
+        _old = ""
+    if _name:
+        callname.clear_name(target, _name, gid)
+        _cleared = f"已删掉「{_name}」"
+        _gone = _name
+    else:
+        callname.clear_all(target, gid)
+        _cleared = "她叫他 / 他叫她 都清了"
+        _gone = _old
+    _clear_label(target)
+    try:
+        group_roster.invalidate(gid)
+    except Exception:
+        pass
+    # 记忆里可能还留着「我和X的称呼：她叫他阿明」；补一条作废说明，
+    # 否则她翻到旧记忆还会照旧叫（用户：「删还删不掉」）。
+    if _gone:
+        try:
+            memory_v2.remember(
+                text=f"称呼已作废：以后不要再把 QQ {target} 叫「{_gone}」",
+                kind="call", about_qq=target, importance=0.9)
+        except Exception:
+            pass
+    await bot.send(
+        event,
+        f"✅ QQ {target} 的称呼：{_cleared}。"
+        + (f"\n旧称呼「{_gone}」也标成作废了。" if _gone else ""))
+
+
 # ================= 头像：优先让 NapCat 去拿 =================
 # 用户 2026-11-19：「没有档案卡片渲染 NapCat 获得用户头像的内容」。
 # 为什么要走 NapCat：容器直连 qlogo 不一定通（没网 / 被风控 / 代理只给 LLM 用），
@@ -3193,33 +3266,68 @@ async def _ensure_avatar(bot, qq: str, gid: str = "") -> str:
     return f"没拿到（NapCat {why}｜直连 {w}）"
 
 
-# ================= 发图：失败要多等几秒重试 =================
+# ================= 发图：超时只发一次，避免双图 =================
 # 用户 2026-11-19：「应该多等会图片，不发文字的」。
 # 真机现象：760x1500 的卡片 PNG 上传慢，NapCat 先回 ActionFailed(retcode=12)，
 # 但图其实**还在上传队列里，两分钟后照样到**（日志里「发送超时/失败」后面图还是出来了）。
-# 所以：失败 → 等几秒重发（缓存已就绪，第二次基本就成），绝不拿一大段文字顶替图片。
+# 2026-11-24 用户实测「/档案 又发两遍」：重试把已经在队列里的图又发了一遍。
+# 所以现在：超时 = 只发一次（图可能已进队列）；只有文件/权限这类非超时错误才重试。
 _IMG_RETRY_DELAYS = (4, 8, 12)
+# 同一张图 60s 内只发一次：用户 2026-11-24「/档案 又发两遍」——
+# NapCat 上传超时（ActionFailed retcode=12）时图其实已经进队列，再重试就会双图。
+_IMG_SENT_AT: dict = {}
+
+
+def _img_key(event, path: str) -> str:
+    gid = str(getattr(event, "group_id", "") or "")
+    uid = str(getattr(event, "user_id", "") or "")
+    return f"{gid or 'private'}:{uid}:{Path(path).name}"
+
+
+def _is_queue_timeout(e: BaseException) -> bool:
+    """NapCat 上传超时 / retcode=12：图多半已经进队列，不能重发。"""
+    s = str(e).lower()
+    return ("retcode=12" in s or "timeout" in s or "超时" in s
+            or "timed out" in s)
 
 
 async def _send_image_patiently(bot, event, path: str,
                                 delays: tuple = _IMG_RETRY_DELAYS) -> bool:
-    """发一张图，失败就等几秒重发。返回最终是否发出去。"""
+    """发一张图；超时只发一次（避免双图），非超时错误才重试一次。"""
     if not path:
         return False
+    key = _img_key(event, path)
+    now = time.time()
+    _prev = _IMG_SENT_AT.get(key) or (0.0, "")
+    if now - float(_prev[0] or 0) < 60:
+        if _prev[1] == "ok":
+            logger.info(f"[IMG] 60s 内已发过同一张图，跳过重复发送：{Path(path).name}")
+            return True
+        logger.info(f"[IMG] 同一张图刚超时过，可能还在上传：{Path(path).name}")
+        return False
     seg = MessageSegment.image(f"file://{Path(path).resolve()}")
-    tries = max(1, len(delays) + 1)
-    for i in range(tries):
+    try:
+        await bot.send(event, seg)
+        _IMG_SENT_AT[key] = (time.time(), "ok")
+        return True
+    except Exception as e:
+        logger.warning(f"[IMG] 发图失败：{type(e).__name__}: {str(e)[:100]}")
+        if _is_queue_timeout(e):
+            # 关键：NapCat 超时不代表没发出去，重发会变成两张。
+            # 记成 timeout：60s 内再点 /档案 只提示「还在上传」，不会再发一张。
+            _IMG_SENT_AT[key] = (time.time(), "timeout")
+            logger.info("[IMG] 判定为上传超时（图可能已进队列）→ 不再重发")
+            return False
+        # 文件不存在 / 权限 / 参数错这类：等几秒重试一次
+        if delays:
+            await asyncio.sleep(delays[0])
         try:
             await bot.send(event, seg)
-            if i:
-                logger.info(f"[IMG] 第 {i + 1} 次发图成功：{Path(path).name}")
+            _IMG_SENT_AT[key] = (time.time(), "ok")
             return True
-        except Exception as e:
-            logger.warning(f"[IMG] 第 {i + 1}/{tries} 次发图失败："
-                           f"{type(e).__name__}: {str(e)[:80]}")
-            if i < tries - 1:
-                await asyncio.sleep(delays[min(i, len(delays) - 1)])
-    return False
+        except Exception as e2:
+            logger.warning(f"[IMG] 重试仍失败：{type(e2).__name__}: {str(e2)[:100]}")
+            return False
 
 
 # ================= /档案 [@人 / QQ号] =================
@@ -3247,13 +3355,30 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
     p = profiles.get_profile(target)
     b = profiles.get_bond(target)
     style = profiles.style_summary(target)
+    _gid_t = str(getattr(event, "group_id", "") or "")
+
+    # 称呼/白月光以 callname / white_moon 为准（和回复流水线、档案图同源）。
+    try:
+        from services import callname as _cn
+        _call_u = _cn.user_call_of(target, _gid_t, fallback="")
+        _call_b = _cn.bot_call_of(target, _gid_t)
+    except Exception:
+        _call_u, _call_b = "", ""
+    _call_u = _call_u or str(p.get("call_name") or "")
+    _call_b = _call_b or str(p.get("bot_alias") or "")
 
     lines = [f"📄 QQ {target} 的档案："]
     lines.append(f"· 群名片/昵称：{p.get('nickname') or '(未设置)'}")
-    lines.append(f"· 我叫他：{p.get('call_name') or '(还没定)'}")
-    lines.append(f"· 他叫我：{p.get('bot_alias') or '(还没定)'}")
-    lines.append(f"· 别名：{', '.join(p.get('aliases', [])) or '(无)'}")
+    lines.append(f"· 我叫他：{_call_u or '(还没定)'}")
+    lines.append(f"· 他叫我：{_call_b or '(还没定)'}")
     lines.append(f"· 是否主人：{'是' if p.get('is_owner') else '否'}")
+    try:
+        from services import white_moon as _wm
+        _wn = str(_wm.profile_note(target, _gid_t) or "").strip()
+        if _wn:
+            lines.append(f"· {_wn.lstrip('· ').strip()}")
+    except Exception:
+        pass
     if style:
         lines.append(f"· 说话方式：{style}")
     if p.get("topics"):
@@ -3303,7 +3428,6 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
     if not _want_text:
         try:
             from services import profile_card as _pc
-            _gid_t = str(getattr(event, "group_id", "") or "")
             # 👇 先让 NapCat 把头像是弄进缓存，再画图（否则左上角只剩名字首字）
             _av_why = await _ensure_avatar(bot, target, _gid_t)
             logger.debug(f"[PROFILE-CARD] {target} 头像：{_av_why}")
@@ -3520,6 +3644,75 @@ def _block_title(body: str) -> str:
 @show_tpl_cmd.handle()
 async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
     _arg = str(args or "").strip()
+    # 用户 2026-11-24：「打 prompt 看不到 pipeline 链路，反而很多刷屏内容；
+    # 给我单独加个打印这个的标签。」→ /看模板 流水线 只打流水线，不混人格/规矩/历史。
+    if "流水线" in _arg or "pipeline" in _arg.lower():
+        from services import reply_pipeline as _rpl
+        # 2026-11-24 追加：支持 `/看模板 流水线 @某人` / `流水线 QQ号`。
+        # 不带参数 = 上一次真实回复的取数；带参数 = 按这个人的最近一句话
+        # 现跑一遍流水线（只用于排查，会覆盖 STATS["last"]）。
+        _tgt = ""
+        try:
+            for _seg in args:
+                if _seg.type == "at":
+                    _tgt = str(_seg.data.get("qq") or "")
+                    break
+        except Exception:
+            _tgt = ""
+        _plain = ""
+        try:
+            _plain = args.extract_plain_text().strip()
+        except Exception:
+            _plain = _arg
+        if not _tgt:
+            _m = re.search(r"(?<!\d)(\d{5,12})(?!\d)", _plain)
+            if _m:
+                _tgt = _m.group(1)
+        if _tgt:
+            _gid_t = str(getattr(event, "group_id", "") or "")
+            _name_t = _tgt
+            try:
+                from services import callname as _cn_t
+                _name_t = _cn_t.user_call_of(_tgt, _gid_t, fallback=_tgt) or _tgt
+            except Exception:
+                pass
+            _text_t = ""
+            if _gid_t:
+                try:
+                    from services import group_scene as _gs_t
+                    _rows_t = [
+                        r for r in _gs_t.recent_messages(_gid_t, 40)
+                        if str(r.get("qq") or "") == str(_tgt)
+                    ]
+                    if _rows_t:
+                        _last_t = _rows_t[-1]
+                        _text_t = (f"{_last_t.get('name') or _name_t}: "
+                                   f"{_last_t.get('text') or ''}").strip()
+                except Exception:
+                    _text_t = ""
+            try:
+                await _rpl.build(
+                    session_key=_get_session_key(event),
+                    gid=_gid_t,
+                    text=_text_t,
+                    speaker_qq=_tgt,
+                    speaker_name=_name_t,
+                    seg_mids=[],
+                    replied_mids=_replied_mids_of(_get_session_key(event)),
+                    moon_target_qq=_tgt,
+                )
+            except Exception as _e:
+                logger.warning(f"[TPL] 按人跑流水线失败: {type(_e).__name__}: {_e}")
+                await bot.send(event, f"按 {_tgt} 跑流水线失败：{type(_e).__name__}: {_e}")
+                return
+        _ptxt = _rpl.dump_text()
+        for piece in _chunk_text(_ptxt, 1200):
+            try:
+                await bot.send(event, piece)
+            except Exception as e:
+                logger.warning(f"[TPL] 流水线打印失败: {e}")
+                return
+        return
     _full = _arg in ("全", "全部", "all", "full")
     key = _get_session_key(event)
     msgs = llm_mod.last_messages(key) or llm_mod.last_messages()
@@ -4672,6 +4865,11 @@ async def _session_worker(bot: Bot, session_key: str):
                     moon_target_qq=_moon_target_qq,
                 )
                 _staged = str((_pl or {}).get("text") or "")
+                # 只有标题、一个块都没拿到 → 退回静态拼装，别让空流水线把
+                # 记忆/图书馆/心情全跳过（否则她这轮什么参考都没有）。
+                if _staged.strip() == reply_pipeline.PIPE_HEADER:
+                    _staged = ""
+                    logger.info(f"[PIPE] {session_key} 全部步骤都没拿到 → 退回静态拼装")
                 if (_pl or {}).get("replied"):
                     logger.info(f"[PIPE] {session_key} 这条已经回过 → 只补一句")
             except Exception as _pe:
@@ -4791,39 +4989,101 @@ async def _session_worker(bot: Bot, session_key: str):
                 try:
                     bot_alias = str(c.get("bot") or "").strip()
                     user_name = str(c.get("user") or "").strip()
-                    if not bot_alias and not user_name:
+                    target_raw = str(c.get("target") or "").strip()
+                    del_what = str(c.get("del") or "").strip().lower()
+                    if not bot_alias and not user_name and not del_what:
                         continue
-                    # ⚠️ 用 call_name 而不是 nickname：nickname 每轮都会被群名片
-                    #    覆盖写回（worker 第 1 步），存不住聊出来的称呼。
-                    # 2026-11-24：模型经常把两个方向写反（人称混淆）→ 先纠正
+                    _gid_cn3 = str(getattr(ev, "group_id", "") or "")
+
+                    # ① 先确定这条称呼是给谁的（2026-11-24 真机：
+                    #    「你要叫他阿明」被写成了「她叫说话人阿明」）
+                    target_qq = speaker_qq
+                    if target_raw:
+                        _resolved = await _resolve_name_in_group(bot, ev, target_raw)
+                        if _resolved:
+                            target_qq = _resolved
+                        else:
+                            logger.warning(
+                                f"[CALL] target「{target_raw}」解析失败 → 不写，"
+                                f"避免记到说话人 {speaker_qq} 头上")
+                            continue
+                    elif user_name and re.search(
+                            r"(叫他|叫她|喊他|喊她|称呼他|称呼她|管他叫|管她叫|给他起|给她起)",
+                            str(text or "")):
+                        # 有第三人称线索、模型却没写 target：能唯一定位就写给他；
+                        # 定位不到就宁可不写（绝不写回说话人）。
+                        _third = await _resolve_name_in_group(bot, ev, user_name)
+                        if _third and _third != speaker_qq:
+                            target_qq = _third
+                        else:
+                            logger.warning(
+                                f"[CALL] 第三人称称呼「{user_name}」无法唯一定位 → 跳过")
+                            continue
+
+                    _target_name = speaker_name
+                    if target_qq != speaker_qq:
+                        try:
+                            _target_name = (profiles.call_of(target_qq, target_qq, _gid_cn3)
+                                            or profiles.get_profile(target_qq).get("nickname")
+                                            or target_qq)
+                        except Exception:
+                            _target_name = target_qq
+
+                    # ② 方向纠错（第三人称用目标的名片，不是说话人的）
                     bot_alias, user_name = callname.normalize_pair(
                         bot_alias, user_name,
-                        speaker_name=speaker_name,
-                        bot_names=_my_names(session_key, speaker_qq))
-                    _gid_cn3 = str(getattr(ev, "group_id", "") or "")
+                        speaker_name=_target_name,
+                        bot_names=_my_names(session_key, target_qq))
+
+                    # ③ 删除 / 写入
+                    if del_what:
+                        _old = ""
+                        try:
+                            _old = profiles.call_of(target_qq, "", _gid_cn3)
+                        except Exception:
+                            _old = ""
+                        if del_what in ("bot", "both", "all", "全部", "两个"):
+                            callname.clear_bot_call(target_qq, _gid_cn3)
+                        if del_what in ("user", "both", "all", "全部", "两个"):
+                            callname.clear_user_call(target_qq, _gid_cn3)
+                        _clear_label(target_qq)
+                        group_roster.invalidate(_gid_cn3)
+                        if _old:
+                            try:
+                                memory_v2.remember(
+                                    text=(f"称呼已作废：以后不要再把 "
+                                          f"QQ {target_qq} 叫「{_old}」"),
+                                    kind="call", about_qq=target_qq,
+                                    importance=0.9)
+                            except Exception:
+                                pass
+                        logger.info(
+                            f"[CALL] {target_qq} 删除称呼（{del_what or 'both'}）")
+                        continue
+
                     if bot_alias:
-                        callname.set_bot_call(speaker_qq, bot_alias, _gid_cn3)
+                        callname.set_bot_call(target_qq, bot_alias, _gid_cn3)
                     if user_name:
-                        callname.set_user_call(speaker_qq, user_name, _gid_cn3)
+                        callname.set_user_call(target_qq, user_name, _gid_cn3)
                     # 称呼变了 → 群聊标签缓存作废，否则上下文里还是旧名字
-                    if user_name:
-                        _clear_label(speaker_qq)
-                        group_roster.invalidate(getattr(ev, "group_id", "") or "")
+                    if user_name or bot_alias:
+                        _clear_label(target_qq)
+                        group_roster.invalidate(_gid_cn3)
                     try:
                         memory_v2.remember(
                             text=(
-                                f"我和{speaker_name}的称呼："
+                                f"我和{_target_name}的称呼："
                                 f"他叫我「{bot_alias or '没定'}」，"
-                                f"我叫他「{user_name or speaker_name}」"
+                                f"我叫他「{user_name or _target_name}」"
                             ),
                             kind="call",
-                            about_qq=speaker_qq,
+                            about_qq=target_qq,
                             importance=0.85,
                         )
                     except Exception:
                         pass
                     logger.info(
-                        f"[CALL] {speaker_qq} 称谓更新："
+                        f"[CALL] {target_qq} 称谓更新："
                         f"他叫她「{bot_alias or '—'}」/ 她叫他「{user_name or '—'}」"
                     )
                 except Exception as e:
@@ -5925,6 +6185,156 @@ async def _(event: MessageEvent, args: Message = CommandArg()):
     await _express_cmd.finish(expression.self_view() + "\n\n" + expression.status())
 
 
+# ================= 自定义说话风格（用户上传 → 主人特批）=================
+# 用户 2026-11-24：「如果他上传一套问答库，是否可以自定义一个白月光风格来跟她说话。
+#   这个我觉得可以让她上传，然后主人给特批对这个人的风格。」
+# 规则：
+#   · 本人可以给自己传；主人可以代传；
+#   · 传完是 pending，只有主人 /白月光特批 之后才进 prompt；
+#   · 样本可以是一段话、多行 Q/A，也可以引用他的一条消息。
+_style_up_cmd = on_command("白月光样本", aliases={"风格样本", "上传风格"},
+                           priority=4, block=True)
+_style_ok_cmd = on_command("白月光特批", aliases={"风格特批"},
+                           priority=4, block=True)
+_style_no_cmd = on_command("白月光驳回", aliases={"风格驳回"},
+                           priority=4, block=True)
+
+_STYLE_WAIT: dict = {}
+_STYLE_WAIT_TTL = 300.0
+
+
+def _style_target(event, raw: str) -> str:
+    """@ 的人优先；其次正文里的 5~12 位 QQ 号。"""
+    ats = [q for q in _at_targets(event) if q not in ("all", "everyone")]
+    if ats:
+        return _canon_at(ats)[0]
+    m = re.search(r"(?<!\d)(\d{5,12})(?!\d)", str(raw or ""))
+    return m.group(1) if m else ""
+
+
+def _style_quoted_text(event) -> str:
+    rp = getattr(event, "reply", None)
+    if rp is None:
+        return ""
+    try:
+        return str(rp.message.extract_plain_text() or "").strip()
+    except Exception:
+        return ""
+
+
+@_style_up_cmd.handle()
+async def _(event: MessageEvent, args: Message = CommandArg()):
+    if not isinstance(event, GroupMessageEvent):
+        await _style_up_cmd.finish("这个功能在群里用。")
+    gid = str(event.group_id)
+    uid = str(event.user_id)
+    raw = args.extract_plain_text().strip()
+    target = _style_target(event, raw)
+    body = raw
+    if target:
+        body = re.sub(r"(?<!\d)" + re.escape(target) + r"(?!\d)", "", body, count=1).strip()
+    if body in ("查看", "状态", "看"):
+        from services import style_vault as _sv
+        await _style_up_cmd.finish(_sv.status_text(gid, target or uid))
+    if not target:
+        target = uid
+    if target != uid and not is_owner(uid):
+        await _style_up_cmd.finish("只能上传你自己的说话风格（主人可以代传）。")
+    if not body:
+        body = _style_quoted_text(event)
+    if not body:
+        _STYLE_WAIT[uid] = {"gid": gid, "target": target,
+                            "until": time.time() + _STYLE_WAIT_TTL}
+        await _style_up_cmd.finish(
+            f"好，{_STYLE_WAIT_TTL / 60:.0f} 分钟内把 {target} 的说话样本发过来。\n"
+            "· 一段话、多行 Q/A 都行；\n"
+            "· 也可以引用他的一条消息再发 /白月光样本；\n"
+            "· 上传后要主人 `/白月光特批 @" + target + "` 才生效。")
+    from services import style_vault as _sv
+    try:
+        rec = _sv.submit(gid, target, body, uid, display_name(event))
+    except Exception as e:
+        await _style_up_cmd.finish(f"没收下：{type(e).__name__}: {e}")
+    await _style_up_cmd.finish(
+        f"✅ 已收到 {rec.get('name') or target} 的风格样本"
+        f"（{len(rec.get('text') or '')} 字）。\n"
+        f"等主人 `/白月光特批 @{rec.get('name') or target}` 后生效。")
+
+
+def _style_wait_rule(event: MessageEvent) -> bool:
+    uid = str(event.user_id)
+    info = _STYLE_WAIT.get(uid)
+    if not info:
+        return False
+    if time.time() > float(info.get("until") or 0):
+        _STYLE_WAIT.pop(uid, None)
+        return False
+    if not isinstance(event, GroupMessageEvent):
+        return False
+    if str(event.group_id) != str(info.get("gid") or ""):
+        return False
+    t = str(event.get_plaintext() or "").strip()
+    return bool(t) and not t.startswith("/")
+
+
+_style_wait_recv = on_message(rule=Rule(_style_wait_rule), priority=2, block=True)
+
+
+@_style_wait_recv.handle()
+async def _(event: GroupMessageEvent):
+    info = _STYLE_WAIT.pop(str(event.user_id), {}) or {}
+    gid = str(info.get("gid") or event.group_id)
+    target = str(info.get("target") or event.user_id)
+    body = str(event.get_plaintext() or "").strip()
+    from services import style_vault as _sv
+    try:
+        rec = _sv.submit(gid, target, body, str(event.user_id), display_name(event))
+    except Exception as e:
+        await _style_wait_recv.finish(f"没收下：{type(e).__name__}: {e}")
+    await _style_wait_recv.finish(
+        f"✅ 已收到 {rec.get('name') or target} 的风格样本"
+        f"（{len(rec.get('text') or '')} 字）。等主人 `/白月光特批 @{rec.get('name') or target}`。")
+
+
+@_style_ok_cmd.handle()
+async def _(event: MessageEvent, args: Message = CommandArg()):
+    if not is_owner(str(event.user_id)):
+        await _style_ok_cmd.finish("仅主人可特批。")
+    if not isinstance(event, GroupMessageEvent):
+        await _style_ok_cmd.finish("这个功能在群里用。")
+    gid = str(event.group_id)
+    raw = args.extract_plain_text().strip()
+    from services import style_vault as _sv
+    if raw in ("列表", "list", "待批", ""):
+        await _style_ok_cmd.finish(_sv.status_text(gid))
+    target = _style_target(event, raw)
+    if not target:
+        await _style_ok_cmd.finish("要 @ 谁，或写 QQ 号。用法：/白月光特批 @某人")
+    rec = _sv.approve(gid, target, str(event.user_id))
+    if not rec:
+        await _style_ok_cmd.finish(f"{target} 在这个群没有待批的样本。")
+    await _style_ok_cmd.finish(
+        f"✅ 已特批：{rec.get('name') or target}（{target}）的风格样本生效。\n"
+        "回他时会按这套样本的句长/标点/口头禅来说。")
+
+
+@_style_no_cmd.handle()
+async def _(event: MessageEvent, args: Message = CommandArg()):
+    if not is_owner(str(event.user_id)):
+        await _style_no_cmd.finish("仅主人可驳回。")
+    if not isinstance(event, GroupMessageEvent):
+        await _style_no_cmd.finish("这个功能在群里用。")
+    gid = str(event.group_id)
+    target = _style_target(event, args.extract_plain_text().strip())
+    if not target:
+        await _style_no_cmd.finish("要 @ 谁，或写 QQ 号。用法：/白月光驳回 @某人")
+    from services import style_vault as _sv
+    rec = _sv.reject(gid, target, str(event.user_id))
+    if not rec:
+        await _style_no_cmd.finish(f"{target} 在这个群没有待批的样本。")
+    await _style_no_cmd.finish(f"已驳回：{rec.get('name') or target}（{target}）。")
+
+
 # ================= /测函数 —— 在 QQ 里直接验证新链路 =================
 # 目的：不用翻日志，发一条命令就能看到各环节的实际输出。
 _test_fn = on_command("测函数", priority=5, block=True)
@@ -6614,8 +7024,11 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
         await _test_fn.finish(callname.status(_tgt_qq or "", _cg))
 
     if what.startswith(("流水线", "pipeline", "取数")):
-        # /测函数 流水线 —— 每一步耗时 + 上次拉了哪些块
+        # /测函数 流水线 —— 每一步耗时 + 上次拉了哪些块；
+        # 加「全」打印完整内容（和 /看模板 流水线 同源）。
         from services import reply_pipeline as _rpl
+        if "全" in what or "全文" in what:
+            await _test_fn.finish(_rpl.dump_text())
         await _test_fn.finish("▍动态取数流水线\n" + _rpl.stats_text())
 
     if what.startswith(("记忆", "图书馆", "memory", "library")):
@@ -6716,6 +7129,14 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
                 _l.append("· 他最近说的（用来对照她学得像不像）：")
                 for _r in _rows:
                     _l.append("   · " + str(_r.get("text") or "")[:60])
+        except Exception:
+            pass
+        try:
+            from services import style_vault as _sv_s
+            _gid_sv = (_tgt_gid2 or _tgt_gid
+                       or str(getattr(event, "group_id", "") or ""))
+            _l.append("")
+            _l.append(_sv_s.status_text(_gid_sv, _qq_s))
         except Exception:
             pass
         await _test_fn.finish("\n".join(_l))
@@ -7773,6 +8194,33 @@ async def _resolve_target_qq(name: str) -> str:
     return ""
 
 
+async def _resolve_name_in_group(bot, ev, name: str) -> str:
+    """把名字/@/QQ 解析成 QQ；**显式传 bot/ev**，不依赖 TOOL_CTX。
+
+    为什么不用 `_resolve_target_qq`：它读全局 TOOL_CTX，并发会话下可能已经被
+    别的群覆盖；称呼写错人就是这么来的（2026-11-24 真机）。
+    """
+    raw = str(name or "").strip()
+    m = re.search(r"(?<!\d)(\d{5,12})(?!\d)", raw)
+    if m:
+        return m.group(1)
+    raw = re.sub(r"[\[<]{1,2}\s*at\s*:?\s*([^\]>]*)[\]>]{1,2}", r"\1", raw,
+                 flags=re.IGNORECASE)
+    raw = raw.lstrip("@＠").strip().strip("「」『』\"'“” ")
+    if not raw:
+        return ""
+    gid = getattr(ev, "group_id", 0) or 0
+    if gid and bot:
+        try:
+            members = await group_roster.members_of(bot, gid)
+            hit = group_roster.find(members, raw, limit=1)
+            if hit:
+                return str(hit[0].get("user_id") or "")
+        except Exception:
+            pass
+    return ""
+
+
 def _lore_scope() -> str:
     """lorebook 的命名空间：群用群号，私聊用 private_QQ（私聊也有自己的词条）。"""
     ev = llm_mod.TOOL_CTX.get("event")
@@ -7867,11 +8315,11 @@ async def _tool_profile_update(args: dict) -> str:
 
 
 async def _tool_set_call(args: dict) -> str:
-    """设置称呼（方向显式，不再靠模型自己分你我）。"""
+    """设置 / 删除称呼（方向显式，支持 target 第三人称）。"""
     who = str(args.get("who") or "").strip().lower()
     name = str(args.get("name") or "").strip()
-    if who not in ("user", "bot") or not name:
-        return "要说明是哪个方向：who=user（你怎么叫他）/ bot（他怎么叫你），还要给 name"
+    if who not in ("user", "bot", "both"):
+        return "要说明方向：who=user（你怎么叫他）/ bot（他怎么叫你）/ both（两个都改）"
     ev = llm_mod.TOOL_CTX.get("event")
     gid = str(getattr(ev, "group_id", "") or "")
     speaker = str(llm_mod.TOOL_CTX.get("speaker_qq") or "")
@@ -7882,11 +8330,22 @@ async def _tool_set_call(args: dict) -> str:
             target = await _resolve_target_qq(tname) or speaker
         except Exception:
             target = speaker
-    if who == "bot":
+    # 删除：name 为空 / 删 / 删除 / forget / del
+    if not name or name.lower() in ("删", "删除", "删掉", "清", "清除", "forget", "del"):
+        if who in ("bot", "both"):
+            callname.clear_bot_call(target, gid)
+        if who in ("user", "both"):
+            callname.clear_user_call(target, gid)
+        _clear_label(target)
+        group_roster.invalidate(gid)
+        return f"删掉了 {target} 的称呼（{who}）"
+    if who in ("bot", "both"):
         callname.set_bot_call(target, name, gid)
-        return f"记下了：他叫你「{name}」（{gid or '全局'}）"
-    callname.set_user_call(target, name, gid)
-    return f"记下了：你叫他「{name}」（{gid or '全局'}）"
+    if who in ("user", "both"):
+        callname.set_user_call(target, name, gid)
+    _clear_label(target)
+    group_roster.invalidate(gid)
+    return f"记下了：{target} 的称呼「{name}」（{who}，{gid or '全局'}）"
 
 
 async def _tool_lore_add(args: dict) -> str:
@@ -8512,20 +8971,24 @@ register_tool(
         "function": {
             "name": "set_call",
             "description": (
-                "记下你俩的称呼（这个群里生效）。who=user 表示「你该怎么叫他」，"
-                "who=bot 表示「他该怎么叫你」。"
+                "记下 / 删除称呼（这个群里生效）。who=user 表示「你该怎么叫他」，"
+                "who=bot 表示「他该怎么叫你」，who=both 两个都改。"
                 "⚠️ 用户说「我叫你 X」→ who=bot、name=X；"
                 "用户说「你叫我 Y」→ who=user、name=Y。别写反。"
+                "⚠️ 如果是给**第三个人**定称呼（「你要叫他阿明」），必须填 target；"
+                "不填 target = 当前说话人，会把别人的称呼记错人。"
+                "要删除就把 name 留空或写「删」。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "who": {"type": "string", "enum": ["user", "bot"]},
-                    "name": {"type": "string", "description": "称呼，12 字以内"},
+                    "who": {"type": "string", "enum": ["user", "bot", "both"]},
+                    "name": {"type": "string",
+                             "description": "称呼（12 字以内）；删除时留空或写「删」"},
                     "target": {"type": "string",
                                "description": "给谁设（名字/@/QQ）；不填=当前说话人"},
                 },
-                "required": ["who", "name"],
+                "required": ["who"],
             },
         },
     },

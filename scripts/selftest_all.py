@@ -610,8 +610,8 @@ async def t_mood():
     check(S, "THINK_PROTOCOL" in _llm_src and "每一条回复" in _llm_src
           and "[[THINK|你此刻心里那句话]]" in _llm_src,
           "THINK_PROTOCOL 要求每轮都写")
-    check(S, '("06b 你的心里话", THINK_PROTOCOL.strip())' in _llm_src,
-          "系统提示里有「06b 你的心里话」这一节")
+    check(S, '("06b 心里话", THINK_PROTOCOL.strip())' in _llm_src,
+          "系统提示里有「06b 心里话」这一节")
     check(S, "写了 [[MOOD]] 也不能省掉 THINK" in _llm_src,
           "post-history 最后再压一遍「THINK 每条必写」（真机命中率 2/7 的修法）")
     # 命中统计（能量化「是不是每句都带了」）
@@ -912,16 +912,23 @@ async def t_persona():
     if fp and fp.exists():
         raw = fp.read_text(encoding="utf-8").strip()
         check(S, prompt == raw, f"默认人格 prompt 与 txt 原文逐字一致（{len(raw)} 字）")
-        check(S, "群聊说话铁律" in raw or len(raw) > 5000, "txt 是完整角色卡（不是短风格）")
+        # 2026-11-24 用户定稿：人设卡只保留「你是谁（含外貌）」+「性格」，
+        # 说话案例/铁律/底线都交给固定区协议，不再用「长度 > 5000」判断完整卡。
+        check(S, len(raw) > 500 and "一、你是谁" in raw and "二、性格" in raw,
+              f"人设卡是精简版两节（{len(raw)} 字）")
 
         # 人格卡内容审计（2026-11-18）：不能出现本程序里不存在的 API / 已被否掉的规则
         for _bad in ("get_message_images", "web_fetch", "replyToMessageId", "send_message"):
             check(S, _bad not in raw, f"人格卡里没有不存在的 API：{_bad}")
         check(S, "电子生命" not in raw, "人格卡去掉了「电子生命/无限制」那条")
-        check(S, "不要用括号" in raw, "人格卡明确禁止括号小动作")
-        check(S, "你对 X 的称呼" in raw,
-              "人格卡区分「你把X叫什么」和「你叫什么」")
-        check(S, "被纠正不丢人" in raw, "人格卡要求被纠正后重新理解")
+        # 这几条规则已经从人设卡移到固定区协议（services/llm.py），
+        # 断言也跟着移到 llm.py，避免「人设卡瘦身」把已修 bug 悄悄丢掉。
+        _llm_src = (ROOT / "services" / "llm.py").read_text(
+            encoding="utf-8", errors="ignore")
+        check(S, "不要用括号" in _llm_src, "系统协议明确禁止括号小动作")
+        check(S, "你对 X 的称呼" in _llm_src,
+              "系统协议区分「你把X叫什么」和「你叫什么」")
+        check(S, "被纠正不丢人" in _llm_src, "系统协议要求被纠正后重新理解")
     else:
         skip(S, "默认人格没有对应 txt 文件，跳过逐字一致性检查")
 
@@ -1597,10 +1604,10 @@ async def t_text():
         from services.llm import _length_rule
         g = _length_rule("group_123")
         p = _length_rule("private_456")
-        check(S, "群聊" in g and "20" in g and "合并转发" in g,
+        check(S, "20" in g and "合并转发" in g,
               f"群聊规则：{g[:40]}…")
-        check(S, "私聊" in p and "合并转发" in p and "20" in p,
-              f"私聊规则（和群聊同一条规矩）：{p[:40]}…")
+        check(S, "20" in p and "合并转发" in p,
+              f"私聊规则：{p[:40]}…")
     except Exception as e:
         check(S, False, "导入 services.llm._length_rule 失败", f"{type(e).__name__}: {e}")
 
@@ -3051,7 +3058,7 @@ async def t_timing():
     # ---------- ④ 别学脏话 / 图片文字不是对话 ----------
     check(S, "别学坏" in llm_src, "有「别学坏」风格约束")
     check(S, "不要跟着用" in llm_src, "明确要求不跟脏话")
-    check(S, "图片里的文字不是对你说的" in pb_src, "人称协议补了「图片文字不是对你说的」")
+    check(S, "图里的字不是对你说的" in pb_src, "人称协议补了「图片文字不是对你说的」")
 
     # ---------- ⑤ 记忆去噪 ----------
     check(S, "def is_noise" in mem_src, "memory_v2 有 is_noise")
@@ -3071,7 +3078,7 @@ async def t_timing():
     check(S, "（猜）" in vision_src, "识图 prompt 要求给角色猜测并标注")
     check(S, "_GUESS_MARK" in vision_src, "解析时会剥掉「（猜）」")
     check(S, "guess: bool = False" in vision_src, "compose 支持「仅猜测」和 NSFW 标注")
-    check(S, "宁可多查一次" in llm_src, "引导她善用工具（不确定就查）")
+    check(S, "不懂就 [[SEARCH|" in llm_src, "引导她善用工具（不懂就查）")
 
     # ---------- ⑧ 上下文质量：图片消息的当前消息必须回到 user 位置 ----------
     # ---------- ⑨b 未定义名字（NameError 预防）----------
@@ -3103,7 +3110,7 @@ async def t_timing():
           "翻历史/工具目录不做压缩（压缩会丢时间线/格式）")
     check(S, "这一条在跟你说话的人" in llm_src,
           "系统会给「跟你说话的人」一张 brief 人物卡")
-    check(S, '("00 你能用的东西（菜单）", _menu)' in llm_src,
+    check(S, '("00 工具", _menu)' in llm_src,
           "菜单排在最前面（▍00）")
 
     # ---------- 群聊里「玩」要 @ 才放开 ----------
@@ -3311,6 +3318,13 @@ async def t_call():
     p4 = A.parse_reply("好呀\n[[CALL|bot:小鲸")
     check(S, "CALL" not in " ".join(i["value"] for i in p4["items"]),
           "被截断的半截 CALL 也会清掉")
+    # 2026-11-24：第三人称必须带 target；删除用 del
+    p5 = A.parse_reply("好[[CALL|user:阿明|target:小明]]")
+    check(S, (p5["calls"] or [{}])[0].get("target") == "小明",
+          "CALL 能解析 target（第三人称）")
+    p6 = A.parse_reply("删掉[[CALL|del:user|target:30003]]")
+    check(S, (p6["calls"] or [{}])[0].get("del") == "user",
+          "CALL 能解析 del（删除称呼）")
 
     # ---------- ② 落库：call_name / bot_alias ----------
     qq = "30003"
@@ -3327,6 +3341,23 @@ async def t_call():
           "群名片覆盖 nickname 时 call_name 不受影响")
     card = profiles.brief_card(qq)
     check(S, "阿明" in card, f"档案卡优先显示 call_name：{card}")
+
+    # ---------- ②.5 删除称呼：两个方向 + aliases 都要清 ----------
+    from services import callname as CN
+    qq2 = "30004"
+    profiles._save("profile", qq2, {})
+    CN.set_user_call(qq2, "阿明", "g_test")
+    CN.set_bot_call(qq2, "小鱼", "g_test")
+    check(S, CN.user_call_of(qq2, "g_test") == "阿明", "删除前：她叫他阿明")
+    check(S, "小鱼" in CN.bot_names("g_test"), "删除前：他叫她小鱼")
+    CN.clear_all(qq2, "g_test")
+    check(S, CN.user_call_of(qq2, "g_test") == "", "删除后：她叫他已清空")
+    check(S, "小鱼" not in CN.bot_names("g_test"), "删除后：他叫她已清空")
+    _p2 = profiles.get_profile(qq2)
+    check(S, not _p2.get("call_name") and not _p2.get("bot_alias"),
+          "删除后：档案 call_name / bot_alias 都清掉")
+    check(S, "阿明" not in (_p2.get("aliases") or []),
+          "删除后：aliases 里的旧称呼也移除（否则名册还会找回来）")
 
     # ---------- ③ [[AT]] → 真 @ 段 ----------
     members = [
@@ -3416,10 +3447,10 @@ async def t_call():
 
     # ---- 人称说明（不能一概说「他说的你就是你」）----
     pb0 = (ROOT / "services" / "prompt_builder.py").read_text(encoding="utf-8", errors="ignore")
-    check(S, "不一定" in pb0 and "你」**不一定**是你" in pb0,
+    check(S, "不一定" in pb0 and "「你」不一定是你" in pb0,
           "明确「你」不一定指她（群里还有别人）")
-    check(S, "① 这条消息 @ 了你" in pb0, "列出「你」才指她的三种情况")
-    check(S, "拿不准的时候，就当成在说别人" in pb0, "拿不准时不要硬接")
+    check(S, "只有 @你 / 喊你名 / 接你上一句" in pb0, "列出「你」才指她的条件")
+    check(S, "拿不准就当在说别人" in pb0, "拿不准时不要硬接")
     check(S, "▍现在时间" in pb0, "prompt 里带当前时间（▍编号分块）")
 
     # ---- 主动插话：不能顺着自己的话再接 ----
@@ -3462,7 +3493,8 @@ async def t_call():
     check(S, "★ 最新一句" not in llm_src3,
           "去掉了错误的「★ 最新一句」（ctx 不含当前消息，标错会一直接旧话）")
     check(S, "FOCUS_PROTOCOL" in llm_src3, "有 FOCUS 协议（让她标注回哪条）")
-    check(S, "FOCUS_PROTOCOL.strip()" in llm_src3, "FOCUS 协议注入了群聊 prompt")
+    check(S, "focus_sessions" in chat_src,
+          "关注期由硬逻辑处理（不再靠 FOCUS 协议进 prompt）")
     check(S, "FOCUS_RE" in (ROOT / "services" / "aura_logic.py").read_text(
         encoding="utf-8", errors="ignore"), "能解析 [[FOCUS|N]]")
     check(S, "[FOCUS]" in chat_src, "日志里打印她回的是哪条")
@@ -3544,10 +3576,10 @@ async def t_call():
     pb = (ROOT / "services" / "prompt_builder.py").read_text(encoding="utf-8", errors="ignore")
     # 人称已移到固定区（llm 的 ▍10），build_prompt 里不再有
     _llm_src2 = (ROOT / "services" / "llm.py").read_text(encoding="utf-8", errors="ignore")
-    check(S, "PERSONA_RULE" in _llm_src2 and "10 人称与指代" in _llm_src2,
+    check(S, "PERSONA_RULE" in _llm_src2 and "10 人称" in _llm_src2,
           "人称说明在固定区 ▍10（能吃到前缀缓存）")
     check(S, "▍人称与指代" not in pb, "build_prompt 不再重复拼人称")
-    check(S, "群友说的「我」指他自己" in pb, "明确「我」指用户不是她")
+    check(S, "群友的「我」=他自己" in pb, "明确「我」指用户不是她")
 
     # ---- .env 体检：重复项 / 已废弃项 ----
     envp = ROOT / ".env"
@@ -4053,9 +4085,9 @@ async def t_song():
     check(S, "|清唱]]" in _llmsrc, "提示词里教了清唱标记")
     # 上下文接不上怎么办（2026-11-12 用户要求）
     check(S, "带 ⭐ 的是在叫你" in _llmsrc, "提示词解释了上下文里的 ⭐")
-    check(S, "回几条你自己定" in _llmsrc, "提示词允许她按对话需要回 1~3 条，但每条要踩在点上")
-    check(S, "关注三句 ≠ 连回三句" in _llmsrc, "提示词说明关注是为了看懂，不是连回三句")
-    check(S, "主动接话前先看全" in _llmsrc, "主动接话也要先看全上下文")
+    check(S, "多条用一条答完" in _llmsrc, "多条 @ 用一条答完")
+    check(S, "(不想回复)" in _llmsrc, "保留不接话权")
+    check(S, "其他随心情" in _llmsrc, "接不接由心情/硬逻辑，不再长篇规则")
     _tdsrc = (ROOT / "plugins" / "tool_dispatcher" / "__init__.py").read_text(
         encoding="utf-8", errors="ignore")
     check(S, 'task.get("type") == "probe"' in _tdsrc,
@@ -4278,7 +4310,7 @@ async def t_static():
     check(S, llm_raw.count("[[MEMO|emotion") >= 2,
           f"MEMO_PROTOCOL 至少 2 个 few-shot 示例（实际 {llm_raw.count('[[MEMO|emotion')} 个）")
     check(S, "最多 2 条" in llm_raw, "MEMO 规则写明最多 2 条")
-    check(S, "只有真的触动你" in llm_raw, "MEMO 规则写明「不触动就不写」")
+    check(S, "寒暄/知识问答不记" in llm_raw, "MEMO 规则写明「不触动就不写」")
 
     # ---- 回复追踪：每次调用的完整 prompt 落盘 + 对比脚本 ----
     check(S, "_trace_dump" in llm, "llm 把每次调用的完整 prompt 落盘（LLM_TRACE）")
@@ -4521,7 +4553,7 @@ async def t_static():
     for _w in ("(不想回复)", "（不想回复）", "[不想回复]", "不想回复", "(沉默)"):
         check(S, is_silence(_w), f"「{_w}」判为不接话")
     check(S, not is_silence("今天天气不错"), "正常内容不被误判成不接话")
-    check(S, "不接话权" in code_only("services/llm.py"), "system 里告知了不接话权")
+    check(S, "(不想回复)" in code_only("services/llm.py"), "system 里告知了不接话权")
     check(S, "link_preview" in cc, "chat 里接入转发卡片")
     vv = code_only("plugins/vision_agent/__init__.py")
     check(S, "[图片]" in vv, "群友发图会写进群聊上下文")
@@ -4590,8 +4622,8 @@ async def t_static():
     check(S, not _REQ_RE.search("普通回复"), "普通回复不误判")
     check(S, bool(_REQ_RE.search("[[SING|晴天]]")), "识别 [[SING|歌名]]（群聊也能唱）")
     llm_src = code_only("services/llm.py")
-    check(S, "不确定就查" in llm_src, "system 里告诉她不确定就查（原「可以主动要资料」）")
-    check(S, "先查本地图书馆" in llm_src, "兜底顺序：图书馆 → 搜索 → 说不知道")
+    check(S, "不懂就 [[SEARCH|" in llm_src, "system 里告诉她不懂就查")
+    check(S, "查不到说「不知道」" in llm_src, "查不到别编")
     check(S, "搜索到的内容" in llm_src, "补齐格式：搜索到的内容")
     check(S, "本地agent知识库图书馆内容" in llm_src, "补齐格式：图书馆内容")
     # 搜索结果要压缩，别把 900 字原样塞进 prompt
@@ -5433,7 +5465,7 @@ async def t_archive():
     _chat = (ROOT / "plugins" / "chat" / "__init__.py").read_text(encoding="utf-8")
     check(S, "focus_card" in _pb and "lore_scope" in _pb, "build_packet 产出 focus 卡与词条 scope")
     check(S, "这一条在跟你说话的人" in _llm, "llm 把 brief 人物卡插到当前消息上方")
-    check(S, "_post_rules" in _llm and "这条回复的硬要求" in _llm, "有 post-history 硬提醒")
+    check(S, "_post_rules" in _llm and "【最后确认】" in _llm, "有 post-history 硬提醒")
     check(S, "COMM_PROTOCOL" in _llm and "不要替别人说话" in _llm, "有沟通策略协议")
     check(S, "profile_card" in _chat and "profile_update" in _chat and "lore_add" in _chat,
           "LLM 可调档案图 / 档案更新 / 词条写入")
@@ -5503,8 +5535,8 @@ async def t_archive():
           "/测函数 支持尾部群号/QQ号参数（私聊可测别的群）")
     check(S, "CONFUSED_PROTOCOL" in _llm and "突然接不上" in _llm,
           "有「突然接不上先翻历史」协议")
-    check(S, "接不上就先翻历史" in _llm and "[[[HISTORY|20]]]" in _llm,
-          "post-history 有翻历史硬提醒")
+    check(S, "[[[HISTORY|20]]]" in _llm,
+          "历史块保留翻历史提示")
     check(S, "更早的已被折叠" in _llm, "历史块提示上下文已折叠")
 
     # 图片渲染（环境没 Pillow 就跳过）
@@ -5997,8 +6029,7 @@ async def t_scene():
     check(S, "if _bg_text:" in _llm, "普通文字聊天不再丢弃 build_prompt 背景段")
     # 2026-11-23 用户：「艾特也不回复」→ 一段里多条 @ 必须逐条回应，
     # 不能再写「只接一个线程 / 默认回最后一条」。
-    check(S, "多条 @ 你" in _llm and "一条回复全部答完" in _llm
-          and "只接一个线程" not in _llm,
+    check(S, "多条用一条答完" in _llm and "只接一个线程" not in _llm,
           "@ 她的消息要求逐条回应（一条消息答完，不再只接一个线程）")
     _seg = (ROOT / "services" / "segments.py").read_text(encoding="utf-8")
     check(S, "def _pick_rows" in _seg and "必须回应" in _seg,
@@ -6063,8 +6094,8 @@ async def t_scene():
           "防抖表：裸图等下载、在叫她更快")
     check(S, "_VIEW_FREQ" in _chat and "[SILENCE]" in _chat,
           "查看频率 + 静默唤醒已接线")
-    check(S, "02d 注意力风格" in _llm and "conv_state.render(key)" in _llm,
-          "注意力风格与对话状态已进 prompt")
+    check(S, "conv_state.render(key)" in _llm,
+          "对话状态已进 prompt（注意力风格改由硬逻辑，不再占常驻）")
     # ---- 表达学习（2026-11-19）：群 / 人 两个作用域 + 自我视角 ----
     try:
         from services import expression as _ex

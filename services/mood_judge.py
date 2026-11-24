@@ -168,17 +168,27 @@ def recent_think(session_key: str, n: int = 3) -> list:
 _SUM_CACHE: dict = {}
 
 
-async def summarize(text: str, session_key: str = "") -> str:
-    """把「要回的那句话」压成一句事实（给记忆/图书馆当检索词）。
+async def summarize(text: str, session_key: str = "", ctx_lines=None,
+                    *, speaker: str = "") -> str:
+    """把「要回的那句话」结合最近上下文压成一句事实（给记忆/图书馆当检索词）。
 
     2026-11-24 用户流水线：心情 LLM 对这段话的总结 → 用总结查记忆 → 查图书馆。
-    所以这里只做**事实摘要**，不判心情、不写库：
-      「他问上次那家蛋糕店叫什么，顺带吐槽自己又胖了」
+    2026-11-24 用户实测 bug：群友说「我小时候也玩过这个（抛硬币）」，另一句
+    「我身高 192」被她理解成「玩到了 192 关」。根因是这里只喂了**当前这一句**，
+    没有上下文，模型只能按字面猜；数字/单位一补就错。
+
+    所以现在：
+      · 带上最近 8~10 条（谁 → 谁），先判断这句在接哪句；
+      · 数字/量词**按字面保留**，不自己补成关卡/等级/分数；
+      · 仍然只做事实摘要，不判心情、不写库。
     """
     t = str(text or "").strip()
     if not t:
         return ""
-    key = f"{session_key}|{t[:60]}|{len(t)}"
+    ctx = [re.sub(r"\s+", " ", str(x or "")).strip()[:140]
+           for x in (ctx_lines or []) if str(x or "").strip()][-10:]
+    key = (f"{session_key}|{speaker[:20]}|{t[:60]}|{len(t)}|"
+           f"{hash(tuple(ctx[-6:]))}")
     hit = _SUM_CACHE.get(key)
     if hit and time.time() - float(hit[1]) < 600:
         return str(hit[0])
@@ -186,14 +196,26 @@ async def summarize(text: str, session_key: str = "") -> str:
     base, key_api = _base()
     if not base or not key_api:
         return ""
-    prompt = (
-        "把下面这段话压成一句客观事实（给检索用）：\n"
-        "· 不超过 40 字；\n"
-        "· 保留具体名词（人名/东西/地点/事件）；\n"
-        "· 不要评价、不要回答它、不要用「我」；\n"
-        "· 只输出这一句。\n\n"
-        f"{t[:600]}"
-    )
+    lines = [
+        "你是群聊事实判读员，不聊天、不评价，只做标注。",
+        "任务：先判断【要回的这一句】在接哪句、到底在说什么，再压成一句事实。",
+        "规则：",
+        "· 结合【最近聊天】里的指代/省略，不要只看字面；",
+        "· 数字/量词按字面保留：写「他说自己 192」就够了，"
+        "不要自己补成「192 关 / 192 级 / 192 分」；拿不准单位就写「（没说是什么）」；",
+        "· 如果【要回的这一句】是 [图片]/[表情]/[视频] 或几乎没有文字，"
+        "就总结「他在接上文的哪件事 / 群里在聊什么」，"
+        "**不要写「内容未显示完整 / 缺少上下文 / 无法判断」这类元评论**；",
+        "· 不要评价、不要回答它、不要用「我」；",
+        "· 不超过 50 字，只输出这一句。",
+        "",
+    ]
+    if ctx:
+        lines.append("【最近聊天（最后一条最新）】")
+        lines.extend(f"{i}. {x}" for i, x in enumerate(ctx, 1))
+        lines.append("")
+    lines.append(f"【要回的这一句】{speaker or '对方'}：{t[:400]}")
+    prompt = "\n".join(lines)
     payload = {
         "model": MODEL or "deepseek-chat",
         "messages": [
@@ -201,7 +223,7 @@ async def summarize(text: str, session_key: str = "") -> str:
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.2,
-        "max_tokens": 80,
+        "max_tokens": 90,
     }
     try:
         import httpx

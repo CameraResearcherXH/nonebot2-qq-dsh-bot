@@ -140,6 +140,94 @@ def set_user_call(qq: str, name: str, gid: str = "") -> str:
     return name
 
 
+# ================= 删除 =================
+def clear_user_call(qq: str, gid: str = "") -> bool:
+    """删掉「她叫他什么」（本群 + 全局），并清档案里的 call_name。"""
+    qq = str(qq or "").strip()
+    if not qq:
+        return False
+    d = _load()
+    (d.get("global", {}).get("user") or {}).pop(qq, None)
+    if gid:
+        g = ((d.get("groups") or {}).get(str(gid)) or {})
+        (g.get("user") or {}).pop(qq, None)
+    _save(d)
+    try:
+        from . import profiles
+        profiles.clear_call_names(qq, call_name=True, bot_alias=False, gid=gid)
+    except Exception as e:
+        logger.debug(f"[CALLNAME] 清档案失败: {type(e).__name__}: {e}")
+    logger.info(f"[CALLNAME] 删除「她叫 {qq}」{'@' + str(gid) if gid else ''}")
+    return True
+
+
+def clear_bot_call(qq: str, gid: str = "") -> bool:
+    """删掉「他叫她什么」（这个 QQ 名下的所有别名），并清档案 bot_alias。"""
+    qq = str(qq or "").strip()
+    if not qq:
+        return False
+    d = _load()
+
+    def _drop(scope: dict) -> None:
+        for name, owner in list((scope.get("bot") or {}).items()):
+            if str(owner) == qq:
+                scope["bot"].pop(name, None)
+
+    _drop(d.get("global", {}))
+    if gid:
+        _drop(((d.get("groups") or {}).get(str(gid)) or {}))
+    _save(d)
+    try:
+        from . import profiles
+        profiles.clear_call_names(qq, call_name=False, bot_alias=True, gid=gid)
+    except Exception as e:
+        logger.debug(f"[CALLNAME] 清档案失败: {type(e).__name__}: {e}")
+    logger.info(f"[CALLNAME] 删除「{qq} 叫她」{'@' + str(gid) if gid else ''}")
+    return True
+
+
+def clear_all(qq: str, gid: str = "") -> None:
+    """两个方向一起删（/删称呼 默认行为）。"""
+    clear_user_call(qq, gid)
+    clear_bot_call(qq, gid)
+
+
+def clear_name(qq: str, name: str, gid: str = "") -> bool:
+    """只删一个具体名字（`/删称呼 QQ 阿明`）。
+
+    为什么不能只靠 clear_all：
+      · clear_all 只清「当前 call_name」，如果「阿明」早就被换成「老大」，
+        它还留在 profiles.aliases 里，`group_roster` 下次又会把它找回来；
+      · 用户明确点名要删「阿明」时，应该按名字精确清，而不是把两个方向全清掉。
+    """
+    qq = str(qq or "").strip()
+    name = _clean(name)
+    if not qq or not name:
+        return False
+    d = _load()
+
+    def _drop(scope: dict) -> None:
+        bot = scope.get("bot") or {}
+        if str(bot.get(name) or "") == qq:
+            bot.pop(name, None)
+        user = scope.get("user") or {}
+        if str(user.get(qq) or "") == name:
+            user.pop(qq, None)
+
+    _drop(d.get("global", {}))
+    if gid:
+        _drop((d.get("groups") or {}).get(str(gid)) or {})
+    _save(d)
+    try:
+        from . import profiles
+        profiles.remove_alias(qq, name)
+    except Exception as e:
+        logger.debug(f"[CALLNAME] 清别名失败: {type(e).__name__}: {e}")
+    logger.info(f"[CALLNAME] 删除 {qq} 的称呼「{name}」"
+                f"{'@' + str(gid) if gid else ''}")
+    return True
+
+
 # ================= 读取 =================
 def bot_names(gid: str = "") -> set:
     """这个群里「他叫她」的所有名字（含全局兜底）。"""
@@ -186,21 +274,34 @@ def user_call_of(qq: str, gid: str = "", fallback: str = "") -> str:
         return fallback
 
 
-def render(qq: str, gid: str = "", speaker_name: str = "") -> str:
-    """给 prompt 用的一小段（固定区，省 token）。"""
-    u = user_call_of(qq, gid, fallback=speaker_name or "")
-    b = ""
+def bot_call_of(qq: str, gid: str = "") -> str:
+    """他叫她什么：本群 > 全局（这个 QQ 名下记过的名字）。
+
+    档案卡 / /档案 文字 / reply_pipeline 都走这里，避免它们各读一份
+    profiles.bot_alias，导致「索引改了、档案没改」。
+    """
+    qq = str(qq or "").strip()
+    if not qq:
+        return ""
     d = _load()
     if gid:
         for name, owner in (((d.get("groups") or {}).get(str(gid)) or {}).get("bot") or {}).items():
-            if str(owner) == str(qq):
-                b = name
-                break
-    if not b:
-        for name, owner in (d.get("global", {}).get("bot") or {}).items():
-            if str(owner) == str(qq):
-                b = name
-                break
+            if str(owner) == qq:
+                return str(name)
+    for name, owner in (d.get("global", {}).get("bot") or {}).items():
+        if str(owner) == qq:
+            return str(name)
+    try:
+        from . import profiles
+        return str((profiles.get_profile(qq) or {}).get("bot_alias") or "")
+    except Exception:
+        return ""
+
+
+def render(qq: str, gid: str = "", speaker_name: str = "") -> str:
+    """给 prompt 用的一小段（固定区，省 token）。"""
+    u = user_call_of(qq, gid, fallback=speaker_name or "")
+    b = bot_call_of(qq, gid)
     if not u and not b:
         return ""
     return (f"▍你俩的称呼\n"

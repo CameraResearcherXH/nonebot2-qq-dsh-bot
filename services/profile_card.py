@@ -41,7 +41,7 @@ PAD = 34
 # 卡片版本：改视觉/取头像逻辑就 +1。
 # 它进缓存键（旧图不会被当成新图复用），也画在脚注 —— 用户 2026-11-19
 # 「改了没看到变更」踩过太多次，图上带版本号，一眼就知道服务器跑的是哪一版。
-CARD_VER = "v3"
+CARD_VER = "v4"
 BG_TOP = (12, 19, 31)
 BG_BOTTOM = (18, 31, 48)
 CARD_BG = (22, 33, 47)
@@ -478,7 +478,18 @@ def _blocks(qq: str, gid: str) -> tuple:
     """返回 (head_info, [(label, [lines])...])。"""
     p = profiles.get_profile(qq)
     g = profiles.group_of(qq, gid)
-    name = profiles.call_of(qq, "", gid) or str(qq)
+    # 称呼以 callname 索引为准（它同时双写 profiles），别再各读一份：
+    # 用户 2026-11-24：「称呼没和档案联动起来」。
+    bot_name = ""
+    try:
+        from . import callname
+        name = (callname.user_call_of(qq, gid, fallback="")
+                or profiles.call_of(qq, "", gid) or str(qq))
+        bot_name = callname.bot_call_of(qq, gid)
+    except Exception:
+        name = profiles.call_of(qq, "", gid) or str(qq)
+    if not bot_name:
+        bot_name = str(p.get("bot_alias") or "").strip()
     nick = str(p.get("nickname") or "").strip()
     tags = []
     if p.get("is_owner"):
@@ -508,8 +519,6 @@ def _blocks(qq: str, gid: str) -> tuple:
             events.append(f"{mark}{txt}")
 
     examples = [str(x or "").strip() for x in (p.get("mes_example") or []) if str(x or "").strip()]
-    aliases = [str(x or "").strip() for x in (p.get("aliases") or []) if str(x or "").strip()]
-    aliases = [a for a in aliases if a != qq and a != nick][:5]
 
     out = []
     if identity:
@@ -522,10 +531,27 @@ def _blocks(qq: str, gid: str) -> tuple:
     rel_lines = []
     if rel:
         rel_lines.append(f"你俩：{rel}")
-    rel_lines.append(f"你叫他「{name}」" + (f"，他叫你「{p['bot_alias']}」" if p.get("bot_alias") else ""))
-    if aliases:
-        rel_lines.append("别名：" + "、".join(aliases))
-    out.append(("关系", rel_lines))
+    if name or bot_name:
+        # 称呼单独一块：来源是 callname 索引，不是随手抓的 aliases。
+        call_lines = [f"你叫他「{name or '（还没定）'}」"]
+        call_lines.append(f"他叫你「{bot_name or '（还没定）'}」")
+        out.append(("称呼", call_lines))
+    if rel_lines:
+        out.append(("关系", rel_lines))
+    # 🌙 白月光：这个人最常 @ / 引用谁 + 说话方式。
+    # 用户 2026-11-24：「白月光是谁以及风格没写进档案」。
+    try:
+        from . import white_moon
+        _wn = str(white_moon.profile_note(qq, gid) or "").strip()
+        if _wn:
+            _line = _wn.lstrip("· ").strip()
+            # 没统计出来也显示一块：用户要确认「档案确实读了白月光」，
+            # 直接消失会看起来像没接线（2026-11-24）。
+            if "还没统计出来" in _line:
+                _line = "还没统计出来（他 @/引用谁最多就会记）"
+            out.append(("白月光", [_line]))
+    except Exception:
+        pass
     if examples:
         ex_lines = []
         for ex in examples[:2]:

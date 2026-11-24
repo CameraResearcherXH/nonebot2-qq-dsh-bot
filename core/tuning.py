@@ -188,6 +188,13 @@ DEFAULTS = {
     'WHITE_MOON_STYLE_ITEMS': 3,
     'WHITE_MOON_STYLE_TTL': 21600.0,
 
+    # ---------- 说话样本库（style_vault） ----------
+    # 1=开：省流模式也会把每个人的原话记进 data/style_corpus（只记文本，不调模型）
+    'STYLE_VAULT_ENABLED': 1,
+    'STYLE_VAULT_MAX_SAMPLES': 200,
+    'STYLE_VAULT_SAMPLE_CHARS': 60,
+    'STYLE_VAULT_MAX_UPLOAD_CHARS': 4000,
+
     # ---------- 工具分发 ----------
     'HEARTBEAT_TIMEOUT_SEC': 90,
     'HISTORY_MAX': 20,
@@ -203,8 +210,10 @@ DEFAULTS = {
 
     # ---------- 模型调用 ----------
     'LIBRARY_COOLDOWN': 600.0,
-    # 回复前「动态取数」流水线的总预算（秒）：到点就带着已拿到的部分回复
-    'PIPELINE_BUDGET': 7.0,
+    # 回复前「动态取数」流水线的总预算（秒）：到点就带着已拿到的部分回复。
+    # 2026-11-24 用户：「pipeline 一定要完整去调一遍」→ 7s 提到 12s，
+    # 让总结（最多 6s）+ 记忆/图书馆（并行各 3s）有足够时间跑完。
+    'PIPELINE_BUDGET': 12.0,
 
     # ---------- 用量监测 ----------
     'LLM_DAILY_BUDGET': 0.0,
@@ -573,6 +582,10 @@ DOCS = {
     'WHITE_MOON_MIN_SCORE': '白月光：至少多少分才算「最吃这个人的说话方式」',
     'WHITE_MOON_STYLE_ITEMS': '白月光：注入几条学到的说法',
     'WHITE_MOON_STYLE_TTL': '白月光：说话方式多久重学一次（秒）',
+    'STYLE_VAULT_ENABLED': '说话样本库：1=自动记每个人的原话（省流模式也记）',
+    'STYLE_VAULT_MAX_SAMPLES': '说话样本库：每个人保留最近多少条原话',
+    'STYLE_VAULT_SAMPLE_CHARS': '说话样本库：单条原话最多存多少字',
+    'STYLE_VAULT_MAX_UPLOAD_CHARS': '自定义风格：用户一次最多上传多少字',
     'HEARTBEAT_TIMEOUT_SEC': '工具分发心跳超时（秒）',
     'HISTORY_MAX': '模型侧历史消息条数',
     'HIST_LINE_BASE': '历史里短消息给多少字',
@@ -831,6 +844,10 @@ FILES = {
     'WHITE_MOON_MIN_SCORE': 'services/white_moon.py',
     'WHITE_MOON_STYLE_ITEMS': 'services/white_moon.py',
     'WHITE_MOON_STYLE_TTL': 'services/white_moon.py',
+    'STYLE_VAULT_ENABLED': 'services/style_vault.py',
+    'STYLE_VAULT_MAX_SAMPLES': 'services/style_vault.py',
+    'STYLE_VAULT_SAMPLE_CHARS': 'services/style_vault.py',
+    'STYLE_VAULT_MAX_UPLOAD_CHARS': 'services/style_vault.py',
     'HEARTBEAT_TIMEOUT_SEC': 'plugins/tool_dispatcher/__init__.py',
     'HISTORY_MAX': 'services/napcat_tools.py',
     'HIST_LINE_BASE': 'services/llm.py',

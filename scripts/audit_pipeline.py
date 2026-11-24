@@ -366,7 +366,7 @@ async def main() -> int:
         "规矩(编号)": "▍00" in sent,
         "你在哪(群号)": "群号：100000017" in sent,
         "你的地盘": "你能说话的群" in sent,
-        "注意力风格": "漂移" in sent,
+        "工具目录": "[[TOOLS|" in sent,
         "群聊现场": "英伟达" in sent,
         "档案(阿明)": "阿明" in sent,
         "滚动状态": "之前的状态" in sent or "英伟达股票" in sent,
@@ -419,8 +419,16 @@ async def main() -> int:
                                     bot_alias=c.get("bot"))
         got = profiles.call_of("10001", "", gid)
         ok("8", f"称谓写回生效（{got}）") if got else bad("8", "称谓没写回")
-        mv = mood.get_mood(f"group_{gid}")["value"]
-        ok("8", f"心情被触动（{mv:.1f}）") if mv != 0 else bad("8", "心情没变化")
+        # 2026-11-20 起数值只认第三方判读（MOOD_FROM_JUDGE=true）；
+        # 她自报的 emotion 只写「原话」label，不动数值。测试按这个真实行为断言。
+        _m8 = mood.get_mood(f"group_{gid}")
+        if getattr(mood, "MOOD_FROM_JUDGE", True):
+            _lab8 = str(_m8.get("label") or "").strip()
+            ok("8", f"心情原话已写回（{_lab8}）") if _lab8 else bad(
+                "8", "心情原话没写回（MOOD_FROM_JUDGE=true 只写 label）")
+        else:
+            mv = float(_m8.get("value") or 0.0)
+            ok("8", f"心情被触动（{mv:.1f}）") if mv != 0 else bad("8", "心情没变化")
     except Exception as e:
         bad("8", "落库异常", f"{type(e).__name__}: {e}")
 

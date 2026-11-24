@@ -98,15 +98,73 @@ def set_call_names(qq: str, *, call_name: str = "", bot_alias: str = "") -> dict
       call_name  = 她怎么叫这个人（「你叫我阿明吧」）
       bot_alias  = 这个人怎么叫她（「我可以叫你小鲸鱼吗」→ 以后喊这个名字 = @ 她）
 
-    两个都只增不删：传空字符串表示这次不改。
+    传空字符串表示这次不改；换 call_name 时会把**旧 call_name 从 aliases 摘掉**
+    （否则「阿明 → 老大」之后阿明会一直留在别名里，见用户 2026-11-24 的反馈）。
     """
     p = get_profile(qq)
     if call_name:
-        p["call_name"] = str(call_name).strip()[:12]
-        merged = set(p.get("aliases", [])) | {p["call_name"]}
-        p["aliases"] = [a for a in merged if a][:30]
+        new_name = str(call_name).strip()[:12]
+        old_name = str(p.get("call_name") or "").strip()
+        # ⚠️ 换称呼时先把旧称呼从 aliases 里摘掉：
+        #    以前只加不删，于是「阿明 → 老大」之后，阿明永远留在别名里，
+        #    /档案 卡片和 group_roster 都还能把死人名翻出来（用户 2026-11-24）。
+        aliases = [a for a in (p.get("aliases") or [])
+                   if str(a).strip() and str(a).strip() != old_name]
+        p["call_name"] = new_name
+        aliases.append(new_name)
+        # 去重但保留顺序
+        seen = set()
+        p["aliases"] = [a for a in aliases
+                        if not (a in seen or seen.add(a))][:30]
     if bot_alias:
         p["bot_alias"] = str(bot_alias).strip()[:12]
+    _save("profile", qq, p)
+    return p
+
+
+def remove_alias(qq: str, name: str) -> dict:
+    """从 aliases 里精确删掉一个名字（/删称呼 QQ 阿明 用）。"""
+    qq = str(qq or "").strip()
+    name = str(name or "").strip()
+    if not qq or not name:
+        return {}
+    p = get_profile(qq)
+    p["aliases"] = [a for a in (p.get("aliases") or [])
+                    if str(a).strip() and str(a).strip() != name]
+    _save("profile", qq, p)
+    return p
+
+
+def clear_call_names(qq: str, *, call_name: bool = True, bot_alias: bool = True,
+                     gid: str = "") -> dict:
+    """删掉称呼（call_name / bot_alias），并把旧 call_name 从 aliases 里移除。
+
+    为什么 aliases 也要删：`group_roster` 找人是按 aliases 匹配的；
+    如果错误的「阿明」留在 aliases 里，下次 `[[WHO|阿明]]` 还会解析回同一个人，
+    看起来就像「删了又自己长回来」。
+    """
+    qq = str(qq or "").strip()
+    if not qq:
+        return {}
+    p = get_profile(qq)
+    old = str(p.get("call_name") or "").strip()
+    if call_name:
+        p.pop("call_name", None)
+    if bot_alias:
+        p.pop("bot_alias", None)
+    if old and call_name:
+        p["aliases"] = [a for a in (p.get("aliases") or [])
+                        if str(a).strip() and str(a).strip() != old]
+    if gid:
+        groups = p.get("groups") or {}
+        g = groups.get(str(gid))
+        if isinstance(g, dict):
+            if call_name:
+                g.pop("call_name", None)
+            if bot_alias:
+                g.pop("bot_alias", None)
+            if not g:
+                groups.pop(str(gid), None)
     _save("profile", qq, p)
     return p
 
@@ -201,6 +259,15 @@ def call_of(qq: str, fallback: str = "", gid: str = "") -> str:
     """
     qq = str(qq or "").strip()
     if qq:
+        # 称呼索引是唯一权威（2026-11-24）：先问 callname，再退回档案字段。
+        # 这样 history_lines / 审核 / 工具 / 档案卡不会各读一份、各叫一个名。
+        try:
+            from . import callname
+            v = callname.user_call_of(qq, gid, fallback="")
+            if v:
+                return v
+        except Exception:
+            pass
         try:
             g = group_of(qq, gid)
             name = (str(g.get("call_name") or "").strip()
@@ -623,7 +690,12 @@ def _clip_text(text: str, limit: int) -> str:
 def _card_head(qq: str, gid: str = "") -> str:
     p = get_profile(qq)
     g = group_of(qq, gid)
-    name = call_of(qq, "", gid) or str(qq)
+    try:
+        from . import callname
+        name = (callname.user_call_of(qq, gid, fallback="")
+                or call_of(qq, "", gid) or str(qq))
+    except Exception:
+        name = call_of(qq, "", gid) or str(qq)
     nick = str(p.get("nickname") or "").strip()
     tags = []
     if p.get("is_owner"):
@@ -803,7 +875,14 @@ def render_card(qq: str, gid: str = "", *, detail: str = "brief",
     except Exception:
         return ""
 
-    name = call_of(qq, "", gid)
+    try:
+        from . import callname
+        name = (callname.user_call_of(qq, gid, fallback="")
+                or call_of(qq, "", gid))
+        _bot_call = callname.bot_call_of(qq, gid)
+    except Exception:
+        name = call_of(qq, "", gid)
+        _bot_call = ""
     if not name:
         return ""
     head = _card_head(qq, gid)
@@ -828,7 +907,7 @@ def render_card(qq: str, gid: str = "", *, detail: str = "brief",
     except Exception:
         _total_notes = len(notes)
     examples = [str(x or "").strip() for x in (p.get("mes_example") or []) if str(x or "").strip()]
-    bot_alias = str(p.get("bot_alias") or "").strip()
+    bot_alias = str(_bot_call or p.get("bot_alias") or "").strip()
 
     # ---- micro：一行，塞上下文标签 ----
     if detail == "micro":

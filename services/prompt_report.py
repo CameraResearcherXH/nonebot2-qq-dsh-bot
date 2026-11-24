@@ -69,8 +69,25 @@ def _section(role: str, content: str, first_system: bool = False) -> str:
         return "历史对话"
     if c.startswith("【私聊前文】"):
         return "私聊前文"
-    if c.startswith("▍现在的状态"):
+    if c.startswith("▍现在的状态") or c.startswith("▍状态｜"):
         return "心情/状态"
+    # 2026-11-24 动态流水线的新标题（▍块名｜≤30 字说明）
+    if c.startswith("▍PIPELINE｜"):
+        return "流水线（动态取数）"
+    if c.startswith("▍称呼｜"):
+        return "称呼"
+    if c.startswith("▍档案｜"):
+        return "人物档案"
+    if c.startswith("▍总结｜"):
+        return "这句话总结"
+    if c.startswith("▍记忆｜"):
+        return "相关记忆"
+    if c.startswith("▍图书馆｜"):
+        return "图书馆"
+    if c.startswith("▍已回｜"):
+        return "已回标记"
+    if c.startswith("▍白月光｜"):
+        return "白月光"
     if c.startswith("▍你对") and "的底色" in c:
         return "好感底色"
     if c.startswith("▍说话风格参考"):

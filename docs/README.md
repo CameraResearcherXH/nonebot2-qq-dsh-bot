@@ -26,7 +26,8 @@
 | [master-design.md](master-design.md) | 总体设计（记忆 / 心情 / 档案 / 群聊现场） |
 | [mood-affinity-design.md](mood-affinity-design.md) | **心情 / 好感 / 群心情 / 峰值事件** 的完整设计 |
 | [memory-profile-design.md](memory-profile-design.md) | **记忆 / 档案 / 心情 / 好感** 的数据结构、读写链、进 prompt 顺序 |
-| [whitemoon.md](whitemoon.md) | **白月光模式**：两层统计、风格取样、注入时机 |
+| [whitemoon.md](whitemoon.md) | **白月光模式**：两层统计、风格取样、注入时机、自定义风格上传/特批 |
+| [reply-pipeline.md](reply-pipeline.md) | **回复流水线**：固定区 / 动态 8 步 / 每块 ≤30 字对照表 / 排查 |
 | [usage-report.md](usage-report.md) | **用量与 prompt 体检**：缓存命中、分段占比、图表 |
 | [feature-audit.md](feature-audit.md) | 功能链路审计：每个断点编号与对应闸门 |
 | [harness_design.md](harness_design.md) | 自测 / 闸门体系 |
@@ -47,7 +48,7 @@
 
 | 文档 | 说明 |
 |---|---|
-| [tuning.md](tuning.md) | **全部可调参数**（229 项，自动生成；改 `core/tuning.py`） |
+| [tuning.md](tuning.md) | **全部可调参数**（257 项，自动生成；改 `core/tuning.py`） |
 | [third-party-audit.md](third-party-audit.md) | 第三方插件清单（上游 / 许可证 / 是否修改） |
 | [CREDITS.md](CREDITS.md) | 思路参考与开源依赖（MaiBot / SillyTavern / maimai…） |
 | [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | 第三方插件声明 |

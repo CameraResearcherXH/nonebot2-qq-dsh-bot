@@ -113,11 +113,9 @@ async def send_sticker_by_tag(bot: Bot, event: MessageEvent, tag: str) -> bool:
     pick, tried = _pick(tag)
     if not pick:
         if tag:
-            logger.info(f"[STICKER] 没有「{tag}」这个标签的表情（{tried}），不随机兜底")
-            try:
-                await bot.send(event, f"没有「{tag}」这个标签的表情哦。")
-            except Exception:
-                pass
+            # 用户 2026-11-24：「有这个表情她却说没有，干脆别发提示词；
+            # 宁愿不发也不要发个提示词。」→ 只在日志留痕，不再往群里补一句。
+            logger.info(f"[STICKER] 没有「{tag}」这个标签的表情（{tried}），静默跳过")
         else:
             h = sticker_lib.health()
             logger.warning(
