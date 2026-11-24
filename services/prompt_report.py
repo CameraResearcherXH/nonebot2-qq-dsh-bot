@@ -27,13 +27,19 @@ TRACE_DIR = Path("data/llm_trace")
 USAGE_DB = Path(os.getenv("LLM_USAGE_DB", "data/llm_usage.db"))
 
 
-def _section(role: str, content: str) -> str:
+def _section(role: str, content: str, first_system: bool = False) -> str:
     if role == "user":
         return "当前消息"
     if role != "system":
         return ""
     c = str(content or "").lstrip()
-    if c.startswith("DeepSeek 小鲸鱼") or c.startswith("你是 "):
+    # 角色卡 = 第一条 system（llm.py 里就是 msgs[0]）。
+    # 不再靠 "DeepSeek 小鲸鱼" 这种人格名匹配：换别人的人设卡时那段会认不出来，
+    # 报表里就凭空少掉最大的一块（用户 2026-11-24 反馈「换人格卡还是鲸鱼味」同源）。
+    if first_system:
+        return "角色卡"
+    if c.startswith("DeepSeek "):
+        # 旧 trace 兜底（那时角色卡开头固定写「DeepSeek 小鲸鱼」）
         return "角色卡"
     if "下面是几条规矩" in c or c.startswith("▍00"):
         return "规矩/协议"
@@ -119,10 +125,13 @@ def _aggregate(day: str, limit: int):
     for r in rows:
         msgs = r.get("msgs") or []
         counted = []
+        _first_sys = next(
+            (i for i, m in enumerate(msgs)
+             if str((m or {}).get("role") or "") == "system"), None)
         for i, m in enumerate(msgs):
             role = str((m or {}).get("role") or "")
             content = str((m or {}).get("content") or "")
-            sec = _section(role, content)
+            sec = _section(role, content, first_system=(i == _first_sys))
             if not sec:
                 continue
             counted.append((i, sec, len(content)))
@@ -273,15 +282,21 @@ def detail_report(day: str = "", limit: int = 80) -> str:
         return "📊 最近没有带规矩块的请求。"
 
     msgs = last.get("msgs") or []
+    _first_sys = next(
+        (i for i, m in enumerate(msgs)
+         if str((m or {}).get("role") or "") == "system"), None)
     total = sum(len(str((m or {}).get("content") or ""))
-                for m in msgs
+                for i, m in enumerate(msgs)
                 if _section(str((m or {}).get("role") or ""),
-                            str((m or {}).get("content") or "")))
+                            str((m or {}).get("content") or ""),
+                            first_system=(i == _first_sys)))
     persona = ""
     rules = ""
-    for m in msgs:
+    for i, m in enumerate(msgs):
         c = str((m or {}).get("content") or "")
-        if not persona and (c.startswith("DeepSeek 小鲸鱼") or c.startswith("你是 ")):
+        if not persona and _section(
+                str((m or {}).get("role") or ""), c,
+                first_system=(i == _first_sys)) == "角色卡":
             persona = c
         if not rules and "下面是几条规矩" in c:
             rules = c

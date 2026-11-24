@@ -119,7 +119,7 @@ async def summarize_day(day: str = "", max_sessions: int = 30) -> int:
         if len(lines) < MIN_MSGS:
             continue
         prompt = (
-            "下面是某个 QQ 群/私聊里一整天的聊天记录（「我」是 AI 角色小鲸鱼）。\n"
+            "下面是某个 QQ 群/私聊里一整天的聊天记录（「我」是当前人格的 AI 角色）。\n"
             "请用**第一人称**写一段「昨日回顾」，要求：\n"
             "1. 2~4 句，总共不超过 80 字\n"
             "2. 只写真正发生的事、聊过的话题、谁说了什么重要的话\n"

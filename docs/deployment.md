@@ -179,6 +179,37 @@ docker exec qq-grok-bot python3 scripts/test_new_features.py
 | `/用量` | token 用量 + 图表 |
 | `/测函数 prompt` | prompt 分段占比 + 缓存 |
 
+## 5.5 算力机 / 本机插件（`NODE_COMPUTE`）
+
+`.env`：
+
+```ini
+# 1 = 走 node.py（默认）
+# 0 = 不加载本项目的 draw / song_cover，画图/唱歌交给 plugins/third 里的现成插件
+NODE_COMPUTE=1
+```
+
+`NODE_COMPUTE=0` 时：
+
+- `plugins/draw`、`plugins/song_cover` 不加载（同名 `/画图`、`/唱歌` 让给三方插件）；
+- `draw_image` / `draw_from_pixiv` / `pixiv_search` / `sing` / `video_understand`
+  这些 function 工具不注册；
+- 工具目录会变成「本机模式」，提示模型先去 `[[TOOLS|搜:画图]]` 找三方工具。
+
+把本机画图/唱歌插件放进 `plugins/third/<名字>/`，如果要让她能 function call，
+按 [third-party-integration.md](third-party-integration.md) 写 `plugin.toml`。
+
+## 5.6 改代码：self_tool / harness（`CODE_AGENT`）
+
+```ini
+# self_tool = 她自己写 Python 小工具（默认）
+# harness   = 接本机 DeepSeek Harness，可以真的改仓库代码（self_tool 自动关闭）
+# off       = 都不开
+CODE_AGENT=self_tool
+```
+
+Harness 桥的配置与用法见 [harness-bridge.md](harness-bridge.md)。
+
 ## 6. 可选：算力机（画图 / 翻唱 / 语音 / 视频）
 
 在一台有 NVIDIA GPU 的机器上：

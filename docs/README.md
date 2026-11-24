@@ -14,6 +14,7 @@
 | [features.md](features.md) | **功能总览**：每个能力是干嘛的、怎么用、配置在哪 |
 | [plugin-dev.md](plugin-dev.md) | 插件开发：`plugin.toml`、工具声明、插件商城 |
 | [third-party-integration.md](third-party-integration.md) | **三方插件接入**：怎么变成 function calling 工具 + 我们对上游改了什么 |
+| [harness-bridge.md](harness-bridge.md) | **DSH 会话桥**：QQ ↔ DeepSeek Harness 改代码（`CODE_AGENT`） |
 | [persona-card.md](persona-card.md) | **人格卡**：格式、字段、参考来源、怎么写自己的角色 |
 | [CHANGELOG.md](CHANGELOG.md) | 更新日志（新增 / 优化 / 修复） |
 

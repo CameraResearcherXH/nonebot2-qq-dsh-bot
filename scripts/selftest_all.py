@@ -3152,12 +3152,14 @@ async def t_timing():
         C.group_dislike_text.pop(_g, None)
 
     # 不满检测：该中的中，不该中的别中
-    check(S, C._note_dislike("g_mute", "这逼鱼真烦人") is True,
-          "强信号「这逼鱼真烦人」→ 触发（含指代她的词）")
+    check(S, C._note_dislike("g_mute", "这机器人真烦人") is True,
+          "强信号「这机器人真烦人」→ 触发（含指代她的词）")
     check(S, C._is_muted("g_mute") is True, "触发后该群进入静默")
     check(S, C._note_dislike("g_mute2", "能不能关了先", to_me=True) is True,
           "弱信号 + @ 她 → 触发")
-    check(S, C._note_dislike("g_mute3", "这肥鱼魔了") is True, "「这肥鱼魔了」→ 触发")
+    check(S, C._note_dislike("g_mute3", "这机器人魔了") is True, "「这机器人魔了」→ 触发")
+    check(S, C._note_dislike("g_mute4", "小鲸鱼真烦人") is True,
+          "当前人格名 + 负面词 → 触发（不写死鱼/鲸鱼）")
     check(S, C._note_dislike("g_ok", "今天好累啊") is False, "普通抱怨不触发（不误伤）")
     check(S, C._is_muted("g_ok") is False, "没触发的群不受影响")
     check(S, C._note_dislike("g_ok2", "好烦啊不想上班") is False,
@@ -4413,6 +4415,20 @@ async def t_static():
     check(S, "自己写工具" in _cat, "工具目录有「自己写工具」分类（self_tool_write 能力提示）")
     check(S, "self_tool_write" in _llm._TOOL_MENU_HEAD,
           "工具菜单头部提到 self_tool_write（否则模型注意不到能自己写工具）")
+    # ---- 算力机开关 / Harness 桥（2026-11-24）----
+    _cfg_src = (ROOT / "services" / "config.py").read_text(encoding="utf-8", errors="ignore")
+    check(S, "NODE_COMPUTE" in _cfg_src and "CODE_AGENT" in _cfg_src,
+          "config 有 NODE_COMPUTE / CODE_AGENT 宏")
+    _boot_src = (ROOT / "bot.py").read_text(encoding="utf-8", errors="ignore")
+    check(S, "_SKIP_WHEN_NO_NODE" in _boot_src, "NODE_COMPUTE=0 跳过 draw/song_cover")
+    check(S, "_SKIP_ALWAYS" in _boot_src and "self_tools" in _boot_src,
+          "CODE_AGENT=harness 跳过 self_tools")
+    _llm_src2 = (ROOT / "services" / "llm.py").read_text(encoding="utf-8", errors="ignore")
+    check(S, "_NODE_ONLY_TOOLS" in _llm_src2, "register_tool 会过滤算力机工具")
+    check(S, "HARNESS_ENABLED" in _llm_src2, "register_tool 会过滤 self_tool/mytool")
+    check(S, (ROOT / "services" / "harness.py").exists(), "有 services/harness.py")
+    check(S, (ROOT / "plugins" / "harness" / "__init__.py").exists(),
+          "有 plugins/harness（/h、/改代码）")
     check(S, "STICKER" in _llm._REQ_RE.pattern, "[[STICKER]] 进了 _REQ_RE")
     check(S, "TOOLS" in _llm._REQ_RE.pattern, "[[TOOLS]] 进了 _REQ_RE")
     check(S, "MEMORY" in _llm._REQ_RE.pattern, "[[MEMORY]] 进了 _REQ_RE")

@@ -7,8 +7,9 @@ from nonebot.adapters.onebot.v11 import Bot, MessageEvent, MessageSegment
 from .config import DASHSCOPE_API_KEY, ALIYUN_VOICE_TYPE
 
 # CosyVoice 的 MaaS 端点：优先从 DASHSCOPE_BASE_URL 取 host，
-# 这样换 workspace 只要改 .env 一处（原来写死 host，换工作空间就 404）
-_DEFAULT_TTS_HOST = "ws-4h02cctsdtvrjulj.cn-beijing.maas.aliyuncs.com"
+# 这样换 workspace 只要改 .env 一处（原来写死 host，换工作空间就 404）。
+# 兜底用公共域名：专属 workspace（ws-xxxx）写在 .env 里，别写进代码（发行仓会带出去）。
+_DEFAULT_TTS_HOST = "dashscope.aliyuncs.com"
 
 
 def _tts_endpoint() -> str:

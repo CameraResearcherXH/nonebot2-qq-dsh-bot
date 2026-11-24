@@ -93,7 +93,7 @@ async def judge_new(desc: str, tag: str, *, similar_desc: str = "",
 
     只在「该标签库存已接近软上限」或「疑似重复」时才该调用 —— 别每张都调，费钱。
     """
-    prompt = f"""你是「小鲸鱼」的表情库管理员。她是个活泼的女仆角色，靠表情包表达情绪。
+    prompt = f"""你是当前人格的表情库管理员。她靠表情包表达情绪。
 
 现在有一张新表情想入库：
   标签：{tag}
@@ -143,7 +143,7 @@ async def prune(need: int, candidates: list) -> list:
             f"用过{c.get('used_count', 0)}次 | 精品分{c.get('quality', 0.5)} | {desc}"
         )
 
-    prompt = f"""你是「小鲸鱼」的表情库管理员。表情库上限 {SL.STICKER_MAX} 张，现在超了，
+    prompt = f"""你是当前人格的表情库管理员。表情库上限 {SL.STICKER_MAX} 张，现在超了，
 需要淘汰 {need} 张。
 
 下面是候选（都是「用得少 + 评分偏低」的），请挑出**最不值得保留**的 {need} 张：
@@ -189,7 +189,7 @@ async def rate_batch(items: list, batch: int = 40) -> int:
             f"{j + 1}. id={c['md5']} | 标签={c.get('tag','?')} | 描述：{(c.get('desc') or '无')[:50]}"
             for j, c in enumerate(chunk)
         ]
-        prompt = f"""你是「小鲸鱼」的表情库管理员。给下面每张表情打「精品分」（0~1）。
+        prompt = f"""你是当前人格的表情库管理员。给下面每张表情打「精品分」（0~1）。
 
 打分标准：
 - 0.9~1.0：情绪极鲜明、通用性极强，聊天里随时能用

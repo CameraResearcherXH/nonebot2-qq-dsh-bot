@@ -664,7 +664,7 @@ def render_profile_image(qq: str, gid: str = "") -> str:
                 yy += 32
             y += bh
 
-        foot = time.strftime("小鲸鱼档案 · %Y-%m-%d %H:%M", time.localtime())
+        foot = time.strftime("角色档案 · %Y-%m-%d %H:%M", time.localtime())
         foot += f" · {CARD_VER}"          # 图上带版本：一眼看出服务器跑的是哪一版
         draw.text((PAD, H - PAD - 8), foot, font=f_small, fill=MUTED)
 
@@ -775,7 +775,7 @@ def render_lore_image(scope: str, *, title: str = "本群词条", limit: int = 1
         if total > len(shown):
             draw.text((PAD, H - PAD - 34), f"还有 {total - len(shown)} 条，/词条 文字 看全部",
                       font=f_small, fill=MUTED)
-        foot = time.strftime("小鲸鱼词条 · %Y-%m-%d %H:%M", time.localtime())
+        foot = time.strftime("角色词条 · %Y-%m-%d %H:%M", time.localtime())
         draw.text((PAD, H - PAD - 8), foot, font=f_small, fill=MUTED)
 
         img.save(fname, format="PNG", optimize=True)
@@ -947,7 +947,7 @@ def render_scene_image(gid: str, *, bot_qq: str = "", bot_name: str = "",
                 yy += 29
             y += bh
 
-        foot = time.strftime("小鲸鱼现场 · %Y-%m-%d %H:%M", time.localtime())
+        foot = time.strftime("群聊现场 · %Y-%m-%d %H:%M", time.localtime())
         draw.text((PAD, H - PAD - 8), foot, font=f_small, fill=MUTED)
         img.save(fname, format="JPEG", quality=85, optimize=True)
         files = sorted(CARD_DIR.glob("scene_*.*"), key=lambda p: p.stat().st_mtime, reverse=True)

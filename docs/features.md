@@ -247,3 +247,21 @@ python3 scripts/dump_tuning.py --write   # 重新生成 docs/tuning.md
   滑动窗口，2 小时后自动恢复。
 - **怎么用**：自动；阈值 `POKE_MAX_PER_WINDOW` / `POKE_WINDOW_HOURS`。
 - **代码**：`services/poke_guard.py`、`plugins/chat/__init__.py`
+
+## 17. 算力机开关（`NODE_COMPUTE`，2026-11-24）
+
+- **是什么**：`1` 走 `node.py`（画图/翻唱/语音/视频理解排任务给算力机）；
+  `0` 不加载本项目的 `draw` / `song_cover`，也不注册这些 function 工具，
+  画图/唱歌交给 `plugins/third` 里的本机插件。
+- **怎么用**：`.env` 里 `NODE_COMPUTE=1|0`；改完 `docker compose up -d --force-recreate bot`。
+- **代码**：`services/config.py`、`bot.py`、`services/llm.py`（`_NODE_ONLY_TOOLS`）
+
+## 18. Harness 改代码桥（`CODE_AGENT=harness`，2026-11-24）
+
+- **是什么**：把 QQ 会话接到本机 DeepSeek Harness，可以真的读仓库、改代码、跑测试；
+  结果原样回 QQ。带上人格/心情/好感/白月光/相关记忆。
+- **怎么用**：`CODE_AGENT=harness` + `HARNESS_BACKEND=cli|http`；
+  `/h <需求>`、`/改代码 <需求>`、`/h 新`、`/h` 看状态。
+- **和 self_tool 互斥**：`CODE_AGENT=harness` 时 `plugins/self_tools` 不加载。
+- **代码**：`services/harness.py`、`plugins/harness/`
+- **说明**：[harness-bridge.md](harness-bridge.md)

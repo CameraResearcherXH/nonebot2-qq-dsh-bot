@@ -24,6 +24,9 @@
   `/测函数 prompt` 看 prompt 各段占比与缓存报告。
 - **换号不丢记忆**：人格 ID 与登录 QQ 解耦；旧号的发言/记忆仍算「她」。
 - **戳一戳屏蔽**：同一个人 2 小时内戳超过 3 次就不再回，2 小时后自动恢复。
+- **算力机开关**：`NODE_COMPUTE=1` 走 `node.py`；`0` 时画图/唱歌交给 `plugins/third` 的本机插件。
+- **Harness 改代码桥**：`CODE_AGENT=harness` 把 QQ 会话接到本机 DeepSeek Harness，
+  可以直接改仓库代码、跑测试；与 `self_tool` 互斥。
 - **分段回复**：群聊不是一条一回 —— 等这一段说完（默认安静 6 秒 / 最长 30 秒）再整体回，
   心情判读、收发件人判断、上下文都用这一整段，省 token 也不阻塞队列。
 - **以图搜源**：`picsearch` 综合 TraceMoe / SauceNAO / Ascii2D / IQDB，不再裸调 trace.moe。
@@ -107,6 +110,7 @@ rvc_pipeline.py    RVC 音域对齐 / 变调 / 混音流水线
 - [白月光模式](docs/whitemoon.md)
 - [用量与 prompt 体检](docs/usage-report.md)
 - [第三方插件接入](docs/third-party-integration.md)：怎么变成 function calling 工具 + 我们对上游改了什么
+- [Harness 改代码桥](docs/harness-bridge.md)：QQ ↔ DeepSeek Harness（`CODE_AGENT`）
 - [算力机部署](docs/node-compute.md)
 - [人格卡格式](docs/persona-card.md)
 - [全部参数](docs/tuning.md)

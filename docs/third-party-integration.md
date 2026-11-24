@@ -65,6 +65,23 @@ async def picsearch(image_url: str) -> str:
 - 失败返回「人话」错误（「图片下载失败」），不要抛异常给模型；
 - 需要真实 QQ 操作时用 `services.napcat_tools.execute`，不要直接 `bot.call_api`。
 
+## 1.5 本机模式（`NODE_COMPUTE=0`）
+
+如果用户不想搭算力机，`.env` 写：
+
+```ini
+NODE_COMPUTE=0
+```
+
+效果：
+
+- 不加载本项目的 `plugins/draw`、`plugins/song_cover`；
+- 不注册 `draw_image` / `draw_from_pixiv` / `pixiv_search` / `sing` / `video_understand`；
+- 画图/唱歌由 `plugins/third` 里的现成插件接管（同名 `/画图`、`/唱歌` 不冲突）；
+- 想让它们变成 function calling 工具，就按第 1 节写 `plugin.toml`。
+
+工具目录会自动切成「本机模式」，提示模型先 `[[TOOLS|搜:画图]]` 找三方工具。
+
 ## 2. 模型怎么发现这些工具
 
 三层，从粗到细：

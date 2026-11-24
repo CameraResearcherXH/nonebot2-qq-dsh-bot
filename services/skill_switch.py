@@ -44,6 +44,8 @@ SKILL_GROUPS = {
     "sticker": {"sticker_save", "sticker_send"},
     "social": {"napcat_call", "napcat_help", "poke", "napcat_tools"},
     "self_tools": {"self_tool_file", "self_tool_run", "self_tool_write"},
+    # CODE_AGENT=harness 时的改代码桥（和 self_tools 二选一）
+    "code": {"harness_ask", "harness_status", "harness_reset"},
     "vision": {"vision_source"},
     "lore": {"lore_add"},
     "proactive": {"proactive.interject", "proactive.private"},
@@ -57,7 +59,7 @@ SKILL_GROUPS = {
 GROUP_LABEL = {
     "search": "搜索", "draw": "画图", "media": "语音/音乐",
     "sticker": "表情", "social": "社交/群管理", "self_tools": "自检工具",
-    "vision": "视觉", "lore": "世界书", "proactive": "主动开口",
+    "code": "改代码", "vision": "视觉", "lore": "世界书", "proactive": "主动开口",
     "third_party": "第三方插件",
 }
 
@@ -122,6 +124,8 @@ def _group_of(name: str) -> str:
         return "social"
     if n.startswith("self_tool"):
         return "self_tools"
+    if n.startswith("harness"):
+        return "code"
     if n.startswith("vision"):
         return "vision"
     if n.startswith("lore"):

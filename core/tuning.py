@@ -103,6 +103,9 @@ DEFAULTS = {
     # 戳一戳屏蔽：同一个人 POKE_WINDOW_HOURS 内戳超过 POKE_MAX_PER_WINDOW 次就不回
     'POKE_MAX_PER_WINDOW': 3,
     'POKE_WINDOW_HOURS': 2.0,
+    # DeepSeek Harness 桥：单次最长秒数 / 回 QQ 的最大字数
+    'HARNESS_TIMEOUT': 300.0,
+    'HARNESS_MAX_OUTPUT': 3000,
 
     # ---------- 模型调用 ----------
     'CHAT_HISTORY_TURNS': 6,
@@ -505,6 +508,8 @@ DOCS = {
     'BURST_WINDOW_SEC': '高刷检测窗口（秒）',
     'POKE_MAX_PER_WINDOW': '戳一戳屏蔽：窗口内最多回几次（超过就不回）',
     'POKE_WINDOW_HOURS': '戳一戳屏蔽的统计窗口（小时）',
+    'HARNESS_TIMEOUT': 'Harness 桥单次调用最长秒数',
+    'HARNESS_MAX_OUTPUT': 'Harness 桥回给 QQ 的最大字数',
     'CHAT_HISTORY_TURNS': '对话历史轮数',
     'CHAT_OFF_MAX_HOURS': '安静最长持续小时数（超时自动解除）',
     'CONV_STATE_MAX_CHARS': '对话状态摘要最大字数',
@@ -754,6 +759,8 @@ FILES = {
     'BURST_WINDOW_SEC': 'plugins/chat/__init__.py',
     'POKE_MAX_PER_WINDOW': 'services/poke_guard.py',
     'POKE_WINDOW_HOURS': 'services/poke_guard.py',
+    'HARNESS_TIMEOUT': 'services/harness.py',
+    'HARNESS_MAX_OUTPUT': 'services/harness.py',
     'CHAT_HISTORY_TURNS': 'services/llm.py',
     'CHAT_OFF_MAX_HOURS': 'services/chat_switch.py',
     'CONV_STATE_MAX_CHARS': 'services/conv_state.py',

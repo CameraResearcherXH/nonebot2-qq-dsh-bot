@@ -39,6 +39,8 @@ dist/
 *.working
 *.bak
 DIST_REPORT.md
+# xray 本地运行时（34MB Windows 二进制，绝不进发行仓）
+scripts/.xray_runtime/
 *.old
 *.orig
 *.log

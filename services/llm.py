@@ -14,7 +14,8 @@ from pathlib import Path
 import httpx
 from nonebot import logger
 from .config import (BOT_MODE, MOCK_REPLY, XAI_API_KEY, XAI_BASE_URL, XAI_MODEL,
-                     PROXY, ROLEPLAY_API_KEY, ROLEPLAY_BASE_URL, ROLEPLAY_MODEL)
+                     PROXY, ROLEPLAY_API_KEY, ROLEPLAY_BASE_URL, ROLEPLAY_MODEL,
+                     NODE_COMPUTE, CODE_AGENT, HARNESS_ENABLED)
 from .persona import persona_for, persona_name
 from . import attention, conv_state, expression, chat_switch
 from .memory import add_memory
@@ -108,6 +109,13 @@ def _split_prompt(text: str) -> tuple:
 # ⚠️ 只在私聊启用：群聊每轮都挂工具会多耗 token，而且容易乱调。
 TOOL_HANDLERS: dict = {}
 TOOLS_SPEC: list = []
+
+# 算力机（node.py）专属工具：NODE_COMPUTE=0 时不注册，让 plugins/third 的本机插件接管
+_NODE_ONLY_TOOLS = {
+    "sing", "video_understand",
+    "draw_image", "draw_from_pixiv", "pixiv_search",
+    "cover", "rvc_cover", "tts_voice",
+}
 # 每个工具挂在哪：私聊 / 群聊。默认只挂私聊（老行为不变）。
 # NapCat 工具那两个 meta 工具要群聊也挂 —— 群里禁言、改名片、戳人这些本来就是群里的事。
 TOOL_SCOPES: dict = {}
@@ -277,6 +285,14 @@ def register_tool(spec: dict, handler, scope=("private",), hold=False) -> None:
     try:
         name = spec["function"]["name"]
     except Exception:
+        return
+    # NODE_COMPUTE=0：算力机专属工具一律不注册，交给 plugins/third 的本机插件
+    if not NODE_COMPUTE and name in _NODE_ONLY_TOOLS:
+        logger.info(f"[TOOLS] NODE_COMPUTE=0 → 跳过算力机工具 {name}")
+        return
+    # CODE_AGENT=harness：self_tool 与它自造的 mytool_* 全部不注册，避免和 harness 抢活
+    if HARNESS_ENABLED and (name.startswith("self_tool_") or name.startswith("mytool_")):
+        logger.info(f"[TOOLS] CODE_AGENT=harness → 跳过 {name}")
         return
     TOOLS_SPEC[:] = [s for s in TOOLS_SPEC if s.get("function", {}).get("name") != name]
     TOOLS_SPEC.append(spec)
@@ -655,6 +671,36 @@ TOOL_CATALOG = {
         "· (不想回复) —— 不想接就只输出这四个字"
     ),
 }
+
+# ---------------- 部署模式决定工具目录长什么样（2026-11-24） ----------------
+if not NODE_COMPUTE:
+    # 本机部署：没有算力机，画图/唱歌交给 plugins/third 里的现成插件
+    TOOL_CATALOG["画图与搜图"] = (
+        "【画图与搜图（本机模式）】\n"
+        "· vision_source —— 查图片出处（trace.moe），不依赖算力机，照常用\n"
+        "· 本机没有接算力机：**不要调** draw_image / draw_from_pixiv / pixiv_search\n"
+        "· 画图请用 plugins/third 里装的本机画图插件：先 [[TOOLS|搜:画图]] 看有没有对应工具；\n"
+        "  没有就直说「这台机器没接画图」，别假装画了"
+    )
+    TOOL_CATALOG["唱歌与语音"] = (
+        "【唱歌与语音（本机模式）】\n"
+        "· [[VOICE]] —— 这条用语音说（云端 TTS 兜底）\n"
+        "· 本机没有接算力机：**不要调 sing**；\n"
+        "  唱歌请用 plugins/third 里装的本机唱歌插件：先 [[TOOLS|搜:唱歌]] 查；没有就直说没接"
+    )
+
+if CODE_AGENT == "harness":
+    TOOL_CATALOG.pop("自己写工具", None)
+    TOOL_CATALOG["改代码（Harness）"] = (
+        "【改代码（DeepSeek Harness 会话）】\n"
+        "· harness_ask —— 把需求交给本机的 DSH（DeepSeek Harness）会话，它可以真的读/改仓库代码。\n"
+        "  用户说「改一下这个功能」「加个 XX」「这个 bug 修一下」时用；只允许主人使用。\n"
+        "· harness_status —— 看当前 harness 会话、工作目录、后端状态。\n"
+        "· harness_reset —— 开一个新会话（换任务/上下文乱了时用）。\n"
+        "· ⚠️ 改代码可能影响线上，动手前先说清楚要改什么；改完把 diff/结果原样转述给主人。"
+    )
+elif CODE_AGENT == "off":
+    TOOL_CATALOG.pop("自己写工具", None)
 
 
 def _tool_catalog_names() -> str:
@@ -1656,7 +1702,7 @@ MEMO_PROTOCOL = """
 [[MEMO|emotion:情绪|think:心理活动|text:你想记住的那句话]]
 
 示例：他夸你可爱，你心里乐开了花 →
-  [[MEMO|emotion:happy|think:嘴上说没什么，其实挺受用|text:他夸我可爱，我心里偷着乐，尾巴都摇起来了]]
+  [[MEMO|emotion:happy|think:嘴上说没什么，其实挺受用|text:他夸我可爱，我心里偷着乐，又有点不好意思]]
 
 `think` 是你的心理活动（心里怎么转的、在意什么），20 字内，第一人称，只交给心情判读看，写真实念头，别写客套话。
 
@@ -1722,7 +1768,7 @@ CALL_PROTOCOL = """
 [[CALL|bot:他以后怎么叫你|user:你以后怎么叫他]]
 
 例子：
-· 他问「我可以叫你小鲸鱼吗？」你答应了 → [[CALL|bot:小鲸鱼]]
+· 他问「我可以叫你小星吗？」你答应了 → [[CALL|bot:小星]]
 · 他说「你叫我阿明吧」→ [[CALL|user:阿明]]
 
 规则：
@@ -2032,7 +2078,7 @@ def _post_rules(key: str, speaker_qq: str = "", gid: str = "") -> str:
     )
     lines.append(
         "· 群友用方言/谐音骂你（「啥子」=傻子、「瓜娃子」「宝器」）时，"
-        "**别按字面解释自己是谁**（别回「我是 DeepSeek 小鲸鱼」）；"
+        "**别按字面解释自己是谁**（别回「我是 <模型名 / 人格名>」）；"
         "轻轻顶一句、或装没听懂都行。"
     )
     lines.append(

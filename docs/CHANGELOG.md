@@ -1,5 +1,40 @@
 # 更新日志
 
+## 2026-11-24
+
+### 新增
+
+- **算力机开关 `NODE_COMPUTE`**
+  - `1`（默认）= 走 `node.py`：画图 / 翻唱 / 语音 / 视频理解排任务给算力机；
+  - `0` = 不加载本项目 `draw` / `song_cover`，不注册 `draw_image` / `draw_from_pixiv` /
+    `pixiv_search` / `sing` / `video_understand`，画图/唱歌交给 `plugins/third` 的本机插件；
+  - 工具目录会切成「本机模式」，提示模型先 `[[TOOLS|搜:画图]]` 找三方工具。
+- **DeepSeek Harness 改代码桥 `CODE_AGENT=harness`**
+  - QQ（主人）`/h <需求>` 或 `/改代码 <需求>` → 本机 DSH → 结果原样回 QQ；
+  - 支持 `HARNESS_BACKEND=cli|http`，`{prompt}/{cwd}/{session}` 占位；
+  - 带上人格/心情/好感/白月光/相关记忆（`HARNESS_CONTEXT=1`）；
+  - 与 `self_tool` 互斥：harness 模式不加载 `plugins/self_tools`，也不注册 `self_tool_*`/`mytool_*`；
+  - 只有主人能用，输出脱敏、超时 kill、分段发送。
+
+### 修复
+
+- **其他人格卡仍出现「鲸鱼尾巴 / 呆毛」**：prompt 里写死的人格专属词已清掉：
+  - `[[MEMO]]` 示例的「尾巴都摇起来了」→ 通用描述；
+  - `[[CALL]]` 示例的「小鲸鱼」→ 通用名字；
+  - 人称规则、每日总结、表情管理员、档案卡页脚、`_bot_name` 兜底、切人格文案等；
+  - 「被讨厌就闭嘴」的强信号不再写死「鱼/鲸鱼」，改用「机器人/bot/AI + 当前人格名」。
+- **`/测函数 prompt` 换人格卡后认不出角色卡**：改为「第一条 system 消息 = 角色卡」，
+  不再靠 `DeepSeek 小鲸鱼` 前缀匹配（自定义人设卡也能正确统计）。
+- **发行仓清理**：移除误入的 34MB `scripts/.xray_runtime/xray.exe`；
+  `.env.example` 里私人基础设施地址（阿里云专属 workspace、自建站点）改为公开默认值；
+  `services/tts.py` 的兜底 host 改为公共域名。
+
+### 文档
+
+- 新增 `docs/harness-bridge.md`（DSH 桥：配置、后端、安全、与 Aurabot 的区别）；
+- `docs/deployment.md` 增加 `NODE_COMPUTE` / `CODE_AGENT` 两节；
+- `docs/features.md` 增加第 17/18 节。
+
 ## 2026-11-23
 
 ### 新增

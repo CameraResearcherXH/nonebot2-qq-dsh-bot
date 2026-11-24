@@ -717,6 +717,49 @@ try:
 except Exception as _e:
     check("戳一戳屏蔽可导入", False, f"{type(_e).__name__}: {_e}")
 
+# ---- 算力机开关 / Harness 桥（2026-11-24）----
+try:
+    from services import config as _cfg2
+    check("NODE_COMPUTE 默认开", _cfg2.NODE_COMPUTE is True)
+    check("CODE_AGENT 默认 self_tool", _cfg2.CODE_AGENT == "self_tool", _cfg2.CODE_AGENT)
+except Exception as _e:
+    check("NODE_COMPUTE/CODE_AGENT 可读", False, f"{type(_e).__name__}: {_e}")
+
+_old_cwd_h = os.getcwd()
+os.chdir(_tmp)
+_henv = {k: os.environ.get(k) for k in
+         ("HARNESS_STATE", "HARNESS_BACKEND", "HARNESS_CLI", "HARNESS_CONTEXT",
+          "TEST_TOKEN")}
+try:
+    os.environ["HARNESS_STATE"] = str(Path("data/harness.json"))
+    os.environ["HARNESS_BACKEND"] = "cli"
+    os.environ["HARNESS_CLI"] = "echo {prompt}"
+    os.environ["HARNESS_CONTEXT"] = "0"
+    os.environ["TEST_TOKEN"] = "abcdefgh12345678"
+    from services import harness as _hs
+
+    _hs.reset("private_1")
+    _st = _hs.session_of("private_1")
+    check("harness 会话有 id/cwd", bool(_st.get("id")) and bool(_st.get("cwd")), str(_st))
+    _out = asyncio.run(_hs.ask("private_1", "改一下 README"))
+    check("harness CLI 后端能返回结果", "改一下 README" in _out, _out[:120])
+    _st2 = _hs.session_of("private_1")
+    check("harness 会话复用", _st2.get("id") == _st.get("id"))
+    _old = _st2.get("id")
+    _st3 = _hs.reset("private_1")
+    check("harness 重置换新会话", _st3.get("id") != _old)
+    check("harness 输出脱敏", "[REDACTED]" in _hs.redact("token=abcdefgh12345678"))
+    check("harness status 可用", "Harness 桥" in _hs.status("private_1"))
+except Exception as _e:
+    check("harness 可导入/可调用", False, f"{type(_e).__name__}: {_e}")
+finally:
+    for _k, _v in _henv.items():
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
+    os.chdir(_old_cwd_h)
+
 print("-" * 60)
 print("PASS %d / FAIL %d" % (len(PASS), len(FAIL)))
 if FAIL:

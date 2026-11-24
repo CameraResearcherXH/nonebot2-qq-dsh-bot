@@ -30,6 +30,8 @@ EXCLUDE_DIRS = {
     "data", "napcat", "plugins_backup", "venv", ".venv", "env",
     "__pycache__", ".git", ".idea", ".vscode", ".workbuddy", ".codebuddy",
     "_deploy", "_deploy_server",
+    # xray 本地运行时（34MB Windows 二进制，2026-11-24 发现误入过发行仓）
+    ".xray_runtime",
     # 本地合入用的补丁（含 .env 原始 diff，绝不能进发行仓）
     "patches",
     # 私人人格卡：发行仓只放通用模板（personality.example.txt）
@@ -248,6 +250,12 @@ _ENV_CLEAR_KEYS = {
     "NAPCAT_ACCOUNT", "SELF_ID", "SELF_ALIASES",
 }
 
+# 私人基础设施地址 → 公开默认值（2026-11-24：阿里云专属工作区 / 自建站不能进发行仓）
+_ENV_REWRITE = {
+    "DASHSCOPE_BASE_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "BT_BASE_URL": "",
+}
+
 
 def gen_env_example(dest: Path) -> int:
     """生成 .env.example：密钥/私人名单清空，**普通参数保留当前值**当参考。"""
@@ -272,6 +280,8 @@ def gen_env_example(dest: Path) -> int:
                   or any(t in key for t in ("SECRET", "KEY", "TOKEN", "COOKIE", "PASS")))
         if secret:
             val = ""
+        elif key in _ENV_REWRITE:
+            val = _ENV_REWRITE[key]
         else:
             for num in sorted(PRIVATE_NUMBERS):
                 if num in val:

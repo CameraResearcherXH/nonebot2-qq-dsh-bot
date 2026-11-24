@@ -205,14 +205,14 @@ _GREET_RE = re.compile(
 )
 
 # ⚠️ 分成「强信号」和「弱信号」两档，否则 A 让 B 闭嘴也会把她静默掉。
-#   强信号 = 句子里带了**指代她**的词（鱼/鲸鱼/机器人/bot/逼鱼），一定是冲她；
+#   强信号 = 句子里带了**指代她**的词（机器人/bot/AI，或她当前人格名）+ 负面词；
 #   弱信号 = 「闭嘴」「滚」「别说了」这种通用骂人话，**必须再确认是冲她**才生效
 #            （@ 她 / 喊她名字 / 她 2 分钟内刚说过话）。
+# 2026-11-24：不再写死「鱼/鲸鱼」—— 用别人的人格卡时，那些词不是她的名字。
 _DISLIKE_STRONG_RE = re.compile(
-    r"(这|那|你)(条|只|个)?\s*(肥鱼|鲸鱼|鱼|机器人|bot|ai|AI)"
+    r"(这|那|你)(条|只|个)?\s*(机器人|bot|ai|AI|程序|智障)"
     r".{0,8}(烦|吵|闭嘴|滚|关|疯|魔|傻|蠢|有病|恶心)"
-    r"|(烦死|吵死).{0,6}(鱼|机器人|bot)"
-    r"|(逼鱼|这鱼疯|这肥鱼魔|这鱼有病|破鱼|死鱼)",
+    r"|(烦死|吵死).{0,6}(机器人|bot|AI)",
     re.I,
 )
 _DISLIKE_WEAK_RE = re.compile(
@@ -567,7 +567,7 @@ def _bot_name(gid: str = "", self_id: str = "") -> str:
 
     以前这里写的是 `current_personality(...)` —— 那是个 defaultdict，一调就抛
     TypeError（2026-11-19 事故），现在走 persona_name()。
-    优先级：她自己的档案称呼 > 人格名 > 小鲸鱼。
+    优先级：她自己的档案称呼 > 人格名 > 「机器人」。
     """
     try:
         nm = profiles.call_of(str(self_id or ""), "", str(gid or ""))
@@ -576,15 +576,15 @@ def _bot_name(gid: str = "", self_id: str = "") -> str:
     if nm:
         return nm
     try:
-        nm = persona_name(f"group_{gid}" if gid else "") or "小鲸鱼"
+        nm = persona_name(f"group_{gid}" if gid else "") or "机器人"
     except Exception:
-        nm = "小鲸鱼"
-    # 「小鲸鱼proplus」这种内部文件名不是群友叫她的名字，去掉后缀
+        nm = "机器人"
+    # 「角色名proplus」这种内部文件名不是群友叫她的名字，去掉后缀
     for suffix in ("proplus", "pro", "plus"):
         if nm.lower().endswith(suffix) and len(nm) > len(suffix) + 1:
             nm = nm[: -len(suffix)]
             break
-    return nm or "小鲸鱼"
+    return nm or "机器人"
 
 
 # ==================== 她是谁：人格 ID（2026-11-23）====================
@@ -817,7 +817,7 @@ async def _send_long_as_forward(bot, ev, text: str, reply_to: str = "") -> bool:
     if not paras:
         paras = [text]
 
-    _name = "小鲸鱼"
+    _name = "机器人"
     try:
         _name = persona_name() or _name
     except Exception:
@@ -1134,7 +1134,7 @@ def _my_names(session_key: str = "", speaker_qq: str = "") -> set:
     她当前能被叫醒的名字，分三类：
 
       ① 共同词（_ME_NAMES_COMMON）：所有人喊都算，**默认空**（要就自己配）
-      ② 人格名：她自己的名字（小鲸鱼 / 小鲸鱼proplus），全局共享
+      ② 人格名：她自己的名字（角色卡名），全局共享
       ③ **这个用户专属的称呼**（profile.bot_alias）：
          只有**给他设过名字的那个人**喊才生效 —— 别人喊同一个词不算。
          这是「先匹配 QQ，针对人」的关键。
@@ -1815,7 +1815,7 @@ async def _judge_focus_follow(text: str, gid: str, speaker_qq: str, event=None) 
         return True          # 没 key 判不了，按"是"处理，别装死
     ctx = list(recent_group_msgs.get(str(gid), []))[:-1][-6:]
     ctx_str = "\n".join(f"- {c}" for c in ctx) or "（无）"
-    names = "、".join(sorted(_my_names(key, sq))) or "小鲸鱼"
+    names = "、".join(sorted(_my_names(key, sq))) or "机器人"
     prompt = (
         f"你是群里一个叫 {names} 的机器人。刚才有人 @ 过你"
         f"（可能只 @ 了一下、没说话），你在关注他接下来说的几句话。\n"
@@ -3765,12 +3765,12 @@ async def _handle_persona(bot: Bot, event: MessageEvent, session_key: str, text:
         return
     if arg in PERSONALITY_MAP:
         current_personality[session_key] = arg
-        await bot.send(event, f"（尾巴拍拍）切换成功！我现在是【{arg}】模式啦。")
+        await bot.send(event, f"（切换好了）我现在是【{arg}】模式啦。")
         return
 
     # 名字不存在就不切，避免"说切了其实还是默认人格"的人设分裂
     avail = "、".join(list_personas()) or "（无）"
-    await bot.send(event, f"（歪头）没有「{arg}」这个人格哦。\n可用：{avail}")
+    await bot.send(event, f"没有「{arg}」这个人格哦。\n可用：{avail}")
 
 
 async def _handle_sing_waiting(bot: Bot, event: MessageEvent, session_key: str, text: str) -> bool:
@@ -3890,7 +3890,7 @@ def _note_dislike(gid: str, text: str, *, to_me: bool = False,
     群友在嫌弃她吗？命中就给这个群挂一个静默窗口。
 
     分两档（防止「A 让 B 闭嘴」把她静默掉）：
-      · 强信号：句子里有指代她的词（鱼/鲸鱼/机器人/逼鱼…）+ 负面词 → 一定是冲她
+      · 强信号：句子里有指代她的词（机器人/bot/AI/她当前人格名）+ 负面词 → 一定是冲她
       · 弱信号：「闭嘴」「滚」「别说了」这种通用骂人话 → 还要有一条"冲她"的证据：
           @ 了她 / 喊了她名字 / 她 2 分钟内刚说过话
     只压制「主动开口」（插话 / 为图片开口），**@ 她或喊名字仍然回** ——
@@ -3902,6 +3902,16 @@ def _note_dislike(gid: str, text: str, *, to_me: bool = False,
     try:
         strong = bool(_DISLIKE_STRONG_RE.search(t))
         weak = bool(_DISLIKE_WEAK_RE.search(t))
+        # 当前人格名 + 负面词 → 也算强信号（不写死「鱼/鲸鱼」）
+        if not strong:
+            try:
+                _names = _my_names(f"group_{gid}", "")
+            except Exception:
+                _names = set()
+            _neg = ("烦", "吵", "闭嘴", "滚", "傻", "蠢", "有病", "恶心", "魔", "疯")
+            if (any(n and str(n) in t for n in _names)
+                    and any(w in t for w in _neg)):
+                strong = True
     except Exception:
         return False
     if not strong and not weak:
@@ -5487,7 +5497,7 @@ async def _random_chat_loop(bot: Bot):
                         "【例子·照着这个尺度判】\n"
                         "· 他：「@老王 文件发你了，装一下」→ (不想回复)（他们在互相做事，没你的事）\n"
                         "· 他：「这破服务器又崩了」→ 「又崩？我这刚连上」（没问你，但你能接一句）\n"
-                        "· 他：「小鲸鱼 这配置咋样」→ 「能跑，但内存给少了」（在问你，正面答）\n"
+                        "· 他：「<角色名> 这配置咋样」→ 「能跑，但内存给少了」（在问你，正面答）\n"
                         "· 他：「坏了 她知道啥子是骂人」→ (不想回复)（他们在议论你，不是问你；"
                         "别凑上去问「啥子是啥子」）\n"
                         "· 他：「你会不会唱歌」→ 「会啊，想听啥」（在问你，但只是问，别自己开唱）"
@@ -8833,7 +8843,7 @@ _SCENE_SAMPLE = [
     {"qq": "10002", "who": "小柚子", "text": "你吃药了吗", "kind": "user"},
     {"qq": "10003", "who": "老王", "text": "抽卡又歪了", "kind": "user"},
     {"qq": "10004", "who": "阿强", "text": "保底都歪，麻了", "kind": "user"},
-    {"qq": "10002", "who": "小柚子", "text": "小鲸鱼 你说他是不是活该", "kind": "user"},
+    {"qq": "10002", "who": "小柚子", "text": "<角色名> 你说他是不是活该", "kind": "user"},
 ]
 
 

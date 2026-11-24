@@ -962,6 +962,52 @@ def check_g33():
     return (not bad), "；".join(bad), "2 小时滑动窗口 / 第 4 次不回不戳回 / 可调阈值"
 
 
+def check_g34():
+    """算力机开关 / Harness 桥 / self_tool 互斥（2026-11-24）。
+
+    用户：
+      · 「NODE_COMPUTE=1 走 node，0 的时候算力机功能可以调用 third 里的本机插件」
+      · 「加个 aurabot 那种 deepseek harness 回话链接 QQ 会话，可以直接改代码」
+      · 「跟 self_tool 冲突，就 .env 用 0/1 关掉 self_tool 打开 harness」
+    """
+    bad = []
+    cfg = read("services/config.py")
+    for k in ("NODE_COMPUTE", "CODE_AGENT", "HARNESS_ENABLED"):
+        if k not in cfg:
+            bad.append(f"config 缺 {k}")
+    boot = read("bot.py")
+    if "_SKIP_WHEN_NO_NODE" not in boot:
+        bad.append("bot.py 没按 NODE_COMPUTE 跳过 draw/song_cover")
+    if "CODE_AGENT" not in boot or "self_tools" not in boot:
+        bad.append("bot.py 没按 CODE_AGENT 跳过 self_tools")
+    llm = read("services/llm.py")
+    for k in ("_NODE_ONLY_TOOLS", "HARNESS_ENABLED", "name.startswith(\"self_tool_\")"):
+        if k not in llm:
+            bad.append(f"llm 缺 {k}")
+    if "if not NODE_COMPUTE:" not in llm:
+        bad.append("工具目录没按 NODE_COMPUTE 切换")
+    try:
+        hs = read("services/harness.py")
+    except Exception as e:
+        return False, f"读 services/harness.py 失败: {e}"
+    for k in ("HARNESS_CLI", "HARNESS_URL", "def ask", "def redact", "HARNESS_OWNER_ONLY"):
+        if k not in hs:
+            bad.append(f"harness 缺 {k}")
+    try:
+        hp = read("plugins/harness/__init__.py")
+    except Exception as e:
+        return False, f"读 plugins/harness 失败: {e}"
+    for k in ("harness_ask", "harness_status", "harness_reset", "is_owner"):
+        if k not in hp:
+            bad.append(f"harness 插件缺 {k}")
+    env = read(".env")
+    if env:
+        for k in ("NODE_COMPUTE=", "CODE_AGENT=", "HARNESS_BACKEND="):
+            if k not in env:
+                bad.append(f".env 缺 {k}")
+    return (not bad), "；".join(bad), "NODE_COMPUTE / CODE_AGENT / harness 桥 / self_tool 互斥"
+
+
 CHECKS = [
     ("C1", "破冰可独立执行", "behavior", check_c1),
     ("A1", "插话设置 tool context", "behavior", check_a1),
@@ -1002,6 +1048,7 @@ CHECKS = [
     ("G31", "角色扮演 deepseek-flash / 三方 chat / prompt 图表", "record", check_g31),
     ("G32", "人格 ID 与登录 QQ 解耦（换号不丢记忆）", "record", check_g32),
     ("G33", "戳一戳次数屏蔽（2h / 3 次）", "record", check_g33),
+    ("G34", "算力机开关 / Harness 桥 / self_tool 互斥", "record", check_g34),
     ("F1", "BM25 降为加分", "recall", check_f1),
     ("F2", "recall 传 gid", "recall", check_f2),
     ("F2b", "remember 带群号", "recall", check_f2b),

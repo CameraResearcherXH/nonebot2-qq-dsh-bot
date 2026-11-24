@@ -3,6 +3,20 @@ import os
 
 BOT_MODE = os.getenv("BOT_MODE", "mock").lower()
 MOCK_REPLY = os.getenv("MOCK_REPLY", "我是测试机器人~")
+
+# 算力机总开关（2026-11-24 用户要求）：
+#   1 = 走 node.py（画图/翻唱/语音/视频理解都排任务给算力机）
+#   0 = 不加载本项目的 draw / song_cover，也不注册这些 function 工具；
+#       画图/唱歌请把现成的 nonebot 插件放进 plugins/third（本机跑）。
+NODE_COMPUTE = os.getenv("NODE_COMPUTE", "1").strip().lower() not in (
+    "0", "false", "off", "no")
+
+# 改代码的方式（2026-11-24 用户要求）：
+#   self_tool = 原来的「她自己写 Python 工具」（self_tool_write/run/file）
+#   harness   = 接 DeepSeek Harness 会话（可以真的改仓库代码），self_tool 自动关闭
+#   off       = 两个都不开
+CODE_AGENT = os.getenv("CODE_AGENT", "self_tool").strip().lower()
+HARNESS_ENABLED = CODE_AGENT == "harness"
 # ⚠️ XAI_* 现在只给「三方判读 / 审核 / 参考 / 表达学习」等辅助调用用，
 #    默认仍是 DeepSeek（deepseek-chat）。
 XAI_API_KEY = os.getenv("XAI_API_KEY", "")

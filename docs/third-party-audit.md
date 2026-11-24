@@ -18,15 +18,3 @@
 | 目录 | 上游 | 许可证 | LICENSE 文件 |
 |---|---|---|---|
 | `PicImageSearch` | https://github.com/kitUIN/PicImageSearch | MIT（见目录 LICENSE） | ✅ |
-
-## 我们对上游改了什么
-
-上面的表只回答「来源 / 许可证 / 风险」。每个插件的**行为适配点**（修了什么 bug、加了什么能力）
-统一记在 [third-party-integration.md](third-party-integration.md#4-我们对上游插件改了什么)。
-
-摘要：
-
-- `picsearch`：本项目自建（聚合以图搜源），通过 `plugin.toml` 暴露 function 工具；
-- `girls_2d` / `petpet` / `pixivrank_search` / `steam_judger` / `gspanel` / `rollpig_plus` /
-  `bittorrents` / `jinriyunshi`：都做了路径、异步、异常、图片发送、命令统一等适配；
-- `VideoZoomer_master`：原样内置，只做路径/依赖接入。
