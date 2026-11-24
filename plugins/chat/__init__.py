@@ -4413,12 +4413,31 @@ def _flush_stale_queue(session_key: str) -> list:
 # 同一条消息只回一次：NapCat 重投、vision 与 chat 双路入队，都会让同一个
 # message_id 进两次队列 —— 群里看到的就是「一张图回两条」（用户 2026-11-19）。
 _REPLIED_MIDS: "OrderedDict" = OrderedDict()
+# ⚠️ 2026-11-24：`_REPLIED_MIDS` 是「见过/处理过」的去重集合，**不等于真的回了**。
+# 以前流水线直接拿它当〔已回〕，结果每条新消息在进流水线前就被登记 → 全被判「已回」。
+# 这里单独记「真的发出去过回复」的 mid，历史块和 pipeline 只认这一份。
+_DONE_MIDS: "OrderedDict" = OrderedDict()
 
 
 def _replied_mids_of(key: str) -> list:
-    """这个会话里已经回过的 mid 列表（给历史块标〔已回〕用）。"""
+    """这个会话里**真的回过**的 mid 列表（给历史块标〔已回〕用）。"""
     pre = f"{key}:"
-    return [k[len(pre):] for k in list(_REPLIED_MIDS.keys()) if k.startswith(pre)]
+    return [k[len(pre):] for k in list(_DONE_MIDS.keys()) if k.startswith(pre)]
+
+
+def _mark_replied_done(key: str, mids, ttl: float = 86400.0) -> None:
+    """真的发出回复后调用：把这些 mid 标成「已回」。"""
+    now = time.time()
+    for mid in mids or ():
+        mid = str(mid or "").strip()
+        if not mid:
+            continue
+        _DONE_MIDS[f"{key}:{mid}"] = now
+    for kk, ts in list(_DONE_MIDS.items()):
+        if now - float(ts or 0) > ttl:
+            _DONE_MIDS.pop(kk, None)
+    while len(_DONE_MIDS) > 4000:
+        _DONE_MIDS.popitem(last=False)
 
 
 def _already_replied(key: str, mid: str, ttl: float = 600.0) -> bool:
@@ -5607,6 +5626,15 @@ async def _session_worker(bot: Bot, session_key: str):
                     f"气泡={len(items)}")
             except Exception:
                 pass
+
+            # 👇 真的发出回复后，才把这些 mid 标成「已回」。
+            #    `_already_replied` 只是防重投的「见过」集合，不能拿来当已回。
+            if said:
+                _done = [str(r.get("mid") or "")
+                         for r in (_seg_records or []) if str(r.get("mid") or "")]
+                if not _done and _mid0:
+                    _done = [_mid0]
+                _mark_replied_done(session_key, _done)
 
             # 👇 把她自己这一轮说的话也写进群聊上下文。
             #    不写的话，下一轮她完全看不到自己刚说过什么 → 会重复、会自相矛盾。

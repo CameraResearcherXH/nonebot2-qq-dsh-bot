@@ -301,7 +301,11 @@ async def build(
     replied = False
     try:
         _mid = str(seg_mids[0] if seg_mids else "")
-        _rs = {str(x) for x in (replied_mids or [])}
+        # ⚠️ 2026-11-24：worker 为了防重投，在进流水线**之前**就把当前 mid
+        # 登记进 `_REPLIED_MIDS` 了。这里必须把「本段 mid」排掉，否则每条新消息
+        # 都会被判成「已经回过」，模型只会补一句、不敢正常回。
+        _rs = ({str(x) for x in (replied_mids or [])}
+               - {str(x) for x in (seg_mids or [])})
         replied = bool(_mid and _mid in _rs)
         if replied:
             blocks.append(_hdr("已回") + "\n· 这条消息你已经回过了，**别再回一遍**；"

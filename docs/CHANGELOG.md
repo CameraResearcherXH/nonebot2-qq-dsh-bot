@@ -21,6 +21,12 @@
 - **表情描述过滤**：`aura_logic.strip_sticker_description()` 清掉
   `（发个嘲笑表情）` / `给你一个嘲笑表情` / `嘲笑表情 |||<sticker:嘲笑>` 里的文字描述，
   只发图；正常聊「这个表情好可爱」不误伤。
+- **〔已回〕误判（真 bug）**：worker 防重投的 `_REPLIED_MIDS` 在进流水线**之前**
+  就登记了当前 mid，导致每条新消息都被判「已回=是」，模型只敢补一句。
+  现在拆成两个集合：
+  - `_REPLIED_MIDS` = 见过/处理过（只用于 DEDUP）；
+  - `_DONE_MIDS` = **真的发出去过回复**（历史块和 pipeline 的〔已回〕只认它）。
+  发送成功后由 `_mark_replied_done()` 写入；沉默不写。
 - NapCat 看门狗：日志出现「需要验证码 / proofWaterUrl / sms-verify」时只记日志、
   **不自动重启**，等人工在 WebUI 完成验证；无密码模式不会反复作废二维码。
 
