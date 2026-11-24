@@ -427,6 +427,31 @@ def recall(query: str, *, limit: int = 5, speaker_qq: str = "",
     return [_row_to_hit(r, s) for s, r in top]
 
 
+def recent_about(qq: str, *, gid: str = "", limit: int = 3) -> list:
+    """这个人最近的事（不按关键词，只按时间）。
+
+    2026-11-24 用户：「最近很少主动去找记忆了，提起相似的事情还是要回想起来」。
+    关键词召回不到时，至少把「关于这个人的最近几条」给她，别让她像失忆一样。
+    """
+    qq = str(qq or "").strip()
+    if not qq:
+        return []
+    init()
+    c = _conn()
+    sql = "SELECT * FROM memories WHERE status='active' AND about_qq=?"
+    args = [qq]
+    if gid:
+        sql += " AND (gid='' OR gid=?)"
+        args.append(str(gid))
+    sql += " ORDER BY ts DESC LIMIT ?"
+    args.append(max(1, int(limit)))
+    try:
+        rows = c.execute(sql, args).fetchall()
+    except Exception:
+        return []
+    return [_row_to_hit(r, 0.0) for r in rows]
+
+
 def recall_catalog(query: str, *, offset: int = 0, limit: int = 10,
                    speaker_qq: str = "", gid: str = "", time_range=None) -> dict:
     """目录模式：默认按时间倒序（从近到远）；有关键词才按相关度。"""

@@ -24,6 +24,9 @@ HISTORY_KEEP = tuning.i("SEGMENT_HISTORY_KEEP")
 
 _BUF: dict = {}
 _PROCESSED: dict = {}
+# 「插队」标记：这条段里有 @ 她 / 引用她 的消息 → 不等安静，立刻处理。
+# 用户 2026-11-24：「我记得我们艾特是插队的，但是现在好像全跟着标签走了」。
+_URGENT: dict = {}
 
 
 def _key(session_key: str) -> str:
@@ -81,6 +84,9 @@ def push(session_key: str, ev, text: str, *, name: str = "", uid: str = "",
     buf.append(rec)
     if len(buf) > max(1, MAX_MSGS * 2):
         del buf[: len(buf) - MAX_MSGS * 2]
+    # @ 她 / 引用她 → 标「插队」：worker 不用等安静窗口，立刻处理这一段
+    if rec["mentioned"] or str(rec["to_kind"]).lower() == "bot":
+        _URGENT[key] = True
 
 
 def set_addressee(session_key: str, mid: str, *, to_kind: str = "",
@@ -105,6 +111,8 @@ def set_addressee(session_key: str, mid: str, *, to_kind: str = "",
                 r["to_conf"] = float(to_conf or 0.0)
             except Exception:
                 r["to_conf"] = 0.0
+            if str(to_kind or "").lower() == "bot":
+                _URGENT[key] = True
             return True
     return False
 
@@ -143,6 +151,12 @@ async def wait_close(session_key: str, *, wait_sec: float = 0,
     last_len = size(key)
     last_change = time.monotonic()
     while True:
+        # 插队：这一段里有 @ 她 / 引用她 → 只留一个很短的合并窗口就处理，
+        # 不再等满 SEGMENT_WAIT_SEC（用户 2026-11-24：艾特要插队）。
+        if _URGENT.get(key) and size(key) > 0:
+            _URGENT[key] = False
+            await asyncio.sleep(0.35)
+            return take(key)
         n = size(key)
         if n != last_len:
             last_len = n

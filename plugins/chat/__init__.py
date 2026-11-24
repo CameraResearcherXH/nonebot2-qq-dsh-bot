@@ -4213,6 +4213,12 @@ def _flush_stale_queue(session_key: str) -> list:
 _REPLIED_MIDS: "OrderedDict" = OrderedDict()
 
 
+def _replied_mids_of(key: str) -> list:
+    """这个会话里已经回过的 mid 列表（给历史块标〔已回〕用）。"""
+    pre = f"{key}:"
+    return [k[len(pre):] for k in list(_REPLIED_MIDS.keys()) if k.startswith(pre)]
+
+
 def _already_replied(key: str, mid: str, ttl: float = 600.0) -> bool:
     """第一次见到这条消息返回 False 并登记；再见到返回 True（跳过）。"""
     if not mid:
@@ -4248,6 +4254,19 @@ async def _session_worker(bot: Bot, session_key: str):
         now_mono = time.monotonic()
         # 单群可以覆盖回复间隔（测试群压到 4s，见 services/group_tuning.py）
         wait = (last + group_tuning.reply_interval(session_key, REPLY_INTERVAL)) - now_mono
+        # 👇 2026-11-24：@ 她 / 引用她 → 插队，不等回复间隔（艾特要即时）
+        try:
+            _urgent_ev = item[0]
+            _is_at = bool(getattr(_urgent_ev, "is_tome", lambda: False)())
+            _rp_u = getattr(_urgent_ev, "reply", None)
+            _rq_u = str(getattr(getattr(_rp_u, "sender", None), "user_id", "") or "")
+            if _rq_u and _is_self_qq(_rq_u, _urgent_ev):
+                _is_at = True
+            if wait > 0 and _is_at:
+                logger.info(f"[URGENT] {session_key} 被 @ → 跳过回复间隔（{wait:.1f}s）")
+                wait = 0
+        except Exception:
+            pass
         if wait > 0:
             await asyncio.sleep(wait)
 
@@ -4299,7 +4318,8 @@ async def _session_worker(bot: Bot, session_key: str):
                 # recent_group_msgs（用户 2026-11-23：「上下文一定要收发件人处理过」）。
                 ctx = group_scene.history_lines(
                     _gid_s, mood_judge.CTX_LINES,
-                    exclude_mids=_seg_mids, exclude_texts=_seg_txts)
+                    exclude_mids=_seg_mids, exclude_texts=_seg_txts,
+                    replied_mids=_replied_mids_of(session_key))
                 # 整段里只要有一条 @ 了她 / 被判定为对她说 / 喊了她名字，就算在叫她。
                 # ⚠️ 不能只看 mentioned：喊名字（「小鲸鱼你觉得呢」）没有 at 段，
                 #    以前会被 _seg_addressed=False 覆盖掉 → 被叫了也不回。
@@ -4343,7 +4363,9 @@ async def _session_worker(bot: Bot, session_key: str):
         #    分段为空时又把未处理的 recent_group_msgs 塞给模型。
         if session_key.startswith("group_") and not _seg_records:
             _gid_norm = str(getattr(ev, "group_id", "") or "")
-            _hl = group_scene.history_lines(_gid_norm, mood_judge.CTX_LINES)
+            _hl = group_scene.history_lines(
+                _gid_norm, mood_judge.CTX_LINES,
+                replied_mids=_replied_mids_of(session_key))
             if _hl:
                 ctx = _hl
             else:
@@ -7454,6 +7476,10 @@ register_tool(
 # ================= DeepSeek 可调用的工具（只在私聊生效）=================
 # 目的：让她能主动做事，而不是只能等 `/翻唱` 这种正则指令。
 # 比如「我答应过你 11 月 5 日唱晴天」→ 她可以直接调 sing 去唱。
+# 唱歌去重表：{会话#QQ: {song, ts, task}}
+_SING_RECENT: dict = {}
+
+
 async def _tool_sing(args: dict) -> str:
     song = str(args.get("song") or "").strip()
     if not song:
@@ -7477,8 +7503,37 @@ async def _tool_sing(args: dict) -> str:
     if not cover_on():
         return ("翻唱现在是关着的（主人关的，算力机忙），唱不了。"
                 "别答应她，直接跟对方说现在不接单，等主人 /翻唱 on。")
+    # 👇 2026-11-24 用户：「有人让她随便唱首歌，结果她发了三次歌」。
+    #    根因：连着三轮都调了 sing，每轮 create_task 一次 → 三首。
+    #    这里按「会话 + 歌名」做在途/近期去重：
+    #      · 上一首还在跑 → 不再点新歌；
+    #      · 同一首歌 15 分钟内点过 → 不重复唱。
+    _qq_s = str(llm_mod.TOOL_CTX.get("speaker_qq") or "")
+    _gid_s = str(getattr(ev, "group_id", "") or "")
+    _sing_key = f"{_gid_s or 'private'}#{_qq_s}"
+    _now_s = time.time()
+    _prev_s = _SING_RECENT.get(_sing_key)
+    if _prev_s:
+        _pt = _prev_s.get("task")
+        _running = bool(_pt is not None and not _pt.done())
+        if _running and (_now_s - float(_prev_s.get("ts") or 0)) < 900:
+            return (f"《{_prev_s.get('song')}》还在唱，等这首出来再说，"
+                    f"别重复点歌。")
+        if (str(_prev_s.get("song") or "") == song
+                and (_now_s - float(_prev_s.get("ts") or 0)) < 900):
+            return f"《{song}》刚唱过（{int(_now_s - float(_prev_s.get('ts') or 0))}s 前），别重复唱。"
+
     # 后台跑，不阻塞这一轮回复；唱完她自己会把成品发出来
     _task = asyncio.create_task(process_cover_task(bot, ev, song, with_inst, gender))
+    try:
+        _SING_RECENT[_sing_key] = {"song": song, "ts": _now_s, "task": _task}
+        if len(_SING_RECENT) > 200:
+            _cut = _now_s - 3600
+            for _k in [k for k, v in _SING_RECENT.items()
+                       if float(v.get("ts") or 0) < _cut]:
+                _SING_RECENT.pop(_k, None)
+    except Exception:
+        pass
 
     def _on_done(t):
         # 👇 create_task 里抛的异常默认会被静默吞掉 —— 之前 process_cover_task

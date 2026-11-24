@@ -1,6 +1,7 @@
 # services/prompt_builder.py
 from core import tuning
 import os
+import re
 import time
 from services import profiles, memory_v2, mood
 
@@ -290,6 +291,34 @@ def _clip(text: str, limit: int) -> str:
     return t[: max(0, limit - 1)].rstrip() + "…"
 
 
+_RECALL_NOISE_RE = re.compile(r"^(\[\d+\]\s*|⭐|〔已回〕|#\d+\s*)+")
+# 群聊分段/规矩块这些「不是内容」的行，别喂给 BM25
+_RECALL_SKIP_HEAD = ("（这一段群聊", "⚠️", "【必须回应", "带「〔引用", "不写 `<reply:")
+
+
+def _recall_query(text: str, limit: int = 180) -> str:
+    """把「给模型看的整段文本」压成一条干净的检索词。
+
+    2026-11-24 用户：「最近很少主动去找记忆了」。
+    根因之一：`recall_hits` 把整段（带 [2] ⭐#123 某人(123) → 你：… 的头）
+    直接当 BM25 查询，噪音 token 把相关度摊薄 → 分数够不到阈值 → 0 命中。
+    """
+    raw = str(text or "")
+    picked = []
+    for ln in raw.splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith(_RECALL_SKIP_HEAD):
+            continue
+        s2 = _RECALL_NOISE_RE.sub("", ln)
+        # 去掉「某人(123) → 你：」这种前缀，只留内容
+        m = re.match(r"^[^：:]{1,40}[：:]\s*(.+)$", s2)
+        if m:
+            s2 = m.group(1)
+        picked.append(s2.strip())
+    q = " ".join(picked[-3:])[:limit].strip()
+    return q or raw[:limit]
+
+
 def recall_hits(
     session_key: str = "",
     user_text: str = "",
@@ -309,15 +338,26 @@ def recall_hits(
       顺带把「组装两次 = BM25 跑两遍 + index 写两遍盘」也省掉。
     """
     try:
-        return memory_v2.recall(
-            query_for_recall(session_key, user_text),
+        hits = memory_v2.recall(
+            query_for_recall(session_key, _recall_query(user_text)),
             limit=limit,
             speaker_qq=str(speaker_qq),
             max_age_days=max_age_days,
             gid=_gid_of(session_key),
         )
     except Exception:
-        return []
+        hits = []
+    if not hits and speaker_qq:
+        # 关键词没命中 ≠ 没有记忆：至少把「关于这个人的最近几条」带上，
+        # 让她不至于像失忆一样（用户 2026-11-24）。
+        try:
+            hits = memory_v2.recent_about(
+                str(speaker_qq), gid=_gid_of(session_key), limit=3)
+            for _h in hits:
+                _h["fallback"] = True
+        except Exception:
+            hits = []
+    return hits
 
 
 def build_packet(
@@ -422,9 +462,11 @@ def build_packet(
         if _idx:
             _parts.append("\n".join(f"· {x}" for x in _idx))
         if _mem_dir:
-            _parts.append(
-                f"目录（{len(_mem_dir)} 条，越前越相关）：\n" + "\n".join(_mem_dir)
-            )
+            _fb = any(h.get("fallback") for h in hits)
+            _title = ("关于这个人最近的事（关键词没命中，按时间给的）："
+                      if _fb else
+                      f"目录（{len(_mem_dir)} 条，越前越相关）：")
+            _parts.append(_title + "\n" + "\n".join(_mem_dir))
         contents["memory_index"] = (
             "▍记忆目录（只给线索，内容按需拉）\n"
             + "\n".join(_parts)

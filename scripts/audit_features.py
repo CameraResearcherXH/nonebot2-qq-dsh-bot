@@ -1108,6 +1108,52 @@ def check_g37():
 
 
 
+def check_g38():
+    """记忆召回：干净 query + 人物兜底 + 已回标记（2026-11-24）。
+
+    用户：「最近很少主动去找记忆了，提起相似的事情还是要回想起来一下，
+          包括一个人。并不是只翻档案。」
+    """
+    bad = []
+    pb = read("services/prompt_builder.py")
+    for k in ("_recall_query", "memory_v2.recent_about", "_RECALL_SKIP_HEAD"):
+        if k not in pb:
+            bad.append(f"prompt_builder 缺 {k}")
+    mem = read("services/memdb.py")
+    if "def recent_about(" not in mem:
+        bad.append("memdb 缺 recent_about")
+    mv = read("services/memory_v2.py")
+    if "def recent_about(" not in mv:
+        bad.append("memory_v2 没透传 recent_about")
+    gs = read("services/group_scene.py")
+    if "replied_mids" not in gs or "〔已回〕" not in gs:
+        bad.append("history_lines 没标〔已回〕")
+    llm = read("services/llm.py")
+    if "[[MEMORY|关键词]]" not in llm or "提到往事就必须回想" not in llm:
+        bad.append("规矩里没要求「提到往事先翻记忆」")
+    return (not bad), "；".join(bad), "干净召回 query / 人物近期兜底 / 上下文标〔已回〕/ 规矩要求回想"
+
+
+def check_g39():
+    """@ 插队 + 唱歌去重（2026-11-24）。
+
+    用户：「我记得我们艾特是插队的」「群里有人让她唱首歌，结果她发了三次歌」。
+    """
+    bad = []
+    seg = read("services/segments.py")
+    for k in ("_URGENT", "插队"):
+        if k not in seg:
+            bad.append(f"segments 缺 {k}")
+    if "if _URGENT.get(key) and size(key) > 0:" not in seg:
+        bad.append("wait_close 没处理插队")
+    chat = read("plugins/chat/__init__.py")
+    for k in ("_SING_RECENT", "别重复点歌", "[URGENT]"):
+        if k not in chat:
+            bad.append(f"chat 缺 {k}")
+    return (not bad), "；".join(bad), "@ 段立刻处理 + 跳过回复间隔；sing 在途/近期去重"
+
+
+
 CHECKS = [
     ("C1", "破冰可独立执行", "behavior", check_c1),
     ("A1", "插话设置 tool context", "behavior", check_a1),
@@ -1152,6 +1198,8 @@ CHECKS = [
     ("G35", "模型自由搭配（识图/对话/两个检测都能换）", "record", check_g35),
     ("G36", "群聊全局 / 省流模式", "record", check_g36),
     ("G37", "引用精确到消息号 / 同一件事不回两遍", "record", check_g37),
+    ("G38", "记忆召回（干净 query / 人物兜底 / 已回标记）", "record", check_g38),
+    ("G39", "@ 插队 / 唱歌去重", "record", check_g39),
     ("F1", "BM25 降为加分", "recall", check_f1),
     ("F2", "recall 传 gid", "recall", check_f2),
     ("F2b", "remember 带群号", "recall", check_f2b),

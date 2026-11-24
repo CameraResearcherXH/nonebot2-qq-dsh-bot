@@ -613,6 +613,14 @@ def recall(
 # ================== 目录模式 + 单条展开（[[MEMORY|...|翻页N]] / [[MEMORY|展开|编号]]） ==================
 # 用户 2026-11-16：「不展开时希望有十件记录，每件事标上时间和当时的心情；
 # 想看详细在某条后加「详细」展开；可以翻页直到翻完；也可以关键字直搜那段记忆。」
+def recent_about(qq: str, *, gid: str = "", limit: int = 3) -> list:
+    """这个人最近的事（关键词召回不到时的兜底）。"""
+    try:
+        return memdb.recent_about(qq, gid=gid, limit=limit)
+    except Exception:
+        return []
+
+
 def recall_catalog(query: str, *, offset: int = 0, limit: int = 10,
                    speaker_qq: str = "", gid: str = "", time_range=None) -> dict:
     """目录模式：只回「编号 + 时间 + 心情 + 摘要」，不展开全文，省 token。

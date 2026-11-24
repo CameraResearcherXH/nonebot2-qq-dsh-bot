@@ -1280,7 +1280,8 @@ def recent_messages(gid: str, limit: int = 20, window: float = 0.0) -> list:
 
 
 def history_lines(gid: str, n: int = 8, *, width: int = 160,
-                  exclude_mids=(), exclude_texts=()) -> list:
+                  exclude_mids=(), exclude_texts=(),
+                  replied_mids=()) -> list:
     """**处理过的历史**：带收发件人的最近 n 条（判心情 / 角色扮演 / 翻历史 共用）。
 
     用户 2026-11-22：
@@ -1299,6 +1300,10 @@ def history_lines(gid: str, n: int = 8, *, width: int = 160,
     # 兜底：有些适配器事件没有 message_id（mid 为空）→ 再按 (qq, 文本前缀) 排除，
     # 否则「当前这一段」会在历史块里再出现一遍（用户 2026-11-22：模板重复）。
     _ex_txt = {str(x) for x in (exclude_texts or ()) if str(x or "").strip()}
+    # 👇 2026-11-24 用户：「多次拉 8 条要标记哪些消息 id 回复过，
+    #    不要因为这里 bug 重复回复。」已回过的那几条前面打〔已回〕，
+    #    模型就不会再针对它们开一轮。
+    _replied = {str(x) for x in (replied_mids or ()) if str(x or "").strip()}
     try:
         # 多取一些，过滤掉「当前这一段」后仍然凑够 n 条
         rows = recent_messages(gid, max(1, int(n)) + len(_ex) + len(_ex_txt))
@@ -1335,7 +1340,8 @@ def history_lines(gid: str, n: int = 8, *, width: int = 160,
         # ⭐ 和 prompt 里「带 ⭐ 的是在叫你」对齐（2026-11-23）：
         # 以前只写「→ 你」不打 ⭐，而规矩让模型找 ⭐ → 她根本找不到重点。
         _star = "⭐" if to == "你" else ""
-        out.append(f"{_star}{who} → {to}: {txt[:width]}")
+        _done = "〔已回〕" if (_mid and _mid in _replied) else ""
+        out.append(f"{_star}{_done}{who} → {to}: {txt[:width]}")
     return out[-max(1, int(n)):]
 
 

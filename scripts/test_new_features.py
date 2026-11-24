@@ -863,6 +863,43 @@ try:
 except Exception as _e:
     check("省流/引用可导入", False, f"{type(_e).__name__}: {_e}")
 
+
+# ---- 记忆召回 / 插队 / 唱歌去重（2026-11-24 第四轮）----
+try:
+    from services import prompt_builder as _pb
+    _q = _pb._recall_query(
+        "（这一段群聊共 2 条，按时间顺序，最后一条最新。\n"
+        "[1] ⭐#123 阿明(1001) → 你：上次那个蛋糕是哪家的\n"
+        "[2] #124 小红(1002) → 大家：我也想吃")
+    check("召回 query 去掉了行号/⭐/名字前缀",
+          "上次那个蛋糕是哪家的" in _q and "[1]" not in _q and "⭐" not in _q,
+          _q)
+
+    from services import memory_v2 as _mv
+    check("记忆有「关于这个人最近的事」兜底",
+          hasattr(_mv, "recent_about")
+          and isinstance(_mv.recent_about("100000000", limit=2), list))
+
+    from services import group_scene as _gs
+    import inspect as _insp
+    _sig = _insp.signature(_gs.history_lines)
+    check("历史块支持标记〔已回〕", "replied_mids" in _sig.parameters)
+
+    from services import segments as _sg
+    check("分段支持 @ 插队标记", hasattr(_sg, "_URGENT"))
+except Exception as _e:
+    check("记忆/插队可导入", False, f"{type(_e).__name__}: {_e}")
+
+try:
+    _chat_src2 = (ROOT / "plugins" / "chat" / "__init__.py").read_text(
+        encoding="utf-8", errors="ignore")
+    check("唱歌有在途/近期去重",
+          "_SING_RECENT" in _chat_src2 and "别重复点歌" in _chat_src2)
+    check("@ 消息跳过回复间隔（插队）",
+          "[URGENT]" in _chat_src2 and "_is_at" in _chat_src2)
+except Exception as _e:
+    check("插队/唱歌可读源码", False, f"{type(_e).__name__}: {_e}")
+
 print("PASS %d / FAIL %d" % (len(PASS), len(FAIL)))
 if FAIL:
     print("失败：" + "、".join(FAIL))
