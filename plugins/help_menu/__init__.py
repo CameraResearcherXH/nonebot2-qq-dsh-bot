@@ -44,7 +44,7 @@ COMMANDS = [
         ("/功能菜单 详情", "主题索引"),
         ("/功能菜单 算力机", "某个功能的完整说明"),
     ]),
-    ("🛠 改代码 / Harness（仅主人）", [
+    ("🛠 改代码 / Harness（CODE_AGENT=harness，仅主人）", [
         ("/h 或 /harness", "看当前 harness 会话 / 后端 / 工作目录"),
         ("/h 新", "开一个新会话"),
         ("/h <需求>", "交给本机 DeepSeek Harness 改代码"),
