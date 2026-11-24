@@ -805,7 +805,9 @@ def strip_stage_direction(text: str) -> str:
     m = _STAGE_HEAD_RE.match(t)
     if m and any(v in m.group(0) for v in _STAGE_VERBS):
         t = t[m.end():].strip()
-    return strip_inner_thought(t)
+    t = strip_inner_thought(t)
+    t = strip_sticker_description(t)
+    return t
 
 
 # 2026-11-24 用户：「他又开始说心里话了。」
@@ -844,6 +846,43 @@ def strip_inner_thought(text: str) -> str:
     t = _INNER_LABEL_RE.sub("", t)
     t = _INNER_BRACKET_RE.sub("", t)
     return t.strip()
+
+
+# ================= 三-0e1b、表情描述（2026-11-24） =================
+# 用户：「表情包她还会描述表情内容吗？」
+# 实测会：`（发个嘲笑表情）` / `给你一个嘲笑表情` / `嘲笑表情 |||<sticker:嘲笑>`
+# 前面那句会原样发到群里，等于把「我要发表情」说出来。
+# 处理：只删「明显在描述发表情」的短句；正常聊「这个表情好可爱」不动。
+_STICKER_DESC_PAREN_RE = re.compile(
+    r"[（(]\s*(?:我)?(?:给)?(?:你)?\s*(?:发|来|甩|丢|整|搞|送)\s*"
+    r"(?:个|一个|一张|张)?\s*[^（）()]{0,10}?(?:表情包|表情|梗图)\s*"
+    r"(?:给你|哦|啦|吧)?\s*[）)]",
+    re.IGNORECASE)
+_STICKER_DESC_SENT_RE = re.compile(
+    r"^\s*(?:我)?(?:给)?(?:你)?\s*(?:发|来|甩|丢|整|搞|送)\s*"
+    r"(?:个|一个|一张|张)?\s*[^，。！？!?\n]{0,10}?(?:表情包|表情|梗图)\s*"
+    r"(?:给你|哦|啦|吧)?\s*[。！!]?$",
+    re.IGNORECASE)
+_STICKER_DESC_BARE_RE = re.compile(
+    r"^\s*(?:一个|一张|个|张)?\s*[^，。！？!?\n]{1,6}?(?:表情包|表情|梗图)\s*[。！!]?$",
+    re.IGNORECASE)
+
+
+def strip_sticker_description(text: str) -> str:
+    """删掉「我要发个 X 表情」这类描述；只处理短句，不碰正常聊天。"""
+    t = str(text or "")
+    if not t:
+        return t
+    t = _STICKER_DESC_PAREN_RE.sub("", t)
+    keep = []
+    for ln in t.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if _STICKER_DESC_SENT_RE.match(s) or _STICKER_DESC_BARE_RE.match(s):
+            continue
+        keep.append(ln)
+    return "\n".join(keep).strip()
 
 
 # ================= 三-0e2、点评对话本身 / 心里话（2026-11-23） =================

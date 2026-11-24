@@ -202,39 +202,56 @@ async def build(
 
     # ---------- ④ 心情 LLM 对这段话的总结 ----------
     summary = ""
-    try:
-        from . import mood_judge
-        # 只喂当前一句会把「身高 192」猜成「192 关」——必须带上最近聊天，
-        # 让判读先判断「这句在接哪句」。用户 2026-11-24 真机踩过。
-        _ctx4 = []
-        if gid:
-            try:
-                from . import group_scene
-                _ctx4 = group_scene.history_lines(
-                    gid, 10, width=140, exclude_mids=seg_mids)
-                # 审核 LLM 已经有一份「这段在聊什么」的滚动总结，先当背景给它，
-                # 避免只看到最后几条时把「192」这种数字接错话题。
-                _sm4 = (group_scene.snapshot(gid).get("summary") or {}).get("text") or ""
-                if _sm4:
-                    _ctx4 = [f"（之前群里在聊：{str(_sm4)[:120]}）"] + _ctx4
-            except Exception:
-                _ctx4 = []
-        summary = await _step(
-            "总结",
-            mood_judge.summarize(text, session_key, _ctx4,
-                                 speaker=speaker_name),
-            min(6.0, left())) or ""
-        if summary:
-            blocks.append(_hdr("总结") + "\n· " + summary)
-            stages["总结"] = "✓"
-        else:
-            stages["总结"] = "—"
-    except Exception as e:
-        fail("总结", e)
-        summary = ""
+    # ⚠️ 2026-11-24：图片/视频的 text 里带着完整视觉报告（[图片识别结果]…），
+    # 再让总结 LLM 压一遍，会把「画面描述」重新塞回 prompt —— 她就会先描述图再回答。
+    # 视觉分支自己已经有「不要复述画面」的最高 recency 规则；这里直接跳过总结。
+    _txt_s = str(text or "")
+    _is_media = (
+        "[图片识别结果]" in _txt_s
+        or "[视频解析结果]" in _txt_s
+        or _txt_s.strip() in ("[图片]", "[表情]", "[视频]")
+        or "【对方发了一个表情包" in _txt_s
+    )
+    if _is_media:
+        stages["总结"] = "—(媒体，不总结画面)"
+    else:
+        try:
+            from . import mood_judge
+            # 只喂当前一句会把「身高 192」猜成「192 关」——必须带上最近聊天，
+            # 让判读先判断「这句在接哪句」。用户 2026-11-24 真机踩过。
+            _ctx4 = []
+            if gid:
+                try:
+                    from . import group_scene
+                    _ctx4 = group_scene.history_lines(
+                        gid, 10, width=140, exclude_mids=seg_mids)
+                    # 审核 LLM 已经有一份「这段在聊什么」的滚动总结，先当背景给它，
+                    # 避免只看到最后几条时把「192」这种数字接错话题。
+                    _sm4 = (group_scene.snapshot(gid).get("summary") or {}).get("text") or ""
+                    if _sm4:
+                        _ctx4 = [f"（之前群里在聊：{str(_sm4)[:120]}）"] + _ctx4
+                except Exception:
+                    _ctx4 = []
+            summary = await _step(
+                "总结",
+                mood_judge.summarize(text, session_key, _ctx4,
+                                     speaker=speaker_name),
+                min(6.0, left())) or ""
+            if summary:
+                blocks.append(_hdr("总结") + "\n· " + summary)
+                stages["总结"] = "✓"
+            else:
+                stages["总结"] = "—"
+        except Exception as e:
+            fail("总结", e)
+            summary = ""
 
-    # 总结失败就用原话当检索词（去掉 @/引用噪音）
-    query = summary or str(text or "")[:120]
+    # 总结失败就用原话当检索词；媒体消息不要拿整段视觉报告去检索，
+    # 否则记忆/图书馆块里又会出现画面细节。
+    if _is_media:
+        query = f"{speaker_name or '对方'} 图片"
+    else:
+        query = summary or str(text or "")[:120]
 
     # ---------- ⑤⑥ 记忆 + 图书馆（并行，互不等待） ----------
     async def _mem_stage():
