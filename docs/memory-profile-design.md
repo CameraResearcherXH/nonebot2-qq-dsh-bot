@@ -1,6 +1,10 @@
+> ⚠️ **as-built 快照（2026-11-20）**：描述当时的实现，不是目标设计。
+> 现行设计以 [DESIGN.md](DESIGN.md) 为准；差异见 [design-audit-2026-11-25.md](design-audit-2026-11-25.md)。
+> 已知：记忆/档案/心情/好感的当时数据结构；v2 检索会改 schema。
+
 # 记忆 · 档案 · 心情 · 好感：as-built 详解
 
-> 心情 / 好感的数值模型见 [mood-affinity-design.md](mood-affinity-design.md)；
+> 心情 / 好感的数值模型见 [mood-affinity-design.md](archive/mood-affinity-design.md)；
 > 这一篇讲**数据怎么落、怎么读、怎么进 prompt**，以及为什么这么设计。
 
 ## 1. 四层数据，各管什么
@@ -102,8 +106,26 @@ prompt 里只放**和当前说话人 / 当前话题相关**的几条（默认 4 
 | `role` / `identity` / `note` | 身份、备注 | 档案挖掘 |
 | `groups.<gid>` | 群内称呼 / 角色 / 是否静音 | 群内观察 |
 | `bond_word` | 好感名词 | 好感更新 |
-| `bond_notes` | 相处经历（带情绪权重） | 记忆回流 |
+| `bond_notes` | 相处经历（**只收 |Δ|≥0.15 的大波动**，带情绪权重） | 判读回流 |
 | `affinity` | 好感数值 | 判读 Δ |
+
+### 4.0 档案只收「大波动」的事（2026-11-25）
+
+档案和记忆的职责必须分开，否则两块的重复率会很高：
+
+| | 记什么 | 密度 |
+|---|---|---|
+| **记忆** | 发生了什么（细节、可检索、每 turn 都记） | 密 |
+| **档案** | **让她心情明显动过**的事（1 条「印象最深」+ 少量事件） | 稀 |
+
+规则：
+
+- 门槛 `PROFILE_NOTE_MIN_DELTA=0.15`（`core/tuning.py`）：判读的 `|Δ|` 低于它，
+  `profiles.add_bond_note` 直接丢弃，只留在记忆里；
+- **事实类不进档案**：`/记住` 的事实、看过的 B 站视频、普通闲聊，只进记忆；
+- `profile_miner` 只写**带明确情绪**的事件，`neutral` 一律跳过；
+- 回复前「档案」块**不再调 `memory_v2.recall`** 取「印象最深的事」，
+  改读 `bond_notes` 里 `|Δ|` 最大的那条——档案和记忆不再各查一遍同一件事。
 
 ### 4.1 称呼是双向的
 
@@ -123,7 +145,7 @@ prompt 里只放**和当前说话人 / 当前话题相关**的几条（默认 4 
 
 ## 5. 心情 / 好感（只讲接线）
 
-数值模型见 [mood-affinity-design.md](mood-affinity-design.md)，这里只讲数据怎么流：
+数值模型见 [mood-affinity-design.md](archive/mood-affinity-design.md)，这里只讲数据怎么流：
 
 ```
 一轮对话

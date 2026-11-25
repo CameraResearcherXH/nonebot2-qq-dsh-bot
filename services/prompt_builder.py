@@ -3,7 +3,7 @@ from core import tuning
 import os
 import re
 import time
-from services import profiles, memory_v2, mood
+from services import profiles, memory_v2, mood, ctx_budget
 
 # 每个 session 的"上一句"（用于短句兜底）
 _last_query: dict[str, str] = {}
@@ -205,15 +205,16 @@ def build_prompt(
 # 我们的对应关系：index.md ↔ 人物档案（模型不知道对方是谁就全乱了）。
 BLOCK_BUDGET = {
     #  (保底, 上限)   单位：字符
-    "profiles":     (120, 420),
+    # 上限直接读 DESIGN §3.3 的 CTX_* 口径（改数字去 tuning.py，不要改这里）
+    "profiles":     (120, tuning.i("CTX_PROFILE")),
     "bond":         (0,   320),
     # ⚠️ 以前这里只有 "memory"，但 build_packet 实际产出的是 "memory_index" +
     #    "yesterday" —— 这两个键不在预算表里 → allocate_budget 不认 →
     #    alloc.get(k, 0) = 0 → 整块被 _clip 成空串。
     #    也就是说「记忆目录」和「昨日总结」这两块**从来没有进过 prompt**（2026-11-17 审计）。
     "memory":       (120, 400),   # 兼容旧调用方，build_packet 不再产出
-    "memory_index": (120, 420),
-    "yesterday":    (0,   220),
+    "memory_index": (120, tuning.i("CTX_EVIDENCE")),
+    "yesterday":    (0,   tuning.i("CTX_SUMMARY")),
     "library":      (0,   350),
     "revisit":      (0,   180),
     # 状态块现在有「心情词 + 数值 + 心里话 + 群聊总结 + 对你的好感」，
@@ -226,7 +227,9 @@ BLOCK_BUDGET = {
     # Lorebook：只在关键词命中时才有内容；给足 520 字，超了模块内部已经按 order 裁过
     "lore":         (0,   520),
 }
-TOTAL_BUDGET = tuning.i("PROMPT_BUDGET")
+# 总池：PROMPT_BUDGET 是 live 池，CTX_SOFT_CAP 是设计上限 —— 取小者，
+# 避免 .env 把 PROMPT_BUDGET 调到 2700 以上绕过设计口径。
+TOTAL_BUDGET = min(tuning.i("PROMPT_BUDGET"), tuning.i("CTX_SOFT_CAP"))
 
 
 def allocate_budget(contents: dict, budget: dict = None,
@@ -376,7 +379,7 @@ def build_packet(
     speaker_name: str = "",
     group_qqs=None,
     library_text: str = "",
-    memory_limit: int = 5,
+    memory_limit: int = 0,   # 0 = 用 RET_MEMORY_TOP（记忆块注入条数）
     max_age_days: float = 0,
     total_budget: int = 0,
     hits: list | None = None,
@@ -454,7 +457,8 @@ def build_packet(
     if hits is None:
         hits = recall_hits(
             session_key, user_text, speaker_qq,
-            limit=memory_limit, max_age_days=max_age_days,
+            limit=int(memory_limit or tuning.i("RET_MEMORY_TOP")),
+            max_age_days=max_age_days,
         )
 
     _mem_dir = []
@@ -530,6 +534,7 @@ def build_packet(
     except Exception:
         mp = ""
     if mp:
+        mp = ctx_budget.observe("state", mp, source=session_key)
         contents["mood"] = "▍现在的状态\n" + mp
 
     # ⑥.5 安静建议（参考）：好感/心情的**走势** + 群里插不插得上话。

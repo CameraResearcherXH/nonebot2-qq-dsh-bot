@@ -41,6 +41,9 @@ from . import attention, chat_switch, conv_state, dialogue_log, mood, profiles
 ENABLED = os.getenv("PROACTIVE_PRIVATE", "true").lower() in ("1", "true", "yes", "on")
 # 每个人每天最多主动找几次
 MAX_PER_DAY = tuning.i("PROACTIVE_MAX_PER_DAY")
+GROUP_MAX_PER_DAY = tuning.i("PROACTIVE_GROUP_MAX_PER_DAY")
+ACCEPT_WINDOW_H = tuning.f("PROACTIVE_ACCEPT_WINDOW_H")
+ACCEPT_BONUS = tuning.f("PROACTIVE_ACCEPT_BONUS")
 # 同一个人两次之间的最小间隔（小时）
 COOLDOWN_H = tuning.f("PROACTIVE_COOLDOWN_H")
 # 多久没说话才值得主动找（小时）——太短像补刀，太长像诈尸
@@ -60,9 +63,23 @@ DRY_RUN = os.getenv("PROACTIVE_DRY_RUN", "false").lower() in ("1", "true", "yes"
 
 STATE_FILE = Path(os.getenv("PROACTIVE_STATE_FILE", "data/proactive.json"))
 
-# 注意力漂移档位 → 「想开口」的乘数
-_DRIFT_FACTOR = {"off": 0.6, "subtle": 0.8, "active": 1.0,
-                 "scattered": 1.15, "wild": 1.3}
+# 注意力漂移档位 → 「想开口」的乘数（±10%）
+# 数值只在 core/tuning.py 的 RHYTHM_*，这里不要写死 ——
+# 之前写死成 0.6/0.8/1.0/1.15/1.3（±40%），和设计稿/tuning 的 ±10% 不一致，
+# 而且 off=0.6 把「不漂移」变成了「不想说话」。
+# 注意：这里刻意写成 5 个字面量分支，不做 dict 映射 ——
+# check_tuning 靠「文件里出现键名字面量」判断是否真接线，动态 key 会被当成没接。
+def _rhythm() -> float:
+    lvl = str(attention.DRIFT_LEVEL or "active").lower()
+    if lvl == "off":
+        return tuning.f("RHYTHM_OFF")
+    if lvl == "subtle":
+        return tuning.f("RHYTHM_SUBTLE")
+    if lvl == "scattered":
+        return tuning.f("RHYTHM_SCATTERED")
+    if lvl == "wild":
+        return tuning.f("RHYTHM_WILD")
+    return tuning.f("RHYTHM_ACTIVE")
 
 _cache: dict = {"mtime": 0.0, "data": {}}
 
@@ -241,11 +258,14 @@ def score_of(qq: str) -> dict:
         chatty = float(mood.mood_factors(key).get("chatty") or 1.0)
     except Exception:
         chatty = 1.0
-    drift = _DRIFT_FACTOR.get(str(attention.DRIFT_LEVEL or "active").lower(), 1.0)
+    drift = _rhythm()
     score = chatty * (0.5 + 1.2 * inti) * drift * (1.0 + 0.8 * aff)
     # 心情低 + 好感高 → 更想找他倾诉（不是硬条件，只给一点加成）
     _pour = 1.15 if (mood_v <= -0.25 and aff >= 0.35) else 1.0
     score *= _pour
+    # 闭环反馈：他以前接得住她的主动 → 下次更愿意找他；总不回 → 自然降权
+    _acc = accept_rate(qq)
+    score *= (1.0 + ACCEPT_BONUS * _acc)
     info.update({
         "ok": score >= MIN_SCORE,
         "score": round(score, 3),
@@ -254,6 +274,7 @@ def score_of(qq: str) -> dict:
         "affinity": round(aff, 2),
         "mood": round(mood_v, 2),
         "pour": round(_pour, 2),
+        "accept_rate": _acc,
         "drift": drift,
         "idle_h": round(idle_h, 1),
         "lines": lines,
@@ -298,9 +319,67 @@ def mark_sent(qq: str) -> None:
     rec["count"] = int(rec.get("count") or 0) + 1
     rec["last_at"] = time.time()
     rec["sent_at"] = time.time()
+    # 闭环（proactive §A）：记一次「发出」，等对方回话来补 accepted
+    rec["sent_total"] = int(rec.get("sent_total") or 0) + 1
+    rec["pending_at"] = time.time()
     # 他之前主动说过话 → 上次那句不算「冷场」，清掉冷场计数
     rec["cold"] = 0
     _save(data)
+
+
+def accept_rate(qq: str) -> float:
+    """主动私聊的「接住率」= accepted / sent（最近窗口内的累计）。"""
+    rec = _rec(_load(), qq)
+    sent = int(rec.get("sent_total") or 0)
+    acc = int(rec.get("accepted_total") or 0)
+    return round(acc / sent, 3) if sent > 0 else 0.0
+
+
+def note_reply(qq: str, text: str = "") -> bool:
+    """对方回话了：如果她最近主动找过他（窗口内），记一次 accept。"""
+    qq = str(qq or "").strip()
+    if not qq.isdigit():
+        return False
+    now = time.time()
+    data = _load()
+    rec = _rec(data, qq)
+    pending = float(rec.get("pending_at") or 0)
+    if not pending or now - pending > ACCEPT_WINDOW_H * 3600:
+        return False
+    rec["accepted_total"] = int(rec.get("accepted_total") or 0) + 1
+    rec["accepted_at"] = now
+    rec["pending_at"] = 0
+    rec["last_reply"] = str(text or "")[:40]
+    _save(data)
+    try:
+        logger.info(f"[PROACTIVE] accept {qq} rate={accept_rate(qq):.2f}"
+                    f"（窗口 {ACCEPT_WINDOW_H:.0f}h）")
+    except Exception:
+        pass
+    return True
+
+
+def group_count_today(gid: str) -> int:
+    g = ((_load().get("groups") or {}).get(str(gid)) or {})
+    return int(g.get("count") or 0) if str(g.get("day") or "") == _today() else 0
+
+
+def mark_group_sent(gid: str) -> int:
+    data = _load()
+    groups = data.setdefault("groups", {})
+    g = groups.setdefault(str(gid), {})
+    if str(g.get("day") or "") != _today():
+        g["day"] = _today()
+        g["count"] = 0
+    g["count"] = int(g.get("count") or 0) + 1
+    g["last_at"] = time.time()
+    _save(data)
+    try:
+        logger.info(f"[PROACTIVE] 群 {gid} 今天主动 {g['count']} 次"
+                    f"（上限 {GROUP_MAX_PER_DAY}）")
+    except Exception:
+        pass
+    return g["count"]
 
 
 def mark_skipped(qq: str, why: str = "") -> None:

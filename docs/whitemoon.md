@@ -1,3 +1,7 @@
+> ⚠️ **as-built 快照（2026-11-24）**：描述当时的实现，不是目标设计。
+> 现行设计以 [DESIGN.md](DESIGN.md) 为准；差异见 [design-audit-2026-11-25.md](design-audit-2026-11-25.md)。
+> 已知：字段/命令仍有效；语义已改为「关系参照」，不再默认借风格。
+
 # 白月光模式（群友之间的「最常找谁」）
 
 > 代码：`services/white_moon.py`　｜　注入：`services/llm.py`（`white_moon.render`）

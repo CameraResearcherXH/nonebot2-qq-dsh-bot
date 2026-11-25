@@ -194,12 +194,16 @@ try:
     _mood._save(_st)
     _mood.touch("idle")
     _after = float(_mood.get_mood("idle").get("value") or 0)
-    # 50 先过 12h 半衰（950s 约 -0.76），再按 5 分钟 2 步走 -2 → 约 47.24
-    check("沉默后 touch 先结算自减（2 步）", 47.0 < _after < 48.0, str(_after))
+    # P2 起半衰期按作用域取（群 30min / 私聊 2h / 全局 6h），不再固定 12h：
+    #   50 先按 950s 衰减，再按 5 分钟 2 步走 -2。期望值从 tuning 现算，别写死。
+    _hl_h = float(_mood._HL_MIN[_mood._scope_of("idle")]) / 60.0
+    _exp = 50.0 * (0.5 ** (950.0 / 3600.0 / _hl_h)) - 2.0
+    check("沉默后 touch 先结算自减（2 步）", abs(_after - _exp) < 1.0,
+          f"{_after} vs {_exp:.2f}")
 finally:
     os.chdir(_old_cwd)
 
-# ---- 心情口径：设计 §13.1（clamp(v+Δ)）+ Δ 入口护栏参数（2026-11-22）----
+# ---- 心情口径：设计 §3.1（clamp(v+Δ)）+ Δ 入口护栏参数（2026-11-22）----
 _old_cwd = os.getcwd()
 os.chdir(_tmp)
 os.environ["MOOD_FILE"] = str(_tmp / "mood_sat.json")
@@ -221,9 +225,11 @@ try:
           str(_tn.f("MOOD_MAX_DELTA")))
     check("Δ 噪音门槛 0.03", abs(float(_tn.f("MOOD_NOISE_DELTA")) - 0.03) < 1e-9,
           str(_tn.f("MOOD_NOISE_DELTA")))
-    check("被动观察单次上限 0.03",
-          abs(float(_tn.f("MOOD_PASSIVE_MAX_DELTA")) - 0.03) < 1e-9,
-          str(_tn.f("MOOD_PASSIVE_MAX_DELTA")))
+    # ADR-038：没 THINK 就不改心情，被动观察通道已删除。
+    # 旧测试还在断言 MOOD_PASSIVE_MAX_DELTA=0.03，会随着键一起消失而假失败。
+    check("被动观察通道已删除（无 MOOD_PASSIVE_MAX_DELTA）",
+          "MOOD_PASSIVE_MAX_DELTA" not in _tn.DEFAULTS,
+          "DEFAULTS 里已无此键")
     check("非冲她来单次上限 0.05",
           abs(float(_tn.f("MOOD_ENV_MAX_DELTA")) - 0.05) < 1e-9,
           str(_tn.f("MOOD_ENV_MAX_DELTA")))
@@ -361,10 +367,14 @@ try:
         return _f
 
     _mj.judge = _mk(-0.07, "environment")
+    _v0 = float(_mg.get_mood("g_guard").get("value") or 0.0) / 100.0
     _r = _aio.run(_mj.judge_and_store("g_guard", "", ["a"], force=True,
                                      passive=True, addressed=False))
-    check("被动观察 Δ 封顶 0.03", abs(float(_r.get("delta")) + 0.03) < 1e-6,
-          str(_r.get("delta")))
+    _v1 = float(_mg.get_mood("g_guard").get("value") or 0.0) / 100.0
+    # 2026-11-25：旁观窗口没有她的 THINK → 不改心情（以前是封顶 ±0.03）
+    check("旁观窗口（无 THINK）不写心情",
+          _r.get("passive") is True and abs(_v1 - _v0) < 1e-4,
+          f"v {_v0} → {_v1}, passive={_r.get('passive')}")
     _mj.judge = _mk(-0.02, "environment")
     _r = _aio.run(_mj.judge_and_store("g_guard", "", ["a"], force=True))
     check("Δ 噪音丢弃为 0", abs(float(_r.get("delta"))) < 1e-9, str(_r.get("delta")))
@@ -378,6 +388,94 @@ try:
                                      addressed=True))
     check("冲她来 → Δ 原样保留", abs(float(_r.get("delta")) - 0.18) < 1e-6,
           str(_r.get("delta")))
+
+    # 2026-11-25 ADR-038：没有她自己的话/THINK，即使是 force 也不写状态
+    _v2 = float(_mg.get_mood("g_guard2").get("value") or 0.0) / 100.0
+    _mj.judge = _mk(0.18, "speaker")
+    _r = _aio.run(_mj.judge_and_store("g_guard2", "", ["a"], force=True,
+                                     addressed=True))
+    _v3 = float(_mg.get_mood("g_guard2").get("value") or 0.0) / 100.0
+    check("无 THINK 的窗口不写心情（force 也不行）",
+          _r.get("passive") is True and abs(_v3 - _v2) < 1e-4,
+          f"v {_v2} → {_v3}, passive={_r.get('passive')}")
+
+    # 好感必须**双向**：负向事件要能把它拉下来，正向要能拉上去
+    from services import profiles as _pf2
+    _pf2.bump_affinity("7770001", 0.06, reason="setup")
+    _a0 = _pf2.get_affinity("7770001")
+    _mj.judge = _mk(-0.22, "speaker")
+    _aio.run(_mj.judge_and_store("g_aff", "", ["a"], think="被噎得有点闷",
+                                 force=True, speaker_qq="7770001",
+                                 addressed=True))
+    _a1 = _pf2.get_affinity("7770001")
+    check("好感能降（负向事件）", _a1 < _a0 - 1e-6, f"{_a0} → {_a1}")
+    _mj.judge = _mk(0.22, "speaker")
+    _aio.run(_mj.judge_and_store("g_aff", "", ["a"], think="被夸得有点飘",
+                                 force=True, speaker_qq="7770001",
+                                 addressed=True))
+    _a2 = _pf2.get_affinity("7770001")
+    check("好感能涨（正向事件）", _a2 > _a1 + 1e-6, f"{_a1} → {_a2}")
+    check("好感单次步长对称（±0.10 内）",
+          abs(_a1 - _a0) <= 0.1001 and abs(_a2 - _a1) <= 0.1001,
+          f"{_a0}→{_a1}→{_a2}")
+finally:
+    os.chdir(_old_cwd)
+
+# ---- 图书馆触发门槛（2026-11-25：闲聊不该每轮都花 5~14s 查 RAG）----
+try:
+    from services import reply_pipeline as _rp
+    check("图书馆：闲聊不查", not _rp._want_library("今天这鸡蛋灌饼也太贵了吧"))
+    check("图书馆：提旧事要查", _rp._want_library("你还记得上次那个事吗"))
+    check("图书馆：真问句要查", _rp._want_library("那个东西多少钱？"))
+except Exception as _e:
+    check("图书馆触发门槛", False, f"{type(_e).__name__}: {_e}")
+
+# ---- 气泡上限两处必须一致（2026-11-25，P3-6）----
+try:
+    from core import tuning as _tn
+    check("气泡上限两处一致（MAX_BUBBLES == OUT_BUBBLES_MAX）",
+          _tn.i("MAX_BUBBLES") == _tn.i("OUT_BUBBLES_MAX"),
+          f"{_tn.i('MAX_BUBBLES')} vs {_tn.i('OUT_BUBBLES_MAX')}")
+except Exception as _e:
+    check("气泡上限两处一致", False, f"{type(_e).__name__}: {_e}")
+
+# ---- P2 状态机 synthetic 序列（2026-11-25）：Q / 单调 / 步长递减 ----
+# 这条不依赖真实流量，能直接抓「Q 恒 0」「K 不递减」。
+_old_cwd = os.getcwd()
+os.chdir(_tmp)
+os.environ["MOOD_FILE"] = str(_tmp / "mood_seq.json")
+try:
+    from services import mood as _ms
+
+    try:
+        _ms.reset("group_seq")
+    except Exception:
+        pass
+    _vs = []
+    for _i in range(5):
+        _vs.append(float(_ms.observe("group_seq", 1, 0.8)["v"]))
+    check("M1 同向 5 次单调递增",
+          all(_vs[i + 1] > _vs[i] for i in range(4)), str(_vs))
+
+    # 静默 6h：P 必须按 Q 回升（以前 dt_h 恒 0，这条会红）
+    _st = _ms._load()
+    _rec = _st["sessions"].get("group_seq") or {}
+    _rec["P"] = 0.01
+    _rec["updated_at"] = time.time() - 6 * 3600
+    _st["sessions"]["group_seq"] = _rec
+    _ms._save(_st)
+    _r5 = _ms.observe("group_seq", 0, 0.8)
+    check("M5 静默 6h 后 P 回升（Q 生效）",
+          float(_r5.get("P_prior") or 0) > 0.2, str(_r5.get("P_prior")))
+
+    try:
+        _ms.reset("group_seq2")
+    except Exception:
+        pass
+    _d1 = abs(float(_ms.observe("group_seq2", 1, 0.8)["dv"]))
+    _d2 = abs(float(_ms.observe("group_seq2", 1, 0.8)["dv"]))
+    check("M10 同档第二次位移更小（K 递减）", _d2 <= _d1 + 1e-9,
+          f"{_d1:.4f} → {_d2:.4f}")
 finally:
     os.chdir(_old_cwd)
 
@@ -579,12 +677,25 @@ try:
     _gm = _wm.group_moon("g1")
     check("群白月光：被 @/引用最多的人",
           _gm.get("qq") == "20002", str(_gm))
+    # 默认 borrow=0：只给「关系参照」1 行事实，不借句式（style §4.3）
+    _blk0 = _wm.render("g1", "10001", "阿明")
+    check("白月光默认只给事实行",
+          "不借句式" in _blk0 and "笑不活了" not in _blk0, _blk0)
+    # 显式打开借风格：仍要带比例，且受字数上限约束
+    _wm.BORROW = 1
+    _wm.BORROW_CHARS = 600
     _blk = _wm.render("g1", "10001", "阿明")
-    check("回阿明时用阿明白月光的风格",
-          "阿明 的白月光" in _blk and "笑不活了" in _blk, _blk)
+    check("回阿明时借阿明白月光的风格",
+          "阿明 的白月光" in _blk and "笑不活了" in _blk
+          and "30%" in _blk, _blk)
     _blk_all = _wm.render("g1", "", "")
-    check("回大家时用群白月光风格",
+    check("回大家时借群白月光风格",
           "这个群的白月光" in _blk_all and "笑不活了" in _blk_all, _blk_all)
+    _old_expr = _wm.EXPRESSIVENESS
+    _wm.EXPRESSIVENESS = 0.2
+    _cold = _wm._borrow_ratio()
+    _wm.EXPRESSIVENESS = _old_expr
+    check("冷漠人设把借风格压到 0.2", _cold <= 0.2 + 1e-9, str(_cold))
     check("每个人档案带自己的白月光",
           "小红" in _wm.profile_note("10001", "g1"))
     check("不统计她本人 / @全体",
@@ -976,6 +1087,160 @@ try:
     check("流水线：统计可读", "流水线" in _rp.stats_text(), _rp.stats_text())
 except Exception as _e:
     check("称呼/流水线可导入", False, f"{type(_e).__name__}: {_e}")
+
+# ---- 判读窗口（P4：段内消息不能丢）----
+try:
+    from services import mood_judge as _mj
+    _recs = [{"mid": str(1000 + i), "ts": 1000.0 + i * 10, "text": "m%d" % i}
+             for i in range(40)]
+    _wins = _mj.split_windows(_recs, size=8, max_sec=300)
+    _mids = [str(r["mid"]) for w in _wins for r in w]
+    check("窗口：40 条切成 5 窗", len(_wins) == 5, str(len(_wins)))
+    check("窗口：段内消息全覆盖且不重复",
+          _mids == [r["mid"] for r in _recs], str(len(_mids)))
+    _slow = [{"mid": str(i), "ts": i * 200.0} for i in range(4)]   # 跨 600s
+    _w2 = _mj.split_windows(_slow, size=8, max_sec=300)
+    check("窗口：慢群按 5min 先到先判", len(_w2) >= 2, str(len(_w2)))
+except Exception as _e:
+    check("窗口可导入", False, "%s: %s" % (type(_e).__name__, _e))
+
+# ---- a/d（唤醒/掌控）：置信加权 + 独立半衰期 ----
+try:
+    import services.mood as _M
+    _oldf = _M.MOOD_FILE
+    _M.MOOD_FILE = _tmp / "mood_ad.json"
+    _M.update_ad("group_t", 0.8, 0.8, confidence=0.2)
+    _lo = _M.ad_of("group_t")["a"] - _M.AD_BASE_A
+    _M.MOOD_FILE.unlink()
+    _M.update_ad("group_t", 0.8, 0.8, confidence=0.9)
+    _hi = _M.ad_of("group_t")["a"] - _M.AD_BASE_A
+    check("a/d：低置信移动 ≤ 高置信的一半", _lo <= 0.5 * _hi + 1e-9,
+          "%.3f/%.3f" % (_lo, _hi))
+    check("a/d：高置信确实移动了", _hi > 0.1, "%.3f" % _hi)
+    _M.MOOD_FILE = _oldf
+except Exception as _e:
+    check("a/d 可导入", False, "%s: %s" % (type(_e).__name__, _e))
+
+# ---- 判读预算（每会话每小时上限）----
+try:
+    from services import mood_judge as _mj2
+    _mj2._CALLS.clear()
+    _now = time.time()
+    check("判读预算：初始 = 上限",
+          _mj2._calls_left("budget_t", _now) == _mj2.JUDGE_MAX_PER_HOUR,
+          str(_mj2._calls_left("budget_t", _now)))
+    _mj2._CALLS["budget_t"] = [_now] * _mj2.JUDGE_MAX_PER_HOUR
+    check("判读预算：用完 = 0", _mj2._calls_left("budget_t", _now) == 0)
+    _mj2._CALLS["budget_t"] = [_now - 4000] * 50      # 全是 1 小时前
+    check("判读预算：过期不占额度",
+          _mj2._calls_left("budget_t", _now) == _mj2.JUDGE_MAX_PER_HOUR)
+    _mj2._CALLS.clear()
+except Exception as _e:
+    check("判读预算可导入", False, "%s: %s" % (type(_e).__name__, _e))
+
+# ---- P4 检索规划器（结构化过滤在前，打分在后）----
+try:
+    _a = memdb.remember(text="老大今天夸我唱歌好听", kind="event",
+                        about_qq="20001", gid="p4g", delta=0.2, salience=0.6)
+    _b = memdb.remember(text="老大昨天骂我笨死了", kind="event",
+                        about_qq="20001", gid="p4g", delta=-0.3, salience=0.7)
+    _c = memdb.remember(text="小明说他要去上海出差", kind="event",
+                        about_qq="20002", gid="p4g", delta=0.0)
+    check("P4：新记忆自动打标签",
+          memdb.stats()["tag_coverage"] >= 0.99, str(memdb.stats()["tag_coverage"]))
+    _neg = memdb.recall_planned("老大", direction="neg", limit=5, mark_hit=False)
+    check("P4：情绪方向是过滤不是加分",
+          bool(_neg) and all(float(h["delta"] or 0) < 0 for h in _neg),
+          str(len(_neg)))
+    _per = memdb.recall_planned("", tag_values=["20002"], limit=5, mark_hit=False)
+    check("P4：标签过滤",
+          bool(_per) and all(h["about_qq"] == "20002" for h in _per))
+    _hard = memdb.recall_planned("", speaker_qq="20001", person_hard=True,
+                                 limit=5, mark_hit=False)
+    check("P4：人过滤",
+          bool(_hard) and all(h["about_qq"] in ("20001", "") for h in _hard))
+    _q = memdb.recall_planned("上海", limit=1, mark_hit=False)
+    check("P4：关键词命中", bool(_q) and "上海" in _q[0]["summary"])
+    _r0 = memdb._conn().execute(
+        "select retrieval_strength from memories where id=?", (_c,)).fetchone()[0]
+    memdb.recall_planned("上海", limit=1, mark_hit=True)
+    _r1 = memdb._conn().execute(
+        "select retrieval_strength from memories where id=?", (_c,)).fetchone()[0]
+    check("P4：命中回补提取强度", _r1 > _r0, "%s->%s" % (_r0, _r1))
+    memdb.upsert_entity(qq="20001", name="老大", aliases=["老大"])
+    check("P4：实体反查", memdb.resolve_person("老大") == "20001",
+          memdb.resolve_person("老大"))
+    memdb.log_mood_event(about_qq="20001", dv=-0.2)
+    check("P4：心情事件可查",
+          len(memdb.mood_events_of("20001", direction="-")) >= 1)
+    _bt = memdb.backfill_tags(force=True)
+    check("P4：补标签幂等", _bt["coverage"] >= 0.99, str(_bt))
+except Exception as _e:
+    check("P4 规划器可导入", False, "%s: %s" % (type(_e).__name__, _e))
+
+# ---- P2 状态机 / P3 关系四量（2026-11-25）----
+_old_cwd = os.getcwd()
+_p2dir = tempfile.mkdtemp(prefix="p2_")
+os.chdir(_p2dir)
+os.environ["MOOD_FILE"] = os.path.join(_p2dir, "mood.json")
+os.environ["REL_FILE"] = os.path.join(_p2dir, "rel.json")
+try:
+    import importlib
+    from services import mood as _m2
+    importlib.reload(_m2)
+    try:
+        _m2.MOOD_FILE.unlink()
+    except Exception:
+        pass
+    _o1 = _m2.observe("group_1", 1, 0.9)
+    check("P2：impact+1 高置信步进 ≈0.08~0.12", 0.07 <= _o1["v"] <= 0.13, str(_o1))
+    _o2 = _m2.observe("group_1", 0, 0.9)
+    check("P2：impact=0 不动", abs(_o2["v"] - _o1["v"]) < 1e-6, str(_o2))
+    _o3 = _m2.observe("group_1", 1, 0.2)
+    check("P2：低置信单次位移更小", abs(_o3["dv"]) < abs(_o1["dv"]),
+          f"{_o3['dv']} vs {_o1['dv']}")
+    _m2.reset("group_1")
+    _m2.observe("group_1", 2, 0.9)
+    _mv = _m2.anchor("group_1", 2, 0.9, baseline=0.0)
+    check("P2：锚点向上纠偏", _mv > 0, str(_mv))
+    _m2.reset("group_1")
+    _m2.observe("group_1", 2, 0.9)
+    _pv = _m2.state_of("group_1")["P"]
+    _fv = _m2.fast_guard("group_1", light=False)
+    _st2 = _m2.state_of("group_1")
+    check("P2：快速护栏只降不升且抬 P",
+          _fv <= -0.44 and _st2["P"] > _pv,
+          f"{_fv}/{_pv}->{_st2['P']}")
+    from services import relationship as _rl
+    _rl.REL_FILE = _rl.Path(os.path.join(_p2dir, "rel2.json"))
+    _t0 = _rl.state_of("20001")["trust"]
+    _t1 = _rl.bump("20001", "trust", 1, reason="说到做到", relevance=1.0)
+    check("P3：trust 正向步长", _t1 > _t0, f"{_t0}->{_t1}")
+    _t2 = _rl.bump("20001", "trust", -1, reason="失信", relevance=1.0)
+    check("P3：trust 负向步长更大", (_t1 - _t2) > (_t1 - _t0), f"{_t1}->{_t2}")
+    check("P3：关系四量可读",
+          set(_rl.state_of("20001")) == {"affinity", "trust", "respect", "intimacy"})
+except Exception as _e:
+    check("P2/P3 可导入", False, f"{type(_e).__name__}: {_e}")
+finally:
+    os.chdir(_old_cwd)
+
+# ---- 收发件人归因（D21 / R1）----
+try:
+    from services.mood_judge import resolve_target as _rt
+    check("ADDR：A 对 B 说 → recipient",
+          _rt("speaker", "111", "222", "person", 0.95) == ("recipient", "222"),
+          str(_rt("speaker", "111", "222", "person", 0.95)))
+    check("ADDR：低置信退回说话人",
+          _rt("speaker", "111", "222", "person", 0.5) == ("speaker", "111"),
+          str(_rt("speaker", "111", "222", "person", 0.5)))
+    check("ADDR：@她 → speaker",
+          _rt("speaker", "111", "111", "bot", 0.99) == ("speaker", "111"),
+          str(_rt("speaker", "111", "111", "bot", 0.99)))
+    check("ADDR：群气氛不落到人头上",
+          _rt("environment", "111", "222", "person", 0.95)[0] == "world")
+except Exception as _e:
+    check("ADDR 可导入", False, f"{type(_e).__name__}: {_e}")
 
 print("PASS %d / FAIL %d" % (len(PASS), len(FAIL)))
 if FAIL:

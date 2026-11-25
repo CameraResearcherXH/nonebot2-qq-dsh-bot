@@ -39,8 +39,10 @@ except Exception:  # pragma: no cover
     logger = logging.getLogger(__name__)
 
 REFEREE_ENABLED = os.getenv("REFEREE_ENABLED", "true").lower() == "true"
-PEER_GROUPS = {g.strip() for g in os.getenv("PEER_GROUPS", "100000017").split(",") if g.strip()}
-PEER_QQS = {q.strip() for q in os.getenv("PEER_QQS", "2267107632").split(",") if q.strip()}
+# ⚠️ 默认必须是空：这里以前写死了真实群号 / QQ（2026-11-25 清理）。
+#    三方差分只在 .env 显式配置 PEER_GROUPS / PEER_QQS 时才生效。
+PEER_GROUPS = {g.strip() for g in os.getenv("PEER_GROUPS", "").split(",") if g.strip()}
+PEER_QQS = {q.strip() for q in os.getenv("PEER_QQS", "").split(",") if q.strip()}
 
 PEER_WAIT = tuning.f("PEER_WAIT")          # 我们答完等鱼多久（秒）
 PEER_WINDOW = tuning.f("PEER_WINDOW")     # 鱼被 @ 后多久内回复算有效

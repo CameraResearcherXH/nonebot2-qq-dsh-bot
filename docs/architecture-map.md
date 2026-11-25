@@ -1,3 +1,7 @@
+> ⚠️ **as-built 快照（2026-11-20）**：描述当时的实现，不是目标设计。
+> 现行设计以 [DESIGN.md](DESIGN.md) 为准；差异见 [design-audit-2026-11-25.md](design-audit-2026-11-25.md)。
+> 已知：分层/拓扑/7 份副本的当时快照；目录结构可能已变。
+
 # 整体架构地图 + 问题定位（2026-11-20）
 
 > 用途：把「项目实际长什么样」画成一张可以指着说话的图，然后把所有问题钉在图上，
@@ -250,7 +254,7 @@ SCENE 12、PROACTIVE 11、STICKER 9、GROUP 8、TRACE 8、PEER 8、SELF 8、GLM 
 | **B15** | `chat:3771/3778/3781` | 每条消息 3 次同步写 profile | 群活跃时 I/O 抖动 | S |
 | **B16** | `chat:810` | 配额等待 15s 在 worker 内 sleep | 阻塞整个会话（含 @ 急事） | S |
 | **B17** | 全局 | `voice_*.wav` / `temp_audio` 无清理 | 磁盘缓慢增长（185MB→） | S |
-| **B18** | `services/config.py:12` | `MAX_REPLY_CHARS` 死配置 | 误以为有总长上限 | S |
+| **B18** | `services/config.py` | `MAX_REPLY_CHARS` 死配置（**2026-11-25 已删除**：键与常量一起清掉，单泡/气泡数走 `OUT_BUBBLE_CHARS` / `OUT_BUBBLES_MAX`） | 误以为有总长上限 | S |
 | **B19** | `.env` 行内注释 | 依赖 dotenv 剥离行为 | 换 loader 会在 import 崩 | S |
 | **B20** | 仓库根 | 无 git / 无 .gitignore | 不可回滚、无 diff、「复制一份改改」 | S |
 | **B21** | `mood.py:255` | `get_mood()` 读接口也 `_save()`，每轮调 3~5 次 | mood.json 每条消息多次全量读写 | S |
@@ -277,7 +281,8 @@ SCENE 12、PROACTIVE 11、STICKER 9、GROUP 8、TRACE 8、PEER 8、SELF 8、GLM 
 
 ```
 data/mood.json
-├─ global: {value -100..100, label, judge{word,value,mind,affinity,why}}
+├─ global: {value -100..100, label, judge{word,value,guess,affinity,why}}
+│            ↑ guess = 判读模型的猜测；她的真实心理在 mood_think.json（THINK）
 └─ sessions: {
      "group_100000017": {value, label, judge, updated_at},   ← 一个群一个心情
      "private_100000003": {value, label, judge, updated_at}  ← 一个人一个心情
@@ -295,7 +300,7 @@ data/profiles/<qq>_profile.json
 
 ```
 mood_judge.judge_and_store()
-  ├─ mood.set_judge(key, word, value, mind)         ← 写会话心情
+  ├─ mood.set_judge(key, word, value, think)        ← 写会话心情（参数名仍叫 mind，但只存她的 THINK）
   ├─ mood.set_value_from_judge(value, key)          ← 直接覆盖数值（SMOOTH=1.0）
   └─ profiles.bump_affinity(speaker_qq, affinity)   ← 写这个人的好感
 ```
@@ -349,7 +354,8 @@ Person(qq)
 └─ recall_index      : 按人 + valence 的索引（高正/高负各一组）
 
 Session(group_x | private_qq)
-└─ mood_now         : {value, label(自由文本), mind, at}  快变量（半衰期 2~6h）
+└─ mood_now         : {value, label(自由文本), think, at}  快变量（半衰期 2~6h）
+                      think 只来自她的 [[THINK]]；judge 的猜测叫 guess，不注入状态卡
                      群会话的 mood 可由「本群成员最近事件」聚合，而非一个全局数
 
 本轮 prompt 注入：

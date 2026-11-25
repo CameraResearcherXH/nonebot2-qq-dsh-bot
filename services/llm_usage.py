@@ -70,6 +70,13 @@ def init() -> None:
             CREATE INDEX IF NOT EXISTS idx_usage_purpose ON usage(purpose, ts);
             """
         )
+        # 保留 KEEP_DAYS 天明细（docstring 一直这么写，但以前没实现，
+        # 库会无限增长）。启动时清一次，失败不影响主流程。
+        try:
+            cutoff = time.time() - max(1, int(KEEP_DAYS)) * 86400
+            c.execute("DELETE FROM usage WHERE ts < ?", (cutoff,))
+        except Exception:
+            pass
         c.commit()
         c.close()
         _INITED["done"] = True

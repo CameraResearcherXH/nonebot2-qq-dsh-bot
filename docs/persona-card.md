@@ -1,3 +1,7 @@
+> ⚠️ **as-built 快照（2026-11-24）**：描述当时的实现，不是目标设计。
+> 现行设计以 [DESIGN.md](DESIGN.md) 为准；差异见 [design-audit-2026-11-25.md](design-audit-2026-11-25.md)。
+> 已知：人格卡格式仍有效；v2 新增 persona_traits 6 参数。
+
 # 人格卡：格式、字段、参考来源
 
 > 人格卡决定「她是谁」。本项目的实现参考了 **SillyTavern（AI 酒馆）character card v2**

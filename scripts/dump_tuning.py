@@ -127,6 +127,8 @@ def write_markdown(path: Path) -> None:
         "- 时间一律**秒**，除非键名带 `_H`（小时）/`_DAYS`（天）。",
         "- 概率/权重一律 **0~1**。",
         "- 心情内部口径 **-100~100**；判读模型给的是 -1.00~1.00，代码里会 ×100。",
+        "- 生效位置标 **（设计，未接线）** 的键：设计已定、代码还没读，**改了不生效**；"
+        "接线后会自动去掉标记。",
         "",
         "---",
         "",
@@ -148,8 +150,11 @@ def write_markdown(path: Path) -> None:
         lines.append("|---|---|---|---|")
         for r in sorted(by_group[g], key=lambda x: x["key"]):
             mark = "" if fmt(r["cur"]) == fmt(r["default"]) else " ⚠️"
+            src = r["src"]
+            if r["key"] in getattr(tuning, "UNWIRED", ()):
+                src = "%s（设计，未接线）" % src
             lines.append("| `%s` | `%s`%s | %s | `%s` |" % (
-                r["key"], fmt(r["default"]), mark, r["doc"] or "—", r["src"]))
+                r["key"], fmt(r["default"]), mark, r["doc"] or "—", src))
         lines.append("")
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

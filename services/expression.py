@@ -51,6 +51,7 @@ except Exception:  # pragma: no cover
     logger = logging.getLogger(__name__)
 
 from .config import BOT_MODE, PROXY, XAI_API_KEY, XAI_BASE_URL, XAI_MODEL
+from . import ctx_budget
 
 ENABLED = os.getenv("EXPRESSION_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 EVERY = tuning.i("EXPRESSION_EVERY")
@@ -298,9 +299,10 @@ def render(gid: str, qq: str = "") -> str:
         lines.append(f"· 和他说话时你习惯：{p.get('text')}（{p.get('scene')}·{p.get('tone')}）")
     if not lines:
         return ""
-    return ("▍说话风格参考（学他们的语气，**不是知识**；别照抄原句、别每句都用）\n"
+    text = ("▍说话风格参考（学他们的语气，**不是知识**；别照抄原句、别每句都用）\n"
             + "\n".join(lines)
             + "\n用法：像他们那样说话，但说的是你自己的内容；同一个说法别连着用两次。")
+    return ctx_budget.observe("expression", text, source=f"group_{gid}/{qq}")
 
 
 def self_view(limit: int = 8) -> str:

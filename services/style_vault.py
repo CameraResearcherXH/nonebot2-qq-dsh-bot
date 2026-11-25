@@ -40,11 +40,15 @@ ENABLED = bool(tuning.i("STYLE_VAULT_ENABLED"))
 MAX_SAMPLES = tuning.i("STYLE_VAULT_MAX_SAMPLES")
 SAMPLE_CHARS = tuning.i("STYLE_VAULT_SAMPLE_CHARS")
 MAX_UPLOAD_CHARS = tuning.i("STYLE_VAULT_MAX_UPLOAD_CHARS")
+# style-white-moon-design §5.3：取 3 句时 λ=0.7，避免 3 句同长度/同语气
+MMR_ENABLED = tuning.i("STYLE_MMR_ENABLED")
+MMR_LAMBDA = tuning.f("STYLE_MMR_LAMBDA")
 
 CORPUS_DIR = Path(os.getenv("STYLE_CORPUS_DIR", "data/style_corpus"))
 CUSTOM_FILE = Path(os.getenv("STYLE_VAULT_FILE", "data/style_vault.json"))
 
 _LOCK = threading.RLock()
+_LAST_SYNC: dict = {}   # (gid, qq) -> 上次镜像到 sqlite 的时间（60s 一次）
 _CUSTOM_CACHE = {"mtime": 0.0, "data": {}}
 
 # 协议残留 / 非正文
@@ -146,27 +150,77 @@ def note_sample(gid: str, qq: str, text: str, name: str = "") -> bool:
                     _compact(path, _read_corpus(path))
             except Exception:
                 pass
+        # 样本镜像到 sqlite（retrieval §8）：每人每分钟最多一条，别每条消息都写
+        try:
+            from . import memdb
+            _k = (gid, qq)
+            _now = time.time()
+            if _now - _LAST_SYNC.get(_k, 0) > 60:
+                _LAST_SYNC[_k] = _now
+                memdb.add_style_sample(
+                    qq=qq, gid=gid, text=s,
+                    quality=(0.6 if 6 <= len(s) <= 40 else 0.4), ts=_now)
+                logger.info(f"[MEM] style sample {gid}/{qq} {s[:16]}")
+        except Exception:
+            pass
         return True
     except Exception as e:
         logger.debug(f"[STYLE] 记样本失败 {gid}/{qq}: {type(e).__name__}: {e}")
         return False
 
 
-def samples(gid: str, qq: str, limit: int = 3) -> list:
-    """取这个人最近的原话（去重、去掉协议残留），最新的在前。"""
+def _bigrams(t: str) -> set:
+    t = str(t or "")
+    return {t[i:i + 2] for i in range(max(0, len(t) - 1))} or set(t)
+
+
+def _style_sim(a: str, b: str) -> float:
+    """两句原话的相似度：bigram Jaccard + 长度桶/标点桶同质惩罚。"""
+    ja = _bigrams(a)
+    jb = _bigrams(b)
+    jac = len(ja & jb) / max(1, len(ja | jb))
+    same_len = 0.2 if (len(a) <= 8) == (len(b) <= 8) else 0.0
+    pa = any(ch in a for ch in "？?！!…")
+    pb = any(ch in b for ch in "？?！!…")
+    same_punct = 0.1 if pa == pb else 0.0
+    return min(1.0, jac + same_len + same_punct)
+
+
+def samples(gid: str, qq: str, limit: int = 3, *, diverse: bool = False) -> list:
+    """取这个人最近的原话（去重、去掉协议残留），最新的在前。
+
+    diverse=True 时用 MMR 选句（λ=0.7）：3 句不要全是同一长度/同一语气，
+    否则白月光注入的「说话方式」会退化成复读。
+    """
     if not ENABLED:
         return []
     rows = _read_corpus(_corpus_path(gid, qq))
+    lim = max(1, int(limit or 3))
     seen, out = set(), []
+    want = max(lim * 8, 24) if diverse else lim
     for r in reversed(rows):
         t = str(r.get("t") or "").strip()
         if not t or t in seen or _looks_like_noise(t):
             continue
         seen.add(t)
         out.append(t)
-        if len(out) >= max(1, int(limit or 3)):
+        if len(out) >= want:
             break
-    return out
+    if not diverse or not int(MMR_ENABLED or 0) or len(out) <= lim:
+        return out[:lim]
+    n = len(out)
+
+    def _rel(t):
+        # 越新越相关（out 已经是最新在前）
+        try:
+            i = out.index(t)
+        except ValueError:
+            i = n - 1
+        return 1.0 - i / max(1, n - 1)
+
+    from . import mmr
+    return mmr.pick(out, lim, relevance=_rel, similarity=_style_sim,
+                    lam=float(MMR_LAMBDA or 0.7))
 
 
 def corpus_count(gid: str, qq: str) -> int:

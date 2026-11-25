@@ -1,5 +1,160 @@
 # 更新日志
 
+## 2026-11-25（第二十二轮：三项工程债闭环 + 8 个「假接线」键收口）
+
+- **`check_tuning` 改 AST**：不再用「文件里出现键名字符串」判断接线——
+  注释/docstring 不再算数；新增规则「模块级常量读了必须真被用到」。
+  一次就抓出 8 个旧版全漏的键（见下）。宿主 py3.8 解析不了的文件自动降级正则。
+- **`check_design_docs --runtime`**：默认仍只查「文档 ↔ 设计常量」；
+  加 `--runtime` 后用 AST 证明 120 个设计键都有真实读点，并核对
+  `.env` 覆盖后的不变式（`PROMPT_BUDGET ≥ 2120`、`CTX_STYLE_TOTAL×1.5 ≥ 730`、
+  每块 `CTX_* ≥ 设计目标`）。容器内 PASS。
+- **8 个假接线/死键收口**：
+  - `ADDR_RECENT_MENTION` → 短句冲人推断（两处硬编码 0.55/0.5 改用键值）；
+  - `LORE_SCAN_DEPTH` → `lorebook.scan()` 只匹配最近 N 行（depth 语义）；
+  - `LLM_USAGE_KEEP_DAYS` → `llm_usage.init()` 启动清理超期明细；
+  - `REL_INTIMACY_HALF_LIFE_DAYS` → `profiles.intimacy()` 的 30 天半衰期；
+  - `RET_MEMORY_TOP` → `build_packet` 记忆块默认条数（4 条）；
+  - 删除 `MOOD_PASSIVE_MAX_DELTA`（ADR-038 已删被动通道）、
+    `MAX_REPLY_CHARS`（从来没有读点）、`SHORT_QUERY_WINDOW_SEC`（从未实现）。
+  调参键 420 → **418**。
+- **宿主 py3.8 兼容**：`chat` 的两处 `@get_driver().on_bot_connect` 改成
+  `@_driver.on_bot_connect`；`check_names` 的 `ast.MatchAs` 加 `getattr` 兜底。
+  现在本地也能跑完整 AST 检查（容器 3.11 行为不变）。
+- **测试同步**：`test_new_features` / `audit_features G16` 的「被动观察 Δ 上限」
+  断言改成「旁观窗口早退、不写状态」，与 ADR-038 一致。
+- **全链路自检从 22 项失败修到 0**（`verify_all --full` 现在 10/10）。
+  其中 3 条是**真 bug**（不是测试问题）：
+  ① `memdb.recall_catalog` 缺目录编号 `no`（sqlite 与 json 行为不一致）；
+  ② `memdb.remember` 丢掉调用方显式传的 `tags`（`weekly_apply` 的
+     `weekly_check` 全丢）；
+  ③ `journal_agent` / 周报直接读 `index.json`，sqlite 后端永远「0 条记忆」
+     → 新增 `memory_v2.list_items()` / `memdb.list_memories()` 统一读接口。
+  其余为设计变更后的测试漂移（ADR-038 的 THINK/旁观、kind τ 遗忘曲线、
+  40 字铁律、top-N 工具、impact 步进），以及 `recall` 缓存导致的用例互相污染。
+- **验证**：容器内 `verify_all` 9/9、`verify_rollbacks` 19/0、
+  `test_new_features` 222/0、`audit_features` 52/0、
+  `check_tuning`/`check_design_docs --runtime` PASS、
+  部署后日志回滚 6 PASS / 0 FAIL / 13 SKIP、`deploy_manifest` 112 文件 md5 全绿。
+  详见 `docs/verification-report-20261125-debt.md`。
+
+## 2026-11-25（第二十一轮：最后 3 个 RET 键接线，UNWIRED 清零）
+
+- `RET_LIB_LATENCY_MS`：`agent_client.recall` 记录整次图书馆调用耗时，
+  超目标只打 warning，不阻断。
+- `RET_WORLD_TOP`：RAG 回来的 facts 只留最靠前的 N 条再进 prompt（默认 3）。
+- `RET_STYLE_TOP`：白月光 `_raw_examples` 默认取几句原话（默认 3），
+  不再在各调用点写死 `3`。
+- `tuning.UNWIRED` **清空**；`check_tuning` / `audit_coverage` 全部 PASS。
+
+## 2026-11-25（第二十轮：CTX 预算校准 + RRF 框架）
+
+- **CTX_* 校准**：按线上真实块长（字符/1.5，留 ~20% 余量）调整
+  `CTX_PERSONA=700 / CTX_PROTOCOL=1500 / CTX_STATE=240 / CTX_POST_RULES=320 /
+  CTX_RHYTHM=180 / CTX_WHITE_MOON=180 / CTX_STYLE=250 / CTX_STYLE_TOTAL=650 /
+  CTX_ANCHOR=200 / CTX_MULTITARGET=120`。
+  这样 `CTX_ENFORCE=1` 只裁异常膨胀，不会把正常块裁成残句。
+- **RRF 框架**：`memdb.recall_planned` 支持 `RET_FUSION_RRF=1`：
+  按 struct/bm25/tag/strength/recency/salience 六路排名做
+  `weight/(RET_RRF_K+rank)` 融合，再 ×100 保持阈值量级。
+  默认 `0`（加权求和）；200 条记忆自检索：加权 R@1 0.300 / R@5 0.405，
+  RRF R@1 0.240 / R@5 0.430 —— **R@5 更好、R@1 更差**，暂不默认开，
+  等向量路接上或线上 A/B 确认「多一条证据」比「第一条更准」更重要。
+- `tuning.UNWIRED` 从 4 降到 **3**（只剩 `RET_LIB_LATENCY_MS/RET_STYLE_TOP/RET_WORLD_TOP`）。
+
+## 2026-11-25（第十九轮：CTX_* 15 个块级预算接线）
+
+- 新增 `services/ctx_budget.py`：统一读 15 个块级 `CTX_*`，按
+  `chars ≈ token × 1.5` 统计每个块实际字数 vs 预算。
+- **默认 `CTX_ENFORCE=0`：只统计/告警，不裁剪**。因为线上协议块 2089 字
+  vs `CTX_PROTOCOL=180`（774%）、节奏块 228 vs 60（380%）——直接硬裁会残句。
+  确认某个块该裁，再把 `CTX_ENFORCE=1`。
+- 接线点：persona / protocol / tools / anchor / multitarget / state / history /
+  post_rules / expression / rhythm / white_moon / style / style_total /
+  long_doc_evidence / long_doc_library。
+- 新增 `/测函数 上下文`：看每块 `实际/预算`、超限次数、峰值。
+- `tuning.UNWIRED` 从 19 降到 **4**（只剩检索分路键）。
+
+## 2026-11-25（第十八轮：服务器侧二期——ADR-008 单状态源 / P6 评分工具）
+
+- **ADR-008 单一状态源**：`mood` 所有写入口加 `@_serialized`（RLock 串行
+  `load → 改 → save`），`_save` 用 `flock` 保护 `tmp → os.replace`（跨进程）。
+  读接口不抢锁（原子替换保证读到完整旧/新文件）。
+  验证：`scripts/verify_state_lock.py`，8 线程 × 5 次 × 1.0 = 40 内部点，
+  线上/本地都得到 **40.00**，不丢更新。
+- **P6 情绪标注评分**：新增 `scripts/eval_emotion_labels.py`，支持
+  单人 vs `auto_suggest`、双人 A/B 重叠集；算 impact QWK、完全一致率、
+  ±1 一致率、target 准确率、arousal kappa、relation MAE、confidence ECE。
+  200 条 label 目前仍为空，脚本会明确提示「先标注」。
+- **R3 服务器侧前置**：`scripts/library_sync.py` 增加
+  ① sha256 增量（未变跳过，`--force` 全量）；② 行级去重（同一文件内重复/近重复）；
+  ③ 正文头 `# partition: dialogue` 分区标记；④ `--dry-run` 统计。
+  服务器 dry-run：17 文件 3.1MB，去重 **4271/35922 行（12%）**。
+  真正的分区索引仍要在算力机 RAG 侧做。
+- **二期归属澄清**：R3 图书馆分区/去重/增量、R4 向量+RRF、ADR-025 本地识图库
+  **需要算力机**（服务器侧可先做上传前增量/去重/分区标记）；ADR-004 事件研究
+  需要先定「预期」口径；ADR-008 / P6 / CTX_* 是服务器侧。
+
+## 2026-11-25（第十七轮：检索二期 / 位置指标 / p95 周报 / 切 sqlite）
+
+### 检索二期（倒 U / τ_kind / MMR）
+- **显著性倒 U**：`memdb.salience_weight(u)` —— 小冲击几乎不记、中等最显著、
+  极端回落到 0.6（`MEM_SAL_*`）。`storage_strength` 改按
+  `0.15 + 0.45w + 0.20×unexpected + 0.20×relation_relevance`，负性 ×1.15。
+- **τ_kind**：提取强度按 kind 衰减（event 30 / bond 90 / fact 365 /
+  preference 180 / style 365 天）；json 与 sqlite 两个后端同口径。
+- **MMR**：新增 `services/mmr.py`；证据先多取 `limit×MEM_MMR_CAND` 条，
+  再按 `λ×相关性 − (1−λ)×最大相似度` 选（`MEM_MMR_LAMBDA=0.7`），
+  同一件事被记多遍不再占满 5 条证据。风格样本同样走 MMR（`STYLE_MMR_*`）。
+- 修：sqlite 路径以前 `memdb` 只返回 `limit` 条，`_diversify` 没有替换空间；
+  现在多取候选（`mark_hit=False`），最终选中的才 `note_hits()` 回补提取强度。
+
+### 注意力位置指标
+- `eval_gold.py` 新增 `gold_position`（0 前 / 1 后，生产最相关在最后）。
+- `--stage position` 导出 gold 放头/中/尾的三份回放集；
+  `scripts/position_report.py` 算 `lost_in_middle`（中 vs 尾差 <10% 才 PASS）。
+
+### p95 周报
+- `reply_pipeline` 每轮把各步耗时写 `data/metrics/pipeline_stages.jsonl`
+  （`PIPE_METRICS=1`），内存保留 `PIPE_STAGE_SAMPLES` 个样本；
+  `/测函数 流水线` 直接显示 p50/p95 并标「最慢」。
+- 新增 `services/perf_stats.py` + `scripts/p95_report.py`；
+  `weekly_export.py` 周报增加「七、性能 p95」，只优化最慢一块。
+
+### 记忆后端
+- `.env.example` 增加 `MEMORY_BACKEND=json|sqlite` 与切换/回滚说明；
+  切前跑 `python scripts/check_memory_dual.py --strict`。
+
+## 2026-11-25
+
+### 实现（第十六轮：把 92 个「设计键」接上线，剩 22 个明确挂账）
+
+- **心情 P2（唯一更新链路）**：`mood.observe()` —— 判读只报 `impact ∈ -2..+2`，
+  代码查表得步长，经伪观测 `z = clamp(v + dir×step×sens)`、`K=P/(P+R)`、
+  饱和 `×(1−0.6|v|)`、硬上限 0.35 更新 `v`；`P` 随观测下降、按 `Q` 随时间回升。
+  半衰期按作用域：群 30min / 私聊 2h / 全局 6h。回滚：`MOOD_UPDATE=delta`。
+- **锚点**：每 20 个窗口或静默 30min，用 `anchor_level(-2..+2)` 做一次绝对纠偏，
+  带死区 0.15、单次上限 0.20、`P` 回补 0.02（`MOOD_ANCHOR_*`）。
+- **快速通道护栏**：@她/引用她 + 强负面词 → `v=min(v,−0.45)`（轻负面 −0.25），
+  **只降不升**，并把 `P×1.5`（让下一轮判读能拉回）。不写好感。
+- **关系四量 P3**：新增 `services/relationship.py`（trust/respect 写入口 + 半衰期 +
+  记仇半衰期 + 日上限 + 审计流水）；`profiles.decay_affinity()` 按深度系数衰减好感；
+  intimacy 仍是派生量。判读新增 `relation{trust,respect}` / `relation_relevance` / `target`。
+- **输出气泡**：`OUT_BUBBLE_CHARS=40` / `OUT_BUBBLES_MAX=2`；超过 2 泡把尾部合并后走
+  合并转发，**不截断**（旧行为是 20 字硬切/转发）。
+- **收发件人**：`ADDR_*` 全部接进 `group_scene._infer_addressee`，展示分三档
+  （确定 / 像在回 / 信号太弱）。
+- **检索**：`RET_EVIDENCE_MAX/MEMORY_TOP/MAX_PER_PERSON/SAME_PERSON_RATIO/NEUTRAL_QUOTA`
+  接进 `memory_v2.recall`（按人分组 + 反向保底）；`RET_CHAR_LATENCY_MS` 超时告警。
+- **上下文**：`CTX_PROFILE/EVIDENCE/SUMMARY/SOFT_CAP` 接进 `prompt_builder`；
+  其余 17 个块级键 live 没有装配点，仍在 `tuning.UNWIRED`。
+- **运行档位**：新增 `POWER_MODE=full|eco`（`config.power_on`），和 `GROUP_WATCH_MODE`
+  正交：lite 管「回不回」，eco 管「算不算」（审核/图书馆/主动/表达蒸馏）。
+- **修 bug**：`GROUP_WATCH_MODE=lite` 的分支以前被缩进在 `except` 里，
+  只有安静查询抛异常才生效 —— 正常路径下 lite 完全等于 full。
+- **线上验证**：新增 `scripts/verify_napcat_log.py` + [verification-runbook.md](verification-runbook.md)：
+  扫码登录后拉 `docker logs`，按 M1/M3/M4/M8/M10/P4/O4/O5/R*/G36 对账并生成报告。
+
 ## 2026-11-24
 
 ### 修复（第十五轮：同一首歌被重复翻唱 / 整首文件误报失败）
@@ -188,7 +343,7 @@
 
 - **流水线每块加 ≤30 字小标题**：`▍状态｜心情值 · 当前状态 · 那件事的心理`、
   `▍档案｜称呼 · 身份 · 好感 · 印象最深的事` 等，`/测函数 模板` 一眼能对上顺序。
-  完整对照表见 [reply-pipeline.md](reply-pipeline.md)。
+  完整对照表见 [reply-pipeline.md](archive/reply-pipeline.md)。
 - **每一步都留状态**：`stages` 记 `✓ / 数字 / 0 / — / ×异常名`，
   `/测函数 流水线` 直接显示上一次哪一步没拿到；失败不再静默消失。
 - **心情块改用 `mood.status_block`**：一次给全 心情词+数值 / 刚才那下 / 心里话 /

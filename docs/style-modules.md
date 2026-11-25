@@ -1,3 +1,7 @@
+> ⚠️ **as-built 快照（2026-11-22）**：描述当时的实现，不是目标设计。
+> 现行设计以 [DESIGN.md](DESIGN.md) 为准；差异见 [design-audit-2026-11-25.md](design-audit-2026-11-25.md)。
+> 已知：expression 仍有效；旧 attention 已更名「表达节奏」并并入风格文档。
+
 # 两个「风格类」模块：表达学习（expression）与注意力漂移（attention）
 
 > 这两个模块经常被问「到底在干什么」——它们**不产生内容、不改数值**，

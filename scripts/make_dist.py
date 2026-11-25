@@ -178,7 +178,9 @@ def redact_nicknames(dest: Path) -> list:
         new = text
         for a, b in NICKNAME_MAP.items():
             if a in new:
-                hits.append((p.relative_to(dest).as_posix(), f"群友昵称 {a}", b))
+                # ⚠️ 报告里不能写原昵称：DIST_REPORT.md 本身也在发行仓里，
+                #    写出来等于把刚脱敏掉的名字又漏一遍。
+                hits.append((p.relative_to(dest).as_posix(), "群友昵称", b))
                 new = new.replace(a, b)
         if new != text:
             try:
@@ -384,12 +386,40 @@ def gen_persona_example(dest: Path) -> bool:
     return True
 
 
+def _py_for_compile() -> str:
+    """挑一个 >=3.9 的解释器做 compileall。
+
+    仓库里有 3.9+ 语法（`@get_driver().on_shutdown` 这类装饰器里套调用）。
+    宿主只有 3.8 时 compileall 会把**正确的**代码报成 SyntaxError，
+    所以要么换解释器，要么明确 SKIP（到 3.11 容器里再验）。
+    """
+    # 需要 >=3.10：三方插件里有 `match` 语句（VideoZoomer 的 remote_code），
+    # 3.9 也编译不过。容器镜像是 3.11。
+    for cand in ("python3.12", "python3.11", "python3.10"):
+        p = shutil.which(cand)
+        if p:
+            return p
+    if sys.version_info >= (3, 10):
+        return sys.executable
+    return ""
+
+
 def run_checks(dest: Path) -> dict:
     checks = {}
     py = sys.executable
-    r = subprocess.run([py, "-m", "compileall", "-q", str(dest)],
-                       capture_output=True, text=True)
-    checks["compileall"] = (r.returncode == 0, r.stdout[-500:] + r.stderr[-500:])
+    cpy = _py_for_compile()
+    if cpy:
+        r = subprocess.run([cpy, "-m", "compileall", "-q", str(dest)],
+                           capture_output=True, text=True)
+        checks["compileall"] = (r.returncode == 0,
+                                r.stdout[-500:] + r.stderr[-500:])
+    else:
+        checks["compileall"] = (
+            True,
+            "SKIP: 宿主 python %d.%d < 3.10（仓库含 match / 3.9+ 装饰器语法）；"
+            "请在 3.11 容器内跑 `python -m compileall -q .` 复验"
+            % sys.version_info[:2],
+        )
     dep = dest / "scripts" / "check_deps.py"
     if dep.exists():
         r = subprocess.run([py, str(dep)], capture_output=True, text=True, cwd=str(dest))
@@ -436,8 +466,12 @@ def main():
         "## 校验",
     ]
     for k, (ok, msg) in checks.items():
-        report.append("- %s：%s" % (k, "PASS" if ok else "FAIL"))
-        if not ok and msg:
+        status = ("SKIP" if (msg or "").startswith("SKIP")
+                  else ("PASS" if ok else "FAIL"))
+        report.append("- %s：%s" % (k, status))
+        if status == "SKIP":
+            report.append("  %s" % msg.strip())
+        elif not ok and msg:
             report.append("```\n%s\n```" % msg.strip())
     if hits:
         report += ["", "## 脱敏命中（必须处理）"]
@@ -450,9 +484,10 @@ def main():
         _sh.rmtree(_d, ignore_errors=True)
 
     print("已生成：%s" % dest)
+    _cok, _cmsg = checks.get("compileall", (False, ""))
+    _cst = "SKIP" if (_cmsg or "").startswith("SKIP") else ("PASS" if _cok else "FAIL")
     print("文件 %d｜脱敏命中 %d｜compileall %s"
-          % (len(copied), len(hits),
-             "PASS" if checks.get("compileall", (False,))[0] else "FAIL"))
+          % (len(copied), len(hits), _cst))
     if hits:
         print("已脱敏 %d 处（密钥/私人号码，仅改副本）。详见 DIST_REPORT.md" % len(hits))
     if not all(ok for ok, _ in checks.values()):

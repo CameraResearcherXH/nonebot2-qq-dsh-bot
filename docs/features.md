@@ -1,3 +1,7 @@
+> ⚠️ **as-built 快照（2026-11-24）**：描述当时的实现，不是目标设计。
+> 现行设计以 [DESIGN.md](DESIGN.md) 为准；差异见 [design-audit-2026-11-25.md](design-audit-2026-11-25.md)。
+> 已知：功能总览；流水线/主动/安静/白月光已由 v2 重新设计。
+
 # 功能总览：每个能力是干嘛的、怎么用
 
 > 这一页按「用户能感知到的能力」分类。想改参数看 [tuning.md](tuning.md)；
@@ -192,7 +196,7 @@
 
 - **是什么**：把第三方 nonebot 插件放进 `plugins/third/`，用 `plugin.toml` 声明成 function calling skill；
   角色扮演模型可以在对话里直接调用。
-- **怎么用**：见 [plugin-dev.md](plugin-dev.md)；第三方来源见 [third-party-audit.md](third-party-audit.md)。
+- **怎么用**：见 [plugin-dev.md](plugin-dev.md)；第三方来源见 [third-party-audit.md](archive/third-party-audit.md)。
 - **开关**：`/技能` 可以按组关掉；核心能力不可关。
 
 ---
@@ -279,11 +283,14 @@ python3 scripts/dump_tuning.py --write   # 重新生成 docs/tuning.md
 
 - **full（默认）**：所有群消息都进判定，她会关注全部群聊（现状）。
 - **lite（省流）**：消息照常记录（现场 / 白月光 / 心情都不受影响），但**只有硬信号才入队回复**：
-  @ 她 / 引用她 / 喊她名字 / 收发件人判定是她。接话时拉附近 8 条上下文 + 记忆；
+  @ 她 / 引用她 / 喊她名字 / 收发件人判定是她。上下文条数仍由 `MAX_GROUP_RECENT`（默认 16）控制；
   省流模式下不主动插话、不做表达学习。
 - **私聊不受影响**；群白月光是硬逻辑统计，两种模式都在记。
 - **怎么用**：`.env` 里 `GROUP_WATCH_MODE=full|lite`，改完 `up -d --force-recreate bot`。
-- **代码**：`services/config.py`、`plugins/chat/__init__.py`（`_need_reply` 的省流分支）
+- **代码**：`services/config.py`、`plugins/chat/__init__.py`（`_need_reply` 的省流分支）。
+  ⚠️ 2026-11-25 修：这段分支以前被误缩进在 `except` 里，正常路径下 lite 等于 full。
+- **另一把开关**：`POWER_MODE=full|eco` 管「算不算」（审核 / 图书馆 / 主动 / 表达蒸馏），
+  和本节的「回不回」正交；见 [deployment.md §5.9](deployment.md#59-运行档位powermode和-58-正交)。
 
 ## 21. 引用精确到消息号 / 同一件事不回两遍（2026-11-24）
 

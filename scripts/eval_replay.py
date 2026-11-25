@@ -369,6 +369,11 @@ async def _replay_one(item: dict, args, sem: asyncio.Semaphore) -> dict:
             u = j.get("usage") or {}
             return {
                 "id": item["id"], "key": item["key"], "text": item.get("text", ""),
+                # 位置评测要保留 variant / gold 信息，否则 judge 后无法分组
+                "variant": item.get("variant", ""),
+                "gold_ref": item.get("gold_ref", ""),
+                "gold_answer": item.get("gold_answer", ""),
+                "expected_keywords": item.get("expected_keywords") or [],
                 # 带上 msgs：judge / diag 要靠它判断「是否主动插话 / 有没有记忆块」
                 "msgs": item.get("msgs") or [],
                 "baseline_reply": item.get("baseline_reply", ""),

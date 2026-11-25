@@ -1,3 +1,7 @@
+> ⚠️ **as-built 快照（2026-11-23）**：描述当时的实现，不是目标设计。
+> 现行设计以 [DESIGN.md](DESIGN.md) 为准；差异见 [design-audit-2026-11-25.md](design-audit-2026-11-25.md)。
+> 已知：用量/prompt 体检的当时实现。
+
 # 用量查看与 prompt 体检
 
 > 代码：`services/llm_usage.py`、`services/usage_chart.py`、`services/prompt_report.py`

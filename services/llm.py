@@ -17,7 +17,7 @@ from .config import (BOT_MODE, MOCK_REPLY, XAI_API_KEY, XAI_BASE_URL, XAI_MODEL,
                      PROXY, ROLEPLAY_API_KEY, ROLEPLAY_BASE_URL, ROLEPLAY_MODEL,
                      NODE_COMPUTE, CODE_AGENT, HARNESS_ENABLED)
 from .persona import persona_for, persona_name
-from . import attention, conv_state, expression, chat_switch
+from . import attention, conv_state, expression, chat_switch, ctx_budget
 from .memory import add_memory
 from . import agent_client, group_tuning, memory_v2, mood, profiles, group_scene
 from .prompt_builder import PERSONA_RULE, build_packet, recall_hits
@@ -311,8 +311,84 @@ GROUP_TOOL_DENY = {x.strip() for x in os.getenv("GROUP_TOOL_DENY", "").split(","
                    if x.strip()}
 
 
-def tools_for(key: str) -> list:
-    """这个会话该挂哪些工具的 spec。群聊只拿 scope 里带 group 的（再减去黑名单）。"""
+# 工具检索 top-k（DESIGN attention §2.4 / D9）：
+#   全挂 20+ 个工具既费 token 又容易乱挑；按「这句消息」和工具描述的重合度取前 N。
+#   send / stay_silent 是协议工具，永远保留；RET_TOOLS_TOP<=0 = 回滚成「全挂」。
+RET_TOOLS_TOP = tuning.i("RET_TOOLS_TOP")
+_TOOL_CORE = {"send", "stay_silent"}
+
+# long_doc（DESIGN §3.3 / ADR-033/039）：
+#   用户明确要「详细讲讲 / 分析一下」时，单轮放开输出 token 与证据条数；
+#   LONG_DOC_ENABLED=0 可整体回滚成普通回复。
+LONG_DOC_ENABLED = tuning.i("LONG_DOC_ENABLED")
+LONG_DOC_MAX_TOKENS = tuning.i("LONG_DOC_MAX_TOKENS")
+LONG_DOC_EVIDENCE = tuning.i("LONG_DOC_EVIDENCE")
+CTX_HARD_CAP = tuning.i("CTX_HARD_CAP")
+
+_LONG_DOC_HINTS = (
+    "详细讲讲", "详细说说", "展开说", "展开讲", "深入讲", "具体讲讲",
+    "写个总结", "总结一下", "分析一下", "分析下", "梳理一下",
+    "这本书", "这篇论文", "这段代码", "讲了什么", "讲的是什么",
+)
+
+
+def is_long_doc(text: str) -> bool:
+    """这句是不是在要「长答」（只认明确措辞，避免把日常闲聊拉长）。"""
+    if not int(LONG_DOC_ENABLED or 0):
+        return False
+    t = _tool_query_of(text)
+    if len(t) < 6:
+        return False
+    return any(k in t for k in _LONG_DOC_HINTS)
+
+
+def _tool_blob(spec: dict) -> str:
+    fn = spec.get("function") or {}
+    parts = [str(fn.get("name") or ""), str(fn.get("description") or "")]
+    for _p in ((fn.get("parameters") or {}).get("properties") or {}):
+        parts.append(str(_p))
+    return " ".join(parts).lower()
+
+
+def _tool_query_of(text: str) -> str:
+    """从「整段群聊」里取最后一条真人消息当检索词（不然会拿提示语去匹配工具）。
+
+    群聊 text 是一大段提示：有分段说明、规矩、`【时间】⭐名字(123)#456: 内容`。
+    优先找带 `#消息号: ` 的真人行；找不到才退回最后一行。
+    """
+    t = str(text or "").strip()
+    if "\n" in t or "（这一段群聊" in t:
+        lines = [x.strip() for x in t.splitlines() if x.strip()]
+        real = [x for x in lines if re.search(r"#\d+:\s*\S", x)]
+        if real:
+            t = real[-1]
+        else:
+            # 排除提示/规矩行，取最后一条「像正文」的
+            body = [x for x in lines
+                    if not x.startswith(("（", "(", "⚠", "·", "【", "-", "带「"))]
+            t = (body or lines)[-1]
+    t = re.sub(r"^[\[【][^】\]]*[\]】]\s*", "", t)
+    t = re.sub(r"^⭐?\s*#\d+\s*", "", t)   # 有的行是「#消息号 名字(qq): 内容」
+    t = re.sub(r"^⭐?", "", t)
+    # 群聊行是 `名字(qq) → 你：内容`，分隔符可能是全角冒号。
+    # 只有「像消息头」的行才切，纯私聊文本里的冒号不动（否则会丢前半句）。
+    if ("→" in t or "#" in t or re.search(r"\(\d{4,}\)", t)) and ("：" in t or ": " in t):
+        t = re.split(r"[:：]\s*", t, maxsplit=1)[-1]
+    return t.strip()[:60]
+
+
+def _tool_score(qchars: set, spec: dict) -> int:
+    if not qchars:
+        return 0
+    blob = _tool_blob(spec)
+    return sum(1 for ch in qchars if ch in blob)
+
+
+def tools_for(key: str, query: str = "") -> list:
+    """这个会话该挂哪些工具的 spec。
+
+    群聊只拿 scope 里带 group 的（再减去黑名单）；给了 query 时按描述重合度取 top N。
+    """
     want = "group" if str(key).startswith("group") else "private"
     out = []
     for s in TOOLS_SPEC:
@@ -322,7 +398,26 @@ def tools_for(key: str) -> list:
         if want == "group" and name in GROUP_TOOL_DENY:
             continue
         out.append(s)
-    return out
+    n = int(RET_TOOLS_TOP or 0)
+    if n <= 0 or len(out) <= n:
+        return out
+    core, rest = [], []
+    for i, s in enumerate(out):
+        name = (s.get("function") or {}).get("name")
+        (core if name in _TOOL_CORE else rest).append((i, s))
+    _q = _tool_query_of(query)
+    qchars = {c for c in _q.lower() if not c.isspace()}
+    rest.sort(key=lambda it: (-_tool_score(qchars, it[1]), it[0]))
+    keep_n = max(0, n - len(core))
+    picked = core + rest[:keep_n]
+    picked.sort(key=lambda it: it[0])
+    result = [s for _, s in picked]
+    try:
+        logger.info(f"[TOOLS] {key} 挂 {len(result)}/{len(out)} 个"
+                    f"（top{RET_TOOLS_TOP}，query={_q[:24]}）")
+    except Exception:
+        pass
+    return result
 
 
 TOOL_RESULT_MAX = tuning.i("TOOL_RESULT_MAX")
@@ -653,6 +748,8 @@ TOOL_CATALOG = {
         "【安静与地盘（你有沉默的权利）】\n"
         "· stay_silent —— 这一轮不想说话就调它（群友刷图/别人互聊/你没心情/插不上话）。\n"
         "  和「(不想回复)」等价，但更明确；系统不会发任何内容，你读到的都还记得。\n"
+        "  ⚠️ **被 @ / 被叫名字时不要用它**：那是在叫你，至少回一个字或一个表情\n"
+        "  （「嗯？」「在」「怎么了」都行）。唯一例外是你正在静音这个人/这个群。\n"
         "· chat_switch(action=\"list\") —— 看你能在哪些群、能跟谁私聊、谁是主人、现在谁被你静音。\n"
         "· chat_switch(action=\"off\", target=\"这个人\", minutes=30, reason=\"烦\") —— **只不理他**：\n"
         "  他的 @、他的图片也不接；群里别人照常。target 也可以写名字或 QQ 号。\n"
@@ -2161,9 +2258,11 @@ def _dynamic_sections(key: str, *, is_group: bool) -> list:
         secs.append(("08b 暂存表情", _pend.strip()))
     _reply = _reply_protocol(is_group)
     if _reply:
+        _reply = ctx_budget.observe("anchor", _reply, source=key)
         secs.append(("12 引用回复", _reply.strip()))
     _multi = str(TOOL_CTX.get("multi_at") or "").strip()
     if _multi:
+        _multi = ctx_budget.observe("multitarget", _multi, source=key)
         secs.append(("12b 多人同时 @", _multi))
     _missed = _missed_at_hint(key)
     if _missed:
@@ -2194,6 +2293,7 @@ def _behaviour_protocol(key: str, *, is_group: bool = False,
     _play = _play_section(is_group, addressed)
     if _play:
         _menu += "\n\n" + _play
+    _menu = ctx_budget.observe("tools", _menu, source=key)
     # 2026-11-24 用户：「行为规矩基本可以删，硬逻辑+心情/好感+pipeline 已经在管」。
     # 所以这里只留：工具 / 长度 / 接话 / 查 / 叫人 / 称呼 / 记忆 / 心里话 / 心情 /
     # 表情 / 底线 / 人称 / QQ 操作。02b/02c/02d/07 已删（由硬逻辑或 post_rules 兜底）。
@@ -2225,7 +2325,8 @@ def _behaviour_protocol(key: str, *, is_group: bool = False,
     head = "按编号看；冲突时编号小的优先。"
     # 空小节（比如注意力漂移关掉了）直接不渲染，别留个空标题
     body = "\n\n".join(f"▍{t}\n{b}" for t, b in secs if str(b or "").strip())
-    return f"{head}\n\n{body}"
+    # 整段协议只统计（CTX_PROTOCOL 是 token 预算，默认不硬裁）
+    return ctx_budget.observe("protocol", f"{head}\n\n{body}", source=key)
 
 
 def _length_rule(key: str) -> str:
@@ -2234,10 +2335,13 @@ def _length_rule(key: str) -> str:
     数字和 chat 的发送层保持一致（GROUP_MAX_HANZI / PRIVATE_MAX_HANZI）。
     """
     if key.startswith("group_"):
-        limit = group_tuning.max_hanzi(key, tuning.i("GROUP_MAX_HANZI"))
-        return (f"{limit} 字内直接发；超过转合并转发。"
+        # 2026-11-25（P2-1）：生成层也要按 DESIGN §9.1 的「单泡 ≤40 字」，
+        # 以前这里写 GROUP_MAX_HANZI=20，40 字只在发送层生效（模型永远只写 20 字）。
+        limit = group_tuning.max_hanzi(key, tuning.i("OUT_BUBBLE_CHARS"))
+        return (f"单泡 {limit} 字内；超过 {MAX_BUBBLES} 泡才转合并转发。"
                 f"最多 {MAX_BUBBLES} 条气泡，用 ||| 分条。")
-    limit = os.getenv("PRIVATE_MAX_HANZI", "20")
+    # 2026-11-25（P2-2）：走 tuning，不再直读 env（否则改 tuning 不生效）
+    limit = tuning.i("PRIVATE_MAX_HANZI")
     return f"{limit} 字内直接发；超过转合并转发。"
 
 
@@ -2438,6 +2542,7 @@ async def call_llm(
     logger.info(f"[LLM] 开始生成回复 key={key}")
     # 动态流水线（reply_pipeline）产出的数据块；空 = 走原来的静态拼装
     _staged = str(staged_text or "").strip()
+    _long_doc = False       # 视觉分支不判长答；文字分支会重新算
     if BOT_MODE == "mock":
         return MOCK_REPLY, False
 
@@ -2445,6 +2550,8 @@ async def call_llm(
     #    写歌用的是 rap_{session_key}，要剥掉前缀才能拿到同一个 session 的人格
     persona_key = key[len("rap_"):] if key.startswith("rap_") else key
     persona_name, sys_prompt = persona_for(persona_key)
+    # 人格块默认「原文直出」；CTX_ENFORCE=0 时只统计，不裁剪。
+    sys_prompt = ctx_budget.observe("persona", sys_prompt, source=persona_key)
     logger.info(f"[LLM] 🎭 当前人格: {persona_name}")
 
     # ================= 写歌任务 =================
@@ -2492,6 +2599,11 @@ async def call_llm(
             group_context = _db_history(key, speaker_name, CHAT_HISTORY_TURNS)
             if group_context:
                 logger.info(f"[LLM] 🧷 从历史库补了 {len(group_context)} 条上下文（{key}）")
+
+    # 历史行按 CTX_HISTORY 统计/裁剪（默认只统计；每行独立，避免长行挤掉别人）
+    if group_context:
+        group_context = ctx_budget.observe_lines(
+            "history", list(group_context), source=key)
 
     # ================= 核心：视觉消息 =================
     # 优先用调用方显式传入的 is_vision（chat 按消息段判断），
@@ -2727,13 +2839,20 @@ async def call_llm(
         # 这里就不再重复召回/查图书馆 —— 流水线已经把记忆、图书馆、
         # 心情、档案都按「这句消息」取过了。
         _staged = str(staged_text or "").strip()
+        _long_doc = is_long_doc(text)
+        if _long_doc:
+            logger.info(f"[LONG_DOC] 命中长答：{_tool_query_of(text)[:30]}"
+                        f"｜evidence≤{LONG_DOC_EVIDENCE}"
+                        f"｜max_tokens={LONG_DOC_MAX_TOKENS}"
+                        f"｜budget={CTX_HARD_CAP}")
         if _staged:
             _hits = []
             _max_age = _max_age
         else:
             _hits = recall_hits(
                 key, text, speaker_qq,
-                limit=5, max_age_days=_max_age,
+                limit=(LONG_DOC_EVIDENCE if _long_doc else 5),
+                max_age_days=_max_age,
             )
         _addressed_flag = bool(TOOL_CTX.get("addressed", True))
         _scan_text = "\n".join(str(x) for x in (group_context or [])[-6:]) + "\n" + str(text or "")
@@ -2744,13 +2863,22 @@ async def call_llm(
             speaker_name=speaker_name,
             max_age_days=_max_age,
             hits=_hits,
-            memory_limit=(0 if _staged else 5),
+            memory_limit=(LONG_DOC_EVIDENCE if _long_doc
+                          else (0 if _staged else tuning.i("RET_MEMORY_TOP"))),
+            total_budget=(CTX_HARD_CAP if _long_doc else 0),
             gid=_gid,
             addressed=_addressed_flag,
             scan_text=_scan_text,
         )
 
         library_text = ""
+        if _long_doc and _hits:
+            # 长答模式的证据块：只统计/按 CTX_LONG_DOC_EVIDENCE 裁剪
+            ctx_budget.observe(
+                "long_doc_evidence",
+                "\n".join(str(h.get("summary") or h.get("text") or "")
+                          for h in _hits),
+                source=key)
         if _staged:
             logger.info("[LLM] 🧩 已用动态流水线取数 → 跳过静态图书馆")
         elif no_library:
@@ -2772,6 +2900,9 @@ async def call_llm(
             except Exception as e:
                 logger.warning(f"[LLM] 图书馆查询失败（忽略）: {type(e).__name__}: {e}")
             _last_library_at[key] = time.time()
+            if _long_doc and library_text:
+                library_text = ctx_budget.observe(
+                    "long_doc_library", library_text, source=key)
             if library_text:
                 # 复用同一份 hits，不再重跑 BM25 / 重写 index.json
                 packet = build_packet(
@@ -2782,6 +2913,9 @@ async def call_llm(
                     library_text=library_text,
                     max_age_days=_max_age,
                     hits=_hits,
+                    memory_limit=(LONG_DOC_EVIDENCE if _long_doc
+                                  else tuning.i("RET_MEMORY_TOP")),
+                    total_budget=(CTX_HARD_CAP if _long_doc else 0),
                     record=False,
                     gid=_gid,
                     addressed=_addressed_flag,
@@ -2874,7 +3008,10 @@ async def call_llm(
         #    放在历史之后、当前消息之前，离当前这句最近，注意力最集中。
         _meta = packet.get("_meta") or {}
         _focus = str(_meta.get("focus_card") or "").strip()
-        if _focus:
+        # ADR-020：动态流水线已经带了「档案」块，这里再注入 brief 卡就是同一件事说两遍。
+        if _staged:
+            logger.info("[PROMPT] staged=1 → 跳过 focus/白月光重复注入（ADR-020）")
+        if _focus and not _staged:
             # ⚠️ 不要再套一层「▍这一条在跟你说话的人」：brief 卡自己就带
             #    `▍名字（QQ…）` 标题，套两层会出现两个同级标题（用户 2026-11-22：
             #    「模板有很多重复的」）。
@@ -2898,8 +3035,11 @@ async def call_llm(
                     _moon_tn = profiles.call_of(_moon_tq, "", _gid) or _moon_tq
                 except Exception:
                     _moon_tn = _moon_tq
-            _wm = white_moon.render(_gid, _moon_tq, _moon_tn, speaker_name)
+            # ADR-020：流水线的 staged 块已含「白月光」；这里不再重复注入。
+            _wm = "" if _staged else white_moon.render(
+                _gid, _moon_tq, _moon_tn, speaker_name)
             if _wm:
+                _wm = ctx_budget.observe("white_moon", _wm, source=key)
                 msgs.append({"role": "system", "content": _wm})
         except Exception as _e:
             logger.debug(f"[MOON] 注入失败: {type(_e).__name__}: {_e}")
@@ -2926,9 +3066,19 @@ async def call_llm(
                 if packet.get(_key):
                     msgs.append({"role": "system", "content": packet[_key]})
 
+        # 👇 long_doc：用户明确要长答时，给一条「放开写」的硬提醒。
+        #    注意：只放开**这一轮**的输出与证据；人设/协议/前缀块不变（ADR-039）。
+        if _long_doc:
+            msgs.append({
+                "role": "system",
+                "content": ("▍长答模式：这条要展开讲（3~6 段，先结论再细节），"
+                            "不要压成一句；超过 2 泡会走合并转发，不会被截断。"),
+            })
+
         # 👇 post-history：最后一句硬提醒（recency 权重最高，比写在开头有效）
         _post = _post_rules(key, speaker_qq, _gid)
         if _post:
+            _post = ctx_budget.observe("post_rules", _post, source=key)
             msgs.append({"role": "system", "content": _post})
 
         # 👇 最后一行：审核 LLM 给的「这段在聊什么」
@@ -2944,6 +3094,16 @@ async def call_llm(
             pass
 
         msgs.append({"role": "user", "content": text})
+
+    # 风格相关合计（expression + style + rhythm + white_moon）：只统计，不裁剪
+    try:
+        _style_parts = [
+            str(m.get("content") or "") for m in msgs
+            if any(k in str(m.get("content") or "")
+                   for k in ("▍说话风格参考", "▍白月光", "注意力风格"))]
+        ctx_budget.note_style_total(_style_parts)
+    except Exception:
+        pass
 
     # 👇 留一份「最近一次真正发给 DeepSeek 的完整输入」，
     #    给 `/看模板` 用。直接缓存真实 msgs，比在别处重新拼一遍更准（不会漏块）。
@@ -2965,7 +3125,7 @@ async def call_llm(
 
     # 工具按会话类型挂：默认只有私聊有；napcat_help/napcat_call 群聊也挂
     # （群里禁言、改名片、戳一戳本来就是群里的事，不挂等于她做不到）
-    _tools = [] if no_tools else tools_for(key)
+    _tools = [] if no_tools else tools_for(key, text)
     allow_tools = bool(_tools)
     reply, reason = "", ""
 
@@ -3032,7 +3192,7 @@ async def call_llm(
                     "model": ROLEPLAY_MODEL,
                     "messages": msgs,
                     "temperature": 1.0,
-                    "max_tokens": 800,
+                    "max_tokens": (LONG_DOC_MAX_TOKENS if _long_doc else 800),
                 }
                 if allow_tools:
                     payload["tools"] = _tools

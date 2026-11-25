@@ -247,8 +247,11 @@ async def mine(qq: str, gid: str, *, force: bool = False) -> dict:
             if not txt or txt in old:
                 continue
             emo = str(ev.get("emotion") or "").strip().lower()
+            # 2026-11-25：只有带明确情绪的事件才进档案；中性事件留在记忆里。
+            if not emo or emo in ("neutral", "无", "none", "平静"):
+                continue
             try:
-                profiles.add_bond_note(qq, txt, emotion=emo or "neutral", weight=1.0)
+                profiles.add_bond_note(qq, txt, emotion=emo, weight=1.0)
                 added += 1
             except Exception:
                 continue

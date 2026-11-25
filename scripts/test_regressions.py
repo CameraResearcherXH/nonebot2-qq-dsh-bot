@@ -266,12 +266,24 @@ def t_mood():
         check("旧 mood.json 能迁移（兼容）", abs(M.get_mood()["value"] - 30) < 0.1,
               M.get_mood()["value"])
 
-        # 情绪入口仍工作
+        # 情绪入口：默认（MOOD_FROM_JUDGE=true）只存原话、不动数值（2026-11-20 定稿）
         M.MOOD_FILE.unlink()
+        v0 = M.get_mood()["value"]
         v1 = M.bump_by_emotion("happy")
-        check("bump_by_emotion 仍工作（旧行为）", v1 > 0, v1)
-        check("neutral 不改心情（旧行为）",
-              abs(M.bump_by_emotion("neutral") - v1) < 0.01)
+        check("bump_by_emotion 默认不改数值（新行为）", abs(v1 - v0) < 0.01, v1)
+        check("bump_by_emotion 仍存原话（新行为）",
+              bool(M.get_mood().get("label")), M.get_mood().get("label"))
+        # 回滚模式（MOOD_FROM_JUDGE=false）：旧行为必须还在
+        _old_from = M.MOOD_FROM_JUDGE
+        try:
+            M.MOOD_FROM_JUDGE = False
+            M.MOOD_FILE.unlink()
+            v2 = M.bump_by_emotion("happy")
+            check("bump_by_emotion 回滚模式仍工作（旧行为）", v2 > 0, v2)
+            check("neutral 不改心情（旧行为）",
+                  abs(M.bump_by_emotion("neutral") - v2) < 0.01)
+        finally:
+            M.MOOD_FROM_JUDGE = _old_from
     finally:
         M.MOOD_FILE = old
         shutil.rmtree(tmp, ignore_errors=True)
@@ -287,8 +299,11 @@ def t_text():
     check("旧用例：5 字截断", limit_hanzi("一二三四五六七八九十", 5) == "一二三四五…",
           limit_hanzi("一二三四五六七八九十", 5))
     check("旧用例：英文不受限", limit_hanzi("abc", 5) == "abc")
-    check("旧用例：50 字截到 20", hanzi_count(limit_hanzi("啊" * 50, 20)) == 20)
-    check("旧用例：截断带省略号", limit_hanzi("啊" * 50, 20).endswith("…"))
+    _cut20 = limit_hanzi("啊" * 50, 20)
+    # 20 个汉字 + 「…」（省略号算 0.5 字宽），不是硬砍到 20.0
+    check("旧用例：50 字截到 20（+省略号）",
+          20 <= hanzi_count(_cut20) <= 20.5, str(hanzi_count(_cut20)))
+    check("旧用例：截断带省略号", _cut20.endswith("…"))
     check("limit<=0 原样返回", limit_hanzi("随便", 0) == "随便")
 
     cut = limit_hanzi("好的，我这就去看看那个东西到底怎么回事", 6)

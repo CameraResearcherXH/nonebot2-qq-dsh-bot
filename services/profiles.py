@@ -7,6 +7,7 @@
 """
 from core import tuning
 import json
+import math
 import os
 import re
 import time
@@ -21,6 +22,8 @@ except Exception:  # pragma: no cover
 
 PROFILE_DIR = Path("data/profiles")
 PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+# 档案「事情」只收大波动：|Δ| 低于它只进记忆，不进档案（否则档案 = 记忆目录的副本）
+PROFILE_MIN_DELTA = tuning.f("PROFILE_NOTE_MIN_DELTA")
 
 
 def _load(kind: str, qq: str) -> dict:
@@ -430,6 +433,17 @@ def add_bond_note(qq: str, note, *, emotion: str = "", weight: float = 1.0,
     if not text:
         return None
 
+    # 2026-11-25：档案只收「心情明显动过」的事。带 Δ 的调用一律先过门槛，
+    # 低于门槛只进记忆（记忆每 turn 都记，档案是稀疏的「印象」）。
+    if delta is not None:
+        try:
+            if abs(float(delta)) < PROFILE_MIN_DELTA:
+                logger.debug(f"[BOND] {qq} |Δ|={abs(float(delta)):.2f} < "
+                             f"{PROFILE_MIN_DELTA} → 只进记忆，不进档案")
+                return None
+        except Exception:
+            pass
+
     if emotion:
         from .aura_logic import normalize_emotion  # 局部导入，避免循环依赖
         emotion = normalize_emotion(emotion)
@@ -530,7 +544,43 @@ def bump_affinity(qq: str, delta: float, reason: str = "") -> float:
                  "why": str(reason or "")[:40]})
     p["affinity_log"] = hist[-50:]
     _save("profile", qq, p)
+    # 档案镜像（retrieval §8）：好感变了就同步 sqlite profiles
+    try:
+        from . import memdb
+        memdb.upsert_profile(qq=qq,
+                             name=str(p.get("name") or p.get("call_name") or ""),
+                             affinity=new)
+        logger.info(f"[MEM] profile sync {qq} aff={new:+.2f}")
+    except Exception:
+        pass
     return new
+
+
+def decay_affinity(qq: str, tau_days: float, now: float = 0) -> float:
+    """按半衰期把 affinity 往基线 0 拉（τ_eff 由 relationship 按深度系数给）。
+
+    和 bump_affinity 的分工：这是**时间**造成的回落，不占每日额度、不写
+    affinity_log（否则一天不聊天也能把 log 刷满）；变化 <0.001 不落盘。
+    """
+    qq = str(qq or "").strip()
+    if not qq.isdigit():
+        return 0.0
+    now = float(now or time.time())
+    p = get_profile(qq)
+    cur = float(p.get("affinity") or 0.0)
+    if abs(cur) < 1e-9:
+        return 0.0
+    at = float(p.get("affinity_at") or p.get("updated_at") or now)
+    days = max(0.0, (now - at) / 86400.0)
+    if days <= 0 or tau_days <= 0:
+        return cur
+    new = cur * math.pow(0.5, days / max(0.01, float(tau_days)))
+    if abs(new - cur) < 0.001:
+        return cur
+    p["affinity"] = round(new, 3)
+    p["affinity_at"] = now
+    _save("profile", qq, p)
+    return p["affinity"]
 
 
 # 好感「走势」窗口（秒）：默认 30 分钟。
@@ -586,6 +636,11 @@ def affinity_trend(qq: str, window_sec: float = 0) -> dict:
     return out
 
 
+# 亲近半衰期（天）：DESIGN §3.2 的 30 天。以前写死在 intimacy() 里，
+# 调参表里的 REL_INTIMACY_HALF_LIFE_DAYS 读了却没人用（2026-11-25 接线）。
+INTIMACY_HL_D = tuning.f("REL_INTIMACY_HALF_LIFE_DAYS")
+
+
 def intimacy(qq: str) -> float:
     """
     关系温度 0~1：由相处记录条数、情绪权重、时间衰减算出来。
@@ -606,7 +661,7 @@ def intimacy(qq: str) -> float:
     for n in notes:
         try:
             age = max(0.0, (now - float(n.get("at") or 0)) / 86400.0)
-            recency = 0.5 ** (age / 30.0)
+            recency = 0.5 ** (age / max(1.0, float(INTIMACY_HL_D or 30.0)))
             w = min(3.0, float(n.get("weight") or 1.0))
             emo = str(n.get("emotion") or "")
             bonus = (0.35 if emo in ("love", "touched")
@@ -615,8 +670,11 @@ def intimacy(qq: str) -> float:
             score += (0.10 * w + bonus) * recency
         except Exception:
             continue
-    # 除以 3：6 条普通记录大约 0.6（熟人），要长期高频互动才到「很亲近」
-    base = score / 3.0
+    # 2026-11-25：改成饱和曲线，避免「攒够 20 条就 1.00」。
+    #   旧口径 score/3 是线性的：20 条记录（score≈5）直接顶满，240 人里 7 个 1.00，
+    #   而 1.00 会让 affinity 衰减最慢（τ 被拉到最大）。
+    #   现在 score=3→0.5、6→0.67、12→0.8，永远逼近 1 但不到 1。
+    base = (score / (score + 3.0)) if score > 0 else 0.0
     # 显式好感度最多贡献 ±0.25：吵一架会掉一截，但不会把老朋友直接清零
     try:
         base += get_affinity(qq) * 0.25

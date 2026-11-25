@@ -23,6 +23,18 @@ import re
 import time
 from collections import OrderedDict
 
+# 收发件人信号置信度（DESIGN §3.5）：规则只做**候选召回**，不单独判决。
+ADDR_AT_OR_QUOTE = tuning.f("ADDR_AT_OR_QUOTE")
+ADDR_QUOTE = tuning.f("ADDR_QUOTE")
+ADDR_VOCATIVE = tuning.f("ADDR_VOCATIVE")
+ADDR_NAME = tuning.f("ADDR_NAME")
+ADDR_QA_PAIR = tuning.f("ADDR_QA_PAIR")
+ADDR_YOU = tuning.f("ADDR_YOU")
+ADDR_BACKCHANNEL = tuning.f("ADDR_BACKCHANNEL")
+ADDR_RECENT_MENTION = tuning.f("ADDR_RECENT_MENTION")
+ADDR_ASSERT_MIN = tuning.f("ADDR_ASSERT_MIN")
+ADDR_MAYBE_MIN = tuning.f("ADDR_MAYBE_MIN")
+
 from services import identity as _identity
 
 try:
@@ -61,6 +73,7 @@ SEED_RETRY = tuning.f("SCENE_SEED_RETRY")
 _THREADS: dict = {}       # gid -> list[thread]
 _LAST: dict = {}          # gid -> 最新一条
 _PREV: dict = {}          # gid -> 上一条（推断「没 @ 的接话」用）
+_THREAD_SYNC: dict = {}   # gid -> 上次把线程镜像到 sqlite 的时间
 _NAMES: dict = {}         # gid -> (ts, {name: qq})
 _SUMMARY: dict = {}       # gid -> {text, at, until_mid}（审核 LLM 给的滚动总结）
 _SEEDED: dict = {}        # gid -> 上次尝试补现场的时间（失败也限流，别每次都读盘）
@@ -396,7 +409,7 @@ def _infer_addressee(gid: str, qq: str, text: str, prev: dict,
         if _is_bot_qq(explicit_qq, bot_qq):
             # 不管 @ 的是当前号还是历史号，收件人统一记成人格 ID
             return {"to_qq": _self_id() or explicit_qq, "to_name": "你",
-                    "to_kind": "bot", "to_conf": 0.99,
+                    "to_kind": "bot", "to_conf": ADDR_AT_OR_QUOTE,
                     "to_reason": explicit_reason or "at"}
         nm = ""
         for _nm, _q in nmap.items():
@@ -404,20 +417,20 @@ def _infer_addressee(gid: str, qq: str, text: str, prev: dict,
                 nm = _nm
                 break
         return {"to_qq": explicit_qq, "to_name": nm or explicit_qq,
-                "to_kind": "person", "to_conf": 0.95,
+                "to_kind": "person", "to_conf": ADDR_QUOTE,
                 "to_reason": explicit_reason or "at"}
 
     # ① 开头称呼（「阿明，你…」）
     vq, vn = _vocative(text, nmap)
     if vq and vq != str(qq):
         return {"to_qq": vq, "to_name": vn, "to_kind": "person",
-                "to_conf": 0.8, "to_reason": "vocative"}
+                "to_conf": ADDR_VOCATIVE, "to_reason": "vocative"}
 
     # ② 正文里点了名字（不是开头也算，但置信度低一点）
     nq, nn = _guess_addressee(text, qq, nmap)
     if nq:
         return {"to_qq": nq, "to_name": nn, "to_kind": "person",
-                "to_conf": 0.7, "to_reason": "name"}
+                "to_conf": ADDR_NAME, "to_reason": "name"}
 
     # ③ 相邻轮次：上一句是别人说的，且时间很近
     if prev and str(prev.get("qq") or "") != str(qq):
@@ -431,19 +444,19 @@ def _infer_addressee(gid: str, qq: str, text: str, prev: dict,
             if ("你" in text and "你们" not in text and "你俩" not in text):
                 return {"to_qq": str(prev.get("qq") or ""),
                         "to_name": str(prev.get("name") or ""),
-                        "to_kind": "person", "to_conf": 0.6,
+                        "to_kind": "person", "to_conf": ADDR_YOU,
                         "to_reason": "second_person"}
             # 上一句在提问 → 这句大概率是回答
             if _is_question(prev_text) and not _is_question(text):
                 return {"to_qq": str(prev.get("qq") or ""),
                         "to_name": str(prev.get("name") or ""),
-                        "to_kind": "person", "to_conf": 0.65,
+                        "to_kind": "person", "to_conf": ADDR_QA_PAIR,
                         "to_reason": "answer"}
             # 反应词 / 附和 / 明显在接话
             if _is_reaction(text) or _looks_like_answer(text):
                 return {"to_qq": str(prev.get("qq") or ""),
                         "to_name": str(prev.get("name") or ""),
-                        "to_kind": "person", "to_conf": 0.55,
+                        "to_kind": "person", "to_conf": ADDR_BACKCHANNEL,
                         "to_reason": "adjacent"}
 
     # ④ 没信号：不是「大家」，是「不知道对谁」
@@ -629,7 +642,8 @@ def observe(gid: str, *, mid: str = "", qq: str = "", name: str = "",
                     _jq, _jn = _jab_target(gid, qq, text, nmap, bot_qq)
                     if _jq:
                         inf = {"to_qq": _jq, "to_name": _jn, "to_kind": "person",
-                               "to_conf": 0.55, "to_reason": "recent_mention"}
+                               "to_conf": ADDR_RECENT_MENTION,
+                               "to_reason": "recent_mention"}
                     else:
                         inf = {"to_qq": "", "to_name": "", "to_kind": "group",
                                "to_conf": 0.35, "to_reason": "last"}
@@ -653,7 +667,8 @@ def observe(gid: str, *, mid: str = "", qq: str = "", name: str = "",
                 _jq, _jn = _jab_target(gid, qq, text, nmap, bot_qq)
                 if _jq:
                     inf = {"to_qq": _jq, "to_name": _jn, "to_kind": "person",
-                           "to_conf": 0.5, "to_reason": "recent_mention"}
+                           "to_conf": ADDR_RECENT_MENTION,
+                           "to_reason": "recent_mention"}
                 else:
                     inf = {"to_qq": "", "to_name": "", "to_kind": "group",
                            "to_conf": 0.2, "to_reason": "none"}
@@ -732,6 +747,21 @@ def observe(gid: str, *, mid: str = "", qq: str = "", name: str = "",
         _PREV[gid] = dict(prev)
     _LAST[gid] = dict(meta, mid=str(mid or ""), qq=qq, name=name,
                       text=text[:120], is_bot=bool(is_bot), ts=ts)
+    # 线程镜像到 sqlite（retrieval §8）：30 秒一次，避免每条消息都写
+    try:
+        from services import memdb
+        _now2 = time.time()
+        if _now2 - _THREAD_SYNC.get(str(gid), 0) > 30:
+            _THREAD_SYNC[str(gid)] = _now2
+            memdb.upsert_thread(
+                thread_id=str(t["id"]), gid=str(gid),
+                topic=str(t.get("topic") or ""),
+                participants=list((parts or {}).keys()),
+                last_ts=float(t.get("last") or ts or _now2))
+            logger.info(f"[MEM] thread sync {gid} {str(t['id'])[-6:]}"
+                        f"「{str(t.get('topic') or '')[:12]}」")
+    except Exception:
+        pass
     return meta
 
 
@@ -995,13 +1025,16 @@ def addressee_line(gid: str, bot_qq: str = "") -> str:
     if kind == "bot" or _is_bot_qq(to_qq, bot_qq):
         s = f"· 这条是 {who} → 你（在跟你说话）"
     elif kind == "person" and to_qq:
-        if conf >= 0.8:
+        if conf >= ADDR_ASSERT_MIN:
             s = f"· 这条是 {who} → {to_name or to_qq}（**不是你**）→ 里面的「你」指 {to_name or to_qq}，别当成在说你"
-        else:
+        elif conf >= ADDR_MAYBE_MIN:
             _why = ("最近提到过他" if "recent_mention" in str(m.get("to_reason") or "")
                     else "按上一句推断")
             s = (f"· 这条是 {who} → **像是在回 {to_name or to_qq}**（没点名，{_why}；"
                  f"也可能是在对大家说）→ 别默认是在叫你")
+        else:
+            s = (f"· 这条是 {who} → 不确定（信号太弱；可能是在回 {to_name or to_qq}，"
+                 f"别硬认成在叫你）")
     elif kind == "unknown":
         if to_name:
             s = (f"· 这条是 {who} → 不确定（没点名；可能是在回 {to_name}，"

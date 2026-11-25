@@ -18,13 +18,23 @@
   新：{"global": {...}, "sessions": {"group_123": {...}, ...}}
   读到旧格式会自动迁移。
 """
+# 2026-11-25：本地 Python 3.8 也要能 import（PEP 585 的 list[dict] 在 3.8 会炸）。
+from __future__ import annotations
+
 from core import tuning
+import functools
 import json
 import math
 import os
 import re
+import threading
 import time
 from pathlib import Path
+
+try:
+    import fcntl
+except Exception:  # pragma: no cover - Windows 本地调试
+    fcntl = None
 
 # 允许用 MOOD_FILE 指向别处（测试/多实例隔离）
 MOOD_FILE = Path(os.getenv("MOOD_FILE", "data/mood.json"))
@@ -32,6 +42,25 @@ MOOD_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 # 心情波动流水（给「两天一复盘」的 journal_agent 读，不进 Prompt）
 MOOD_HISTORY = Path("data/mood_history.jsonl")
+
+# ============ ADR-008：单一状态源 + 并发写（2026-11-25） ============
+# 问题：mood.json 以前有 10+ 个函数各自 `_load() → 改 → _save()`。
+#   · 同进程多线程（APScheduler / 主动私聊 / 回复链）会丢更新；
+#   · 多进程（脚本 + 容器）可能读到写一半的文件。
+# 做法：
+#   ① 所有**写入口**用 `_serialized` 串行化（RLock，进程内）；
+#   ② `_save` 用 `flock` 保护 `tmp → os.replace`（跨进程）；
+#   ③ 读接口不抢锁（os.replace 是原子的，读到的永远是完整旧/新文件）。
+_STATE_LOCK = threading.RLock()
+
+
+def _serialized(fn):
+    """把一次「load → 改 → save」包成不可分割的事务（进程内）。"""
+    @functools.wraps(fn)
+    def _wrapper(*a, **kw):
+        with _STATE_LOCK:
+            return fn(*a, **kw)
+    return _wrapper
 
 # 心情回到 0 的半衰期（设计默认 12 小时，可在 .env / tuning 调）。
 # 注意：这是「慢慢忘掉」的兜底；真正防一边倒的是 Δ 入口的噪音丢弃
@@ -73,7 +102,41 @@ MOOD_MODE = (os.getenv("MOOD_MODE", "delta") or "delta").strip().lower()
 # 心情作用域：session = 每个群/私聊各一个（默认）；global = 全机器人共用一个
 MOOD_SCOPE = (os.getenv("MOOD_SCOPE", "session") or "session").strip().lower()
 MOOD_MAX_DELTA = tuning.f("MOOD_MAX_DELTA")
-MOOD_LABEL_STEP = tuning.f("MOOD_LABEL_STEP")
+
+# ============ P2：v 步进 + 锚点（DESIGN §3.1，2026-11-25 接线） ============
+#   v2 = 判读只报 impact 档位，代码做「伪观测 z → K → 步进」；
+#   delta = 旧口径（累加 Δ），只作回滚（MOOD_UPDATE=delta）。
+MOOD_UPDATE = (os.getenv("MOOD_UPDATE", "v2") or "v2").strip().lower()
+_HL_MIN = {
+    "group": tuning.f("MOOD_HALF_LIFE_GROUP_MIN"),
+    "private": tuning.f("MOOD_HALF_LIFE_PRIVATE_MIN"),
+    "global": tuning.f("MOOD_HALF_LIFE_GLOBAL_MIN"),
+}
+STEP_1 = tuning.f("MOOD_STEP_1")
+STEP_2 = tuning.f("MOOD_STEP_2")
+SENS_MIN = tuning.f("MOOD_SENS_MIN")
+SENS_MAX = tuning.f("MOOD_SENS_MAX")
+SATURATION = tuning.f("MOOD_SATURATION")
+HARD_CAP = tuning.f("MOOD_HARD_CAP")
+P0 = tuning.f("MOOD_P0")
+Q_BASE = tuning.f("MOOD_Q_RATE_BASE")
+Q_SLOPE = tuning.f("MOOD_Q_RATE_SLOPE")
+R_BASE = tuning.f("MOOD_R_BASE")
+R_SLOPE = tuning.f("MOOD_R_SLOPE")
+ANCHOR_EVERY = tuning.i("MOOD_ANCHOR_EVERY")
+ANCHOR_IDLE_MIN = tuning.f("MOOD_ANCHOR_IDLE_MIN")
+ANCHOR_GAIN = tuning.f("MOOD_ANCHOR_GAIN")
+ANCHOR_DEADBAND = tuning.f("MOOD_ANCHOR_DEADBAND")
+ANCHOR_MAX_MOVE = tuning.f("MOOD_ANCHOR_MAX_MOVE")
+ANCHOR_P_ADD = tuning.f("MOOD_ANCHOR_P_ADD")
+ANCHOR_LEVEL1 = tuning.f("MOOD_ANCHOR_LEVEL1")
+ANCHOR_LEVEL2 = tuning.f("MOOD_ANCHOR_LEVEL2")
+ANCHOR_COUNT_SKIPPED = tuning.i("MOOD_ANCHOR_COUNT_SKIPPED")
+FAST_CONF = tuning.f("MOOD_FAST_CONF")
+FAST_FLOOR = tuning.f("MOOD_FAST_FLOOR")
+FAST_FLOOR_LIGHT = tuning.f("MOOD_FAST_FLOOR_LIGHT")
+FAST_P_FACTOR = tuning.f("MOOD_FAST_P_FACTOR")
+RELEVANCE_GATE = tuning.f("MOOD_RELEVANCE_GATE")
 
 # -1.00 ~ 1.00，每 0.2 一档 → 10 个名词（由低到高）
 MOOD_LABELS = [
@@ -102,6 +165,19 @@ def label_for(value: float) -> str:
     return MOOD_LABELS[-1][1]
 
 
+def _ad_word(a: float) -> str:
+    """把 a（唤醒）说成人话，只用于状态卡展示。"""
+    try:
+        v = float(a)
+    except Exception:
+        return "状态一般"
+    if v >= 0.65:
+        return "有点上头（心跳快、话多）"
+    if v <= 0.2:
+        return "很平静（懒得动）"
+    return "不激动也不困"
+
+
 def _scope_key(session_key: str = "") -> str:
     """MOOD_SCOPE=global 时所有会话共用全局那一个变量。"""
     if MOOD_SCOPE == "global":
@@ -121,6 +197,401 @@ MOOD_IDLE_STEP = tuning.f("MOOD_IDLE_STEP")
 # 所以峰值不是「历史最大 |Δ|」，而是「还没被后续反向波动抵消掉的最大 |Δ|」。
 MOOD_PEAK_WINDOW_SEC = tuning.f("MOOD_PEAK_WINDOW_SEC")
 MOOD_PEAK_MIN_DELTA = tuning.f("MOOD_PEAK_MIN_DELTA")
+
+# ---- a（唤醒）/ d（掌控）：一期只记录（衰减 + 展示），不进 z/Δ ----
+AD_BASE_A = tuning.f("MOOD_AD_BASE_AROUSAL")
+AD_BASE_D = tuning.f("MOOD_AD_BASE_DOMINANCE")
+AD_SMOOTH = tuning.f("AROUSAL_SMOOTH")     # 0.4：单次最大挪 40%（再乘 confidence）
+_HALF_A = {
+    "group": tuning.f("MOOD_HALF_LIFE_A_GROUP_MIN"),
+    "private": tuning.f("MOOD_HALF_LIFE_A_PRIVATE_MIN"),
+    "global": tuning.f("MOOD_HALF_LIFE_A_GLOBAL_MIN"),
+}
+_HALF_D = {
+    "group": tuning.f("MOOD_HALF_LIFE_D_GROUP_MIN"),
+    "private": tuning.f("MOOD_HALF_LIFE_D_PRIVATE_MIN"),
+    "global": tuning.f("MOOD_HALF_LIFE_D_GLOBAL_MIN"),
+}
+
+
+def _scope_of(session_key: str = "") -> str:
+    key = str(session_key or "")
+    if key.startswith("private_"):
+        return "private"
+    if key.startswith("group_"):
+        return "group"
+    return "global"
+
+
+def _ad_decay(rec: dict, now: float, scope: str = "group"):
+    """a/d 按半衰期回落到基线。返回 (rec, changed)。"""
+    changed = False
+    for axis, base, halves in (("a", AD_BASE_A, _HALF_A),
+                               ("d", AD_BASE_D, _HALF_D)):
+        try:
+            val = float(rec.get(axis, base))
+        except Exception:
+            val = base
+        try:
+            at = float(rec.get(axis + "_at") or 0.0)
+        except Exception:
+            at = 0.0
+        if not at:
+            if axis not in rec:
+                rec[axis] = round(base, 4)
+                rec[axis + "_at"] = now
+                changed = True
+            continue
+        half = max(1.0, float(halves.get(scope, halves["group"])))
+        mins = max(0.0, (now - at) / 60.0)
+        nv = base + (val - base) * math.pow(0.5, mins / half)
+        nv = max(0.0, min(1.0, nv))
+        if abs(nv - val) > 1e-4:
+            changed = True
+        rec[axis] = round(nv, 4)
+        rec[axis + "_at"] = now
+    return rec, changed
+
+
+@_serialized
+def update_ad(session_key: str = "", arousal=None, dominance=None,
+              confidence: float = 0.6) -> dict:
+    """judge 给的绝对档位 → a/d（置信加权 EMA）。
+
+    ⚠️ 必须乘 confidence：否则低置信判读也会一次挪 40%（AD_SMOOTH），
+    比 v 的首条 0.085 快 4 倍。a/d **不进** v 的 z/Δ（emotion §1.5）。
+    """
+    key = str(session_key or "")
+    now = time.time()
+    st = _load()
+    if key:
+        rec = st["sessions"].get(key)
+        if rec is None:
+            rec = {"value": float(st["global"].get("value") or 0.0),
+                   "updated_at": now}
+        rec = _decay(rec, now)
+    else:
+        rec = st["global"]
+    scope = _scope_of(key)
+    rec, _ = _ad_decay(rec, now, scope)
+    try:
+        conf = max(0.0, min(1.0, float(confidence)))
+    except Exception:
+        conf = 0.6
+    for axis, target, base in (("a", arousal, AD_BASE_A),
+                               ("d", dominance, AD_BASE_D)):
+        if target is None:
+            continue
+        try:
+            t = max(0.0, min(1.0, float(target)))
+        except Exception:
+            continue
+        cur = float(rec.get(axis, base))
+        rec[axis] = round(cur + conf * AD_SMOOTH * (t - cur), 4)
+        rec[axis + "_at"] = now
+    if key:
+        st["sessions"][key] = rec
+    else:
+        st["global"] = rec
+    _save(st)
+    return {"a": float(rec.get("a", AD_BASE_A)),
+            "d": float(rec.get("d", AD_BASE_D))}
+
+
+def ad_of(session_key: str = "") -> dict:
+    """读 a/d（顺手衰减）。给状态卡 / /测函数 用。"""
+    m = get_mood(session_key)
+    return {"a": float(m.get("a", AD_BASE_A)),
+            "d": float(m.get("d", AD_BASE_D)),
+            "base_a": AD_BASE_A, "base_d": AD_BASE_D}
+
+
+# ============ P2 状态机：impact → z → K → 步进（DESIGN §3.1） ============
+# 为什么要有这一层：
+#   旧口径把 LLM 报的 Δ 直接累加，模型说多少就是多少（一句话能翻脸）；
+#   新口径 LLM 只报**档位** impact∈{-2..+2}，步长/饱和/置信加权都在代码里，
+#   并且每 20 个判读窗口用一次**绝对锚点**纠偏（纯相对会漂）。
+def _p_of(rec: dict) -> float:
+    try:
+        return max(1e-4, min(1.0, float(rec.get("P", P0))))
+    except Exception:
+        return P0
+
+
+# P 的下限（工程护栏，不是设计口径）：
+# 连续判读会让 P 指数衰减到 0，K→0 之后新事件再也推不动 v（情绪「冻住」）。
+# 留 1/4 的观测噪声当底，稳态 K≈0.2，单次 impact=±1 约走 0.02 —— 与 DESIGN
+# §3.1 写的「稳态 0.02~0.05」一致；锚点仍会把 P 抬回 0.02 做纠偏。
+P_FLOOR = max(1e-4, R_BASE * 0.25)
+
+
+def sensitivity(session_key: str = "") -> float:
+    """人设敏感度（乘在观测步长上），默认 1.0，夹在 [SENS_MIN, SENS_MAX]。"""
+    try:
+        _s = float(get_mood(session_key).get("sens", 1.0))
+    except Exception:
+        _s = 1.0
+    return max(SENS_MIN, min(SENS_MAX, _s))
+
+
+@_serialized
+def set_sensitivity(value: float, session_key: str = "") -> float:
+    _s = max(SENS_MIN, min(SENS_MAX, float(value)))
+    now = time.time()
+    st = _load()
+    key = _scope_key(session_key)
+    rec = st["sessions"].get(key) or _new_rec(now, _scope_of(key))
+    rec = _decay(rec, now)
+    rec["sens"] = _s
+    st["sessions"][key] = rec
+    _save(st)
+    return _s
+
+
+def _step_of(impact: int) -> float:
+    return STEP_2 if abs(impact) >= 2 else STEP_1
+
+
+def _anchor_map(level: int) -> float:
+    return {2: ANCHOR_LEVEL2, 1: ANCHOR_LEVEL1, 0: 0.0,
+            -1: -ANCHOR_LEVEL1, -2: -ANCHOR_LEVEL2}.get(int(level), 0.0)
+
+
+def _anchor_rec(rec: dict, level: int, confidence: float,
+                baseline: float = 0.0) -> float:
+    """在 rec 上做一次绝对锚点，返回实际位移（外口径）。"""
+    v = float(rec.get("value") or 0.0) / 100.0
+    target = max(-1.0, min(1.0, float(baseline) + _anchor_map(level)))
+    diff = target - v
+    if abs(diff) < ANCHOR_DEADBAND:
+        return 0.0
+    move = diff * (ANCHOR_GAIN * max(0.0, min(1.0, float(confidence))))
+    move = max(-ANCHOR_MAX_MOVE, min(ANCHOR_MAX_MOVE, move))
+    rec["value"] = _clamp((v + move) * 100.0)
+    rec["P"] = min(1.0, _p_of(rec) + ANCHOR_P_ADD)
+    rec["anchor_at"] = time.time()
+    rec["anchor_n"] = int(rec.get("anchor_n") or 0) + 1
+    return round(move, 4)
+
+
+@_serialized
+def observe(session_key: str, impact: int, confidence: float = 0.6, *,
+            sensitivity: float = None, reactivity: float = 1.0,
+            anchor_level: int = None, word: str = "", why: str = "",
+            src: str = "", about_qq: str = "", mind: str = "") -> dict:
+    """**唯一的心情更新链路**（P2）：impact 档位 → 伪观测 z → K → 步进。
+
+    返回 {v, dv, z, K, P, impact, anchored}；v 是外口径（-1~1）。
+    `anchor_level` 非 None 且到第 ANCHOR_EVERY 个窗口 / 静默够久时做一次锚点。
+    """
+    try:
+        imp = max(-2, min(2, int(impact)))
+    except Exception:
+        imp = 0
+    try:
+        conf = max(0.0, min(1.0, float(confidence)))
+    except Exception:
+        conf = 0.6
+    now = time.time()
+    st = _load()
+    # 人设基线（emotion §3.1/§2.1）：衰减回落点和锚点目标都叠在它上面。
+    # 没有这个字段时恒为 0 —— 冷漠/热情人设的长期回落点会完全一样。
+    _base_v = 0.0
+    try:
+        from . import persona_traits as _pt
+        _base_v = float(_pt.traits_for_session(str(session_key or "")).get("baseline_v") or 0.0)
+    except Exception:
+        _base_v = 0.0
+    _base_v = max(-0.3, min(0.3, _base_v))
+    st["global"] = _decay(st["global"], now, _base_v)
+    key = _scope_key(session_key)
+    _sens = max(SENS_MIN, min(SENS_MAX, float(sensitivity if sensitivity is not None else 1.0)))
+
+    def _one(rec: dict, scope: str, scale: float = 1.0, base: float = 0.0):
+        # ⚠️ dt_h 必须在 _decay **之前**算：_decay 会把 updated_at 写成 now，
+        #    之后再算永远是 0 → Q 恒 0、P 永不随时间回升（2026-11-25 审计 P0-1）。
+        try:
+            _prev_ts = float((rec or {}).get("updated_at") or now)
+        except Exception:
+            _prev_ts = now
+        dt_h = max(0.0, (now - _prev_ts) / 3600.0)
+        rec = _decay(rec, now, base) if rec else _new_rec(now, scope)
+        v = float(rec.get("value") or 0.0) / 100.0
+        p = max(P_FLOOR, min(1.0, _p_of(rec)
+                             + (Q_BASE + Q_SLOPE * max(0.0, float(reactivity))) * dt_h))
+        r = R_BASE + R_SLOPE * (1.0 - conf) ** 2
+        k = (p / (p + r)) if (p + r) > 0 else 0.0
+        d = 0.0 if imp == 0 else (1.0 if imp > 0 else -1.0)
+        z = max(-1.0, min(1.0, v + d * _step_of(imp) * _sens))
+        dv = k * (z - v)
+        dv *= (1.0 - SATURATION * abs(v))
+        dv = max(-HARD_CAP, min(HARD_CAP, dv)) * scale
+        rec["value"] = _clamp((v + dv) * 100.0)
+        rec["updated_at"] = now
+        rec["P"] = max(P_FLOOR, min(1.0, (1.0 - k) * p))
+        rec["judge_n"] = int(rec.get("judge_n") or 0) + 1
+        if abs(dv) > 1e-6:
+            rec["label"] = label_for(rec["value"] / 100.0)
+            rec["label_at"] = now
+        return rec, dv, z, k, p
+
+    anchored = 0.0
+    anchored_g = 0.0
+    if key:
+        scope = _scope_of(key)
+        rec, dv, z, k, p = _one(st["sessions"].get(key), scope, base=_base_v)
+        n = int(rec.get("judge_n") or 0)
+        idle = (now - float(rec.get("anchor_at") or rec.get("updated_at") or now)) \
+            > ANCHOR_IDLE_MIN * 60
+        _do_anchor = (anchor_level is not None
+                      and (n % max(1, ANCHOR_EVERY) == 0 or idle))
+        if _do_anchor:
+            anchored = _anchor_rec(rec, int(anchor_level), conf, _base_v)
+            # 死区跳过的窗口算不算「一次锚点」由 MOOD_ANCHOR_COUNT_SKIPPED 决定：
+            # 0 = 只数真的挪动过的（被跳过就把计数退回去）
+            if anchored == 0 and not ANCHOR_COUNT_SKIPPED:
+                rec["judge_n"] = max(0, n - 1)
+        if abs(_base_v) > 1e-9:
+            rec["base_v"] = round(_base_v, 4)
+        st["sessions"][key] = rec
+        g, dv_g, _, _, _ = _one(st["global"], "global", GLOBAL_SHARE, base=_base_v)
+        # 2026-11-25：全局也要锚（emotion §4.1「锚点同样作用于全局」）。
+        # 以前只有会话锚，全局漂了只能靠 6h 衰减，quiet/proactive 会跟着偏。
+        if _do_anchor:
+            anchored_g = _anchor_rec(g, int(anchor_level), conf, _base_v)
+        if abs(_base_v) > 1e-9:
+            g["base_v"] = round(_base_v, 4)
+        st["global"] = g
+        value_now = float(rec["value"])
+    else:
+        g, dv, z, k, p = _one(st["global"], "global", base=_base_v)
+        if anchor_level is not None:
+            anchored_g = _anchor_rec(g, int(anchor_level), conf, _base_v)
+        if abs(_base_v) > 1e-9:
+            g["base_v"] = round(_base_v, 4)
+        st["global"] = g
+        value_now = float(g["value"])
+    _save(st)
+    try:
+        if abs(dv) > 1e-6:
+            log_shift(dv * 100.0, emotion=(word or "judge"),
+                      label=(why or ""), reason="observe",
+                      session_key=session_key, about_qq=about_qq,
+                      src=src, mind=mind, impact=imp)
+        if anchored:
+            log_shift(anchored * 100.0, emotion="anchor",
+                      label="绝对锚点纠偏", reason="anchor",
+                      session_key=session_key, about_qq=about_qq)
+        if anchored_g:
+            log_shift(anchored_g * 100.0, emotion="anchor",
+                      label="全局锚点纠偏", reason="anchor",
+                      session_key="", about_qq="")
+    except Exception:
+        pass
+    # P 返回**后验**（更新后的不确定度）：日志/诊断要能看出「越判越确定」，
+    # 返回先验 p 会让线上每条都像 P0=0.25（2026-11-25 真机日志踩到）。
+    _post = _p_of(st["sessions"][key]) if key else _p_of(st["global"])
+    return {"v": round(value_now / 100.0, 4), "dv": round(dv, 4),
+            "z": round(z, 4), "K": round(k, 4), "P": round(_post, 4),
+            "P_prior": round(p, 4), "impact": imp, "anchored": anchored}
+
+
+@_serialized
+def note_window(session_key: str = "") -> int:
+    """只记「这一窗判过了」，不改 v。
+
+    ADR-037：被 relevance gate 跳过的窗口也要计入锚点计数，
+    否则噪声群 judge_n 永远是 0、锚点永不触发（状态冻结）。
+    返回累计窗口数。
+    """
+    now = time.time()
+    st = _load()
+    key = _scope_key(session_key)
+    if key:
+        rec = st["sessions"].get(key) or _new_rec(now, _scope_of(key))
+        rec = _decay(rec, now)
+        rec["judge_n"] = int(rec.get("judge_n") or 0) + 1
+        st["sessions"][key] = rec
+    else:
+        g = _decay(st["global"], now)
+        g["judge_n"] = int(g.get("judge_n") or 0) + 1
+        st["global"] = g
+    _save(st)
+    rec2 = st["sessions"].get(key) if key else st["global"]
+    return int((rec2 or {}).get("judge_n") or 0)
+
+
+@_serialized
+def anchor(session_key: str, level: int, confidence: float = 0.6,
+           baseline: float = 0.0) -> float:
+    """手动/独立触发一次绝对锚点，返回位移（外口径）。"""
+    now = time.time()
+    st = _load()
+    key = _scope_key(session_key)
+    rec = st["sessions"].get(key) or _new_rec(now, _scope_of(key))
+    rec = _decay(rec, now)
+    move = _anchor_rec(rec, int(level), confidence, baseline)
+    st["sessions"][key] = rec
+    _save(st)
+    if abs(move) > 1e-9:
+        log_shift(move * 100.0, emotion="anchor", label="绝对锚点纠偏",
+                  reason="anchor", session_key=session_key)
+    return move
+
+
+@_serialized
+def fast_guard(session_key: str = "", light: bool = False,
+               why: str = "") -> float:
+    """快速通道护栏：@她/引用她 + 强负面词时，只做**负向钳制**。
+
+    - `v = min(v, floor)`：只降不升（强负面 -0.45 / 轻负面 -0.25）；
+    - `P = min(1, P×FAST_P_FACTOR)`：**提高**不确定度，让下一轮判读能把她拉回来。
+    规则不判决正向（红线 3），也不写好感。
+    """
+    now = time.time()
+    st = _load()
+    st["global"] = _decay(st["global"], now)
+    key = _scope_key(session_key)
+    floor = FAST_FLOOR_LIGHT if light else FAST_FLOOR
+    if key:
+        rec = st["sessions"].get(key) or _new_rec(now, _scope_of(key))
+        rec = _decay(rec, now)
+    else:
+        rec = st["global"]
+    v = float(rec.get("value") or 0.0) / 100.0
+    moved = 0.0
+    if v > floor:
+        moved = floor - v
+        rec["value"] = _clamp(floor * 100.0)
+        rec["label"] = label_for(floor)
+        rec["label_at"] = now
+    rec["P"] = min(1.0, _p_of(rec) * FAST_P_FACTOR)
+    rec["updated_at"] = now
+    # 快速通道的「置信度」按设计固定为 MOOD_FAST_CONF（0.4）：它不是一次完整判读，
+    # 只在下一轮判读前占个位，让状态卡/诊断看得出「这条是护栏写的」。
+    rec["judge"] = {**(rec.get("judge") or {}), "fast_conf": FAST_CONF,
+                    "fast_at": now}
+    if key:
+        st["sessions"][key] = rec
+    else:
+        st["global"] = rec
+    _save(st)
+    if moved:
+        log_shift(moved * 100.0, emotion="guard",
+                  label=(why or "快速通道负向钳制"), reason="fast-guard",
+                  session_key=session_key)
+    return round(float(rec["value"]) / 100.0, 4)
+
+
+def state_of(session_key: str = "") -> dict:
+    """给状态卡 / 诊断用：v、a、d、P、判读次数、作用域。"""
+    m = get_mood(session_key)
+    return {"v": round(float(m.get("value") or 0.0) / 100.0, 4),
+            "a": round(float(m.get("a", AD_BASE_A)), 3),
+            "d": round(float(m.get("d", AD_BASE_D)), 3),
+            "P": round(_p_of(m), 4),
+            "judge_n": int(m.get("judge_n") or 0),
+            "scope": str(m.get("_scope") or "group")}
 
 
 def _idle_decay(rec: dict, now: float):
@@ -147,6 +618,7 @@ def _idle_decay(rec: dict, now: float):
     return rec, True
 
 
+@_serialized
 def touch(session_key: str = "") -> None:
     """有真人消息 → **先结算沉默期间的自减**，再从这一刻重新计时。
 
@@ -197,16 +669,22 @@ POSITIVE_WORDS = ["可爱", "厉害", "真棒", "喜欢", "谢谢", "哈哈", "�
 NEGATIVE_WORDS = ["笨", "蠢", "讨厌", "滚", "废物", "闭嘴", "傻", "烦", "垃圾", "去死"]
 
 
-def _new_rec(now: float = 0) -> dict:
-    return {"value": 0.0, "updated_at": now or time.time()}
+def _new_rec(now: float = 0, scope: str = "global") -> dict:
+    _t = now or time.time()
+    # anchor_at 必须初始化：留 0 会让「静默 30min」在第一次判读时恒为真 →
+    # 每条新会话的第一个观测都被额外锚一次（2026-11-25 真机日志发现）。
+    return {"value": 0.0, "updated_at": _t, "_scope": scope, "anchor_at": _t}
 
 
 def _clamp(v: float) -> float:
     return max(-100.0, min(100.0, float(v)))
 
 
-def _decay(rec: dict, now: float) -> dict:
+def _decay(rec: dict, now: float, baseline: float = None) -> dict:
     """把一条记录按半衰期衰减到 now，返回新记录（不改原对象）。
+
+    2026-11-25：衰减目标是**人设基线 baseline_v**，不是 0
+    （emotion §3.1「衰减回到 base_v」；冷漠人设和热情人设长期回落点不同）。
 
     ⚠️ 必须把 label 一起带过去：以前只回 value/updated_at，
        一衰减就把她自己写的心情原话丢了（2026-11-19）。
@@ -217,8 +695,25 @@ def _decay(rec: dict, now: float) -> dict:
     except Exception:
         return _new_rec(now)
     hours = max(0.0, (now - updated) / 3600.0)
-    out = {"value": _clamp(value * math.pow(0.5, hours / HALF_LIFE_HOURS)),
-           "updated_at": now}
+    # 半衰期按作用域取（DESIGN §3.1：群 30min / 私聊 2h / 全局 6h）。
+    # 回滚（MOOD_UPDATE=delta）时仍用旧的单一半衰期 12h。
+    _scope = str(rec.get("_scope") or "group")
+    if MOOD_UPDATE == "v2":
+        _hl_h = max(0.01, float(_HL_MIN.get(_scope, _HL_MIN["group"])) / 60.0)
+    else:
+        _hl_h = HALF_LIFE_HOURS
+    # baseline=None 时用记录里存的人设基线（写入口会写 base_v）；
+    # 这样 get_mood 这类读路径不用每次都去算 persona_traits。
+    if baseline is None:
+        try:
+            baseline = float(rec.get("base_v") or 0.0)
+        except Exception:
+            baseline = 0.0
+    _base = max(-1.0, min(1.0, float(baseline or 0.0))) * 100.0
+    out = {"value": _clamp(_base + (value - _base) * math.pow(0.5, hours / _hl_h)),
+           "updated_at": now, "_scope": _scope}
+    if abs(_base) > 1e-9:
+        out["base_v"] = round(_base / 100.0, 4)
     if rec.get("label"):
         out["label"] = str(rec.get("label") or "")
         try:
@@ -234,9 +729,17 @@ def _decay(rec: dict, now: float) -> dict:
                 out[_k] = float(rec.get(_k))
             except Exception:
                 pass
+    # a/d（唤醒/掌控）：它们有自己的半衰期，_decay 只负责原样带过去
+    for _k in ("a", "d", "a_at", "d_at"):
+        if rec.get(_k) is not None:
+            out[_k] = rec.get(_k)
     # 判读结果（mood_judge 写的影子字段）也不能在衰减时丢掉
     if isinstance(rec.get("judge"), dict) and rec["judge"]:
         out["judge"] = dict(rec["judge"])
+    # P2 状态机字段：不确定度 P、判读次数、上次锚点、人设敏感度
+    for _k in ("P", "judge_n", "anchor_at", "anchor_n", "sens"):
+        if rec.get(_k) is not None:
+            out[_k] = rec.get(_k)
     return out
 
 
@@ -255,13 +758,25 @@ def _load() -> dict:
     g = raw.get("global")
     if not isinstance(g, dict):
         g = _new_rec()
+    g.setdefault("_scope", "global")
     s = raw.get("sessions")
     if not isinstance(s, dict):
         s = {}
+    # 旧记录没有 _scope：按 key 回填，避免升级后群聊误用 12h 半衰期
+    for _k, _rec in list(s.items()):
+        if isinstance(_rec, dict):
+            _rec.setdefault("_scope", _scope_of(_k))
+            # 老记录没有 anchor_at：用最后更新时间当起点，避免升级后第一次判读就锚
+            try:
+                _rec.setdefault("anchor_at", float(_rec.get("updated_at") or time.time()))
+            except Exception:
+                _rec["anchor_at"] = time.time()
     return {"global": g, "sessions": s}
 
 
 def _save(st: dict) -> None:
+    """唯一落盘入口：进程内由 `_serialized` 串行，跨进程用 flock 保护写。"""
+    lock = None
     try:
         # 控制会话数量：留最近活跃的 MAX_SESSIONS 个
         sessions = st.get("sessions") or {}
@@ -270,16 +785,30 @@ def _save(st: dict) -> None:
                           key=lambda kv: float((kv[1] or {}).get("updated_at") or 0),
                           reverse=True)[:MAX_SESSIONS]
             st["sessions"] = dict(keep)
+        # 跨进程：两个脚本同时写时，tmp→replace 这一步必须互斥
+        if fcntl is not None:
+            try:
+                lock = open(MOOD_FILE.with_suffix(".lock"), "a+")
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            except Exception:
+                lock = None
         tmp = MOOD_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, MOOD_FILE)
     except Exception:
         pass
+    finally:
+        if lock is not None:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                lock.close()
+            except Exception:
+                pass
 
 
 def log_shift(delta: float, *, emotion: str = "", reason: str = "",
               about_qq: str = "", session_key: str = "", label: str = "",
-              src: str = "", mind: str = ""):
+              src: str = "", mind: str = "", impact=None):
     """把一次心情波动追加到流水文件（复盘 / 峰值事件 / 安静建议都读它）。
 
     emotion 存**归一化**的固定词（机器读），她自己写的原话另存 label。
@@ -301,6 +830,13 @@ def log_shift(delta: float, *, emotion: str = "", reason: str = "",
             "session": str(session_key or ""),
             "value": round(float(get_mood(session_key)["value"]), 2),
         }
+        # 档位（-2~+2）：复盘时才能区分「步长变大了」还是「这次本来就更重」。
+        # 没有它，M10「同段步长递减」在 data 级根本判不了（2026-11-25）。
+        if impact is not None:
+            try:
+                rec["impact"] = int(impact)
+            except Exception:
+                pass
         with open(MOOD_HISTORY, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         # 刚追加过 → 让走势缓存失效（同一秒内连写也不会读到旧的）
@@ -386,8 +922,18 @@ def peak_event(session_key: str = "", *,
             continue
         if abs(d) < MOOD_PEAK_MIN_DELTA or at <= 0:
             continue
+        # 2026-11-25：峰值事件只收「真发生过的事」。
+        #   ① 快速通道已删除，它的历史记录（label 常是图片描述）不再上状态卡；
+        #   ② 图片/视频描述不是「一件事」，丢掉。
+        # 锚点（绝对锚点纠偏）、快速通道、旧关键词路径都不算「一件事」。
+        # 注意：不要写成「只认 observe」—— 测试/旧数据里 reason 可能是空或自定义文本。
+        if str(r.get("reason") or "") in ("anchor", "fast-guard", "guard", "keyword"):
+            continue
         txt = (str(r.get("label") or "").strip()
                or str(r.get("src") or "").strip())
+        if txt.startswith(("**", "【图片", "[图片", "（图片")) \
+                or "图片识别" in txt[:20] or "视频解析" in txt[:20]:
+            continue
         evs.append({"at": at, "delta": d,
                     "text": txt[:80],
                     "mind": str(r.get("mind") or "").strip()[:80],
@@ -425,6 +971,7 @@ def peak_event(session_key: str = "", *,
     return {}
 
 
+@_serialized
 def get_mood(session_key: str = "") -> dict:
     """
     取心情。session_key 为空 = 全局；否则取该会话（没有记录就继承全局）。
@@ -443,8 +990,9 @@ def get_mood(session_key: str = "") -> dict:
     _dirty = False
     _g0 = float(st["global"].get("value") or 0.0)
     g = _decay(st["global"], now)
+    g, _ad_changed = _ad_decay(g, now, "global")
     st["global"] = g
-    if abs(float(g.get("value") or 0.0) - _g0) > 1e-9:
+    if _ad_changed or abs(float(g.get("value") or 0.0) - _g0) > 1e-9:
         _dirty = True
 
     key = str(session_key or "")
@@ -455,14 +1003,18 @@ def get_mood(session_key: str = "") -> dict:
         if rec is None:
             # 第一次进这个会话 → 继承当前全局状态，别一上来就归零
             rec = {"value": g["value"], "updated_at": now,
-                   "label": g.get("label") or "", "label_at": g.get("label_at") or 0}
+                   "label": g.get("label") or "", "label_at": g.get("label_at") or 0,
+                   "a": g.get("a", AD_BASE_A), "a_at": now,
+                   "d": g.get("d", AD_BASE_D), "d_at": now,
+                   "_scope": _scope_of(key), "anchor_at": now}
             _dirty = True
         else:
             _v0 = float(rec.get("value") or 0.0)
             rec = _decay(rec, now)
             # 空闲衰减：没人找她时慢慢归 0（和 12h 半衰叠加，短时间尺度以 idle 为主）
             rec, _idle_changed = _idle_decay(rec, now)
-            if _idle_changed:
+            rec, _ad_changed = _ad_decay(rec, now, _scope_of(key))
+            if _idle_changed or _ad_changed:
                 _dirty = True
             if abs(float(rec.get("value") or 0.0) - _v0) > 1e-9:
                 _dirty = True
@@ -479,9 +1031,17 @@ def get_mood(session_key: str = "") -> dict:
     if _dirty:
         _save(st)
     return {"value": rec["value"], "label": label, "label_at": label_at,
-            "judge": dict(rec.get("judge") or {}), "updated_at": now}
+            "judge": dict(rec.get("judge") or {}), "updated_at": now,
+            "a": float(rec.get("a", AD_BASE_A)),
+            "d": float(rec.get("d", AD_BASE_D)),
+            # P2 状态机字段：读接口也要带出来，否则 state_of/诊断永远看到 P0
+            "P": _p_of(rec),
+            "judge_n": int(rec.get("judge_n") or 0),
+            "_scope": str(rec.get("_scope") or _scope_of(key)),
+            "sens": float(rec.get("sens") or 1.0)}
 
 
+@_serialized
 def set_label(label: str, session_key: str = "") -> str:
     """
     记下**她自己写的心情原话**（不是固定枚举）。
@@ -511,6 +1071,7 @@ def set_label(label: str, session_key: str = "") -> str:
     return txt
 
 
+@_serialized
 def set_judge(session_key: str, word: str, value: float, *,
               why: str = "", src: str = "", mind: str = "",
               delta: float = 0.0) -> dict:
@@ -593,6 +1154,7 @@ def _delta_from_text(text: str) -> float:
     return max(-12.0, min(12.0, s * 0.8))
 
 
+@_serialized
 def bump_mood(delta: float, session_key: str = "") -> float:
     """
     改心情：会话吃满额，全局只吃 GLOBAL_SHARE。
@@ -628,6 +1190,7 @@ def bump_mood(delta: float, session_key: str = "") -> float:
     return value
 
 
+@_serialized
 def set_value_from_judge(value: float, session_key: str = "", *, word: str = "",
                          why: str = "", src: str = "", about_qq: str = "",
                          mind: str = "") -> float:
@@ -757,6 +1320,7 @@ def apply_delta(delta: float, session_key: str = "", *, word: str = "",
     return round(value_now / 100.0, 4)
 
 
+@_serialized
 def reset(session_key: str = "", *, value: float = 0.0) -> float:
     """把某个会话的心情重置到 value（默认 0），并清掉名词/判读。
 
@@ -938,13 +1502,37 @@ def status_block(session_key: str = "", speaker_qq: str = "") -> str:
     _lvl = float(m.get("value") or 0.0) / 100.0
     _state = label_for(_lvl)
     lines.append(f"· 心情：{_state}（{_lvl:+.2f}；-1 最难受 / 0 平静 / +1 最开心）")
+    _a = float(m.get("a", AD_BASE_A))
+    _d = float(m.get("d", AD_BASE_D))
+    if abs(_a - AD_BASE_A) >= 0.08 or abs(_d - AD_BASE_D) >= 0.12:
+        lines.append(f"· 你现在的状态：{_ad_word(_a)}"
+                     f"｜掌控感 {_d:.2f}（0 被压着 / 1 说了算）")
     if label and label != _state:
         lines.append(f"· 你自己写的感觉：{label}")
     if word and word not in (_state, label):
         lines.append(f"· 刚才那下：{word}")
-    mind = str(j.get("mind") or "").strip()
-    if mind:
-        lines.append(f"· 你心里那句话：{mind}")
+    # 2026-11-25：这里以前回显 `judge.mind`（判读模型从群聊编的），等于把猜测当成她的心理。
+    # 现在只回显她自己写过的 [[THINK]]；没有就整行不写。judge.mind 只留给 /测函数 诊断。
+    think = ""
+    try:
+        from . import mood_judge as _mj
+        _items = _mj.recent_think_items(session_key, 1)
+        if _items:
+            think = str(_items[-1].get("text") or "").strip()
+    except Exception:
+        think = ""
+    if think:
+        lines.append(f"· 你心里那句话：{think}")
+
+    # 关系四量（P3）：只在偏离基线时出现一行，别每轮都占字数
+    try:
+        if speaker_qq:
+            from . import relationship as _rel
+            _rl = _rel.render_line(speaker_qq)
+            if _rl:
+                lines.append(f"· 你俩的关系：{_rl}")
+    except Exception:
+        pass
 
     # 峰值事件：最近涨/跌幅度最大、且还没被后续反向波动抵消掉的那件事。
     # 用户 2026-11-20：心情名词要连这件事 + 当时的心理活动一起给她看；
@@ -997,7 +1585,10 @@ def status_block(session_key: str = "", speaker_qq: str = "") -> str:
     if _qq.isdigit():
         try:
             from . import profiles as _pf
-            _aff = _pf.get_affinity(_qq)
+            from . import relationship as _rln
+            # 用 relationship.affinity_of：和「你俩的关系」那一行同源（含半衰期回落），
+            # 以前这里读原始值、那里读衰减值，同一个人会显示两个数。
+            _aff = float(_rln.affinity_of(_qq))
             _tr = _pf.affinity_trend(_qq)
             if abs(_aff) >= 0.05 or int(_tr.get("n") or 0) > 0:
                 _gid = key[6:] if key.startswith("group_") else ""
@@ -1029,7 +1620,8 @@ def mood_factors(session_key: str = "") -> dict:
     """
     # 数值本身已经由判读写入（set_value_from_judge，带平滑），
     # 这里直接用它 —— 不再单独读 judge.value，避免「平滑只作用于存储、不作用于行为」。
-    base = float(get_mood(session_key).get("value") or 0.0)
+    _m = get_mood(session_key)
+    base = float(_m.get("value") or 0.0)
     # 👇 群心情是**独立**的一层：整体心情不错，但在这个群 5 小时净掉 0.7，
     #    她也会明显少说话（用户 2026-11-20）。只对群会话生效。
     _gf = 1.0
@@ -1045,4 +1637,7 @@ def mood_factors(session_key: str = "") -> dict:
         "delay": 1.0 + max(-0.5, -base / 200.0),
         "chatty": (1.0 + max(-0.8, base / 100.0)) * _gf,
         "group": _gf,
+        # a/d 一期只记录：这里只暴露，**不改** voice/sticker/delay/chatty
+        "arousal": round(float(_m.get("a", AD_BASE_A)), 3),
+        "dominance": round(float(_m.get("d", AD_BASE_D)), 3),
     }

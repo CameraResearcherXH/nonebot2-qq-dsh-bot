@@ -17,6 +17,7 @@
 - 时间一律**秒**，除非键名带 `_H`（小时）/`_DAYS`（天）。
 - 概率/权重一律 **0~1**。
 - 心情内部口径 **-100~100**；判读模型给的是 -1.00~1.00，代码里会 ×100。
+- 生效位置标 **（设计，未接线）** 的键：设计已定、代码还没读，**改了不生效**；接线后会自动去掉标记。
 
 ---
 
@@ -24,25 +25,25 @@
 
 | 分组 | 项数 |
 |---|---|
-| 回复 / 限流 / 主动插话 | 44 |
-| 心情 | 34 |
-| 档案 / 好感 | 12 |
-| 记忆 | 16 |
+| 回复 / 限流 / 主动插话 | 46 |
+| 心情 | 75 |
+| 档案 / 好感 | 14 |
+| 记忆 | 34 |
 | 表情 | 7 |
-| 主动私聊 | 9 |
+| 主动私聊 | 17 |
 | 安静 / 破冰 | 6 |
-| 提示词 | 3 |
-| 模型调用 | 18 |
+| 提示词 | 8 |
+| 模型调用 | 23 |
 | 用量监测 | 4 |
 | 回复审核 | 14 |
 | 表达 / 语气 | 7 |
 | 视觉 | 19 |
 | 画图 | 2 |
-| 语音 / 音乐 | 27 |
+| 语音 / 音乐 | 30 |
 | 世界书 | 4 |
-| 安全 / 工具 | 10 |
-| 其他 | 15 |
-| **合计** | **251** |
+| 安全 / 工具 | 9 |
+| 其他 | 98 |
+| **合计** | **417** |
 
 ## 回复 / 限流 / 主动插话
 
@@ -65,6 +66,7 @@
 | `FOCUS_TIMEOUT` | `120` | 关注会话的有效期（秒） | `plugins/chat/__init__.py` |
 | `GROUP_MAX_HANZI` | `20` | 群聊单条回复的字数上限（按显示宽度算：汉字 1 / 半角 0.5） | `plugins/chat/__init__.py` |
 | `GROUP_MUTE_SEC` | `900` | 被群友嫌弃后静默多少秒 | `plugins/chat/__init__.py` |
+| `GROUP_REPLY_COOLDOWN` | `45` | 群聊刚回过之后多少秒内，非点名消息不单独回（防同一件事回两遍） | `plugins/chat/__init__.py` |
 | `GROUP_SEND_LIMIT` | `9` | 群发配额：每窗口最多几条 | `plugins/chat/__init__.py` |
 | `GROUP_SEND_MAX_WAIT` | `15` | 配额不足时最多等多久（秒） | `plugins/chat/__init__.py` |
 | `LONG_FORWARD_MIN` | `120` | 超过多少字改用合并转发 | `plugins/chat/__init__.py` |
@@ -73,6 +75,8 @@
 | `MERGE_WINDOW` | `0.6` | 合并转发判定窗口（秒） | `plugins/chat/__init__.py` |
 | `MOOD_FOLLOW_MIN` | `-35` | 心情低于这个值就不再追着接话（只回明确叫她） | `plugins/chat/__init__.py` |
 | `MOOD_WATCH_SEC` | `60` | 被动心情观察的最小间隔（秒） | `plugins/chat/__init__.py` |
+| `OUT_BUBBLES_MAX` | `2` | 单轮气泡上限 | `plugins/chat/__init__.py` |
+| `OUT_BUBBLE_CHARS` | `40` | 单泡汉字上限 | `plugins/chat/__init__.py` |
 | `PEER_REPLY_COOLDOWN` | `180` | 对鱼接话的冷却（秒） | `plugins/chat/__init__.py` |
 | `PEER_REPLY_PROB` | `0.15` | 对鱼的消息接话概率（0~1） | `plugins/chat/__init__.py` |
 | `PRIVATE_MAX_HANZI` | `20` | 私聊单条回复的字数上限（同上） | `plugins/chat/__init__.py` |
@@ -85,7 +89,6 @@
 | `REPLY_DEDUP_SEC` | `60` | 重复回复去重窗口（秒） | `plugins/chat/__init__.py` |
 | `REPLY_INTERVAL` | `10` | 同一会话两条回复之间最少间隔秒数（限流） | `plugins/chat/__init__.py` |
 | `SEGMENT_WAIT_FAST` | `1.2` | 群聊分段：@ 她 / 叫名字时只等多久（默认 1.2，别让她慢半拍） | `plugins/chat/__init__.py` |
-| `SHORT_QUERY_WINDOW_SEC` | `120` | 短查询上下文窗口（秒） | `plugins/chat/__init__.py` |
 | `SLEEP_HOUR_END` | `8` | 群聊免打扰结束小时（0-23） | `plugins/chat/__init__.py` |
 | `SLEEP_HOUR_START` | `0` | 群聊免打扰开始小时（0-23） | `plugins/chat/__init__.py` |
 | `TTS_PICKUP_TIMEOUT` | `40` | 等算力机接单的超时（秒） | `plugins/chat/__init__.py` |
@@ -97,9 +100,13 @@
 
 | 参数 | 默认 | 说明 | 生效位置 |
 |---|---|---|---|
-| `AFFINITY_GAIN` | `0.05` | 心情变化 Δ 转好感的系数（0.05 ≈ 一次大事件 +0.05） | `services/mood_judge.py` |
-| `GROUP_MOOD_CHAT_MAX` | `1.35` | 群心情最好时「愿不愿意多说话」的乘数上限（1.35） | `services/mood.py` |
-| `GROUP_MOOD_CHAT_MIN` | `0.55` | 群心情最差时「愿不愿意多说话」的乘数下限（0.55） | `services/mood.py` |
+| `AFFINITY_GAIN` | `0.05` | ⚠️ LEGACY（P3 删）：旧好感通道系数；新口径见 REL_* | `services/mood_judge.py` |
+| `AROUSAL_LEVEL_HIGH` | `0.8` | judge arousal=high 对应的 a 值 | `services/mood_judge.py` |
+| `AROUSAL_LEVEL_LOW` | `0.2` | judge arousal=low 对应的 a 值 | `services/mood_judge.py` |
+| `AROUSAL_LEVEL_MID` | `0.5` | judge arousal=mid 对应的 a 值 | `services/mood_judge.py` |
+| `AROUSAL_SMOOTH` | `0.4` | a 平滑：a = (1-s)*old + s*level | `services/mood.py` |
+| `GROUP_MOOD_CHAT_MAX` | `1.35` | 群心情最好时「愿不愿意多说话」的乘数上限（1.35） | `services/group_mood.py` |
+| `GROUP_MOOD_CHAT_MIN` | `0.55` | 群心情最差时「愿不愿意多说话」的乘数下限（0.55） | `services/group_mood.py` |
 | `GROUP_MOOD_GROUP_DROP` | `0.7` | 整个群净掉多少 → 判定群聊不愉快（0.7） | `services/group_mood.py` |
 | `GROUP_MOOD_LIKE_MIN` | `0.05` | 净 Δ 达到多少算喜欢/讨厌（0.05，算人数和比例用） | `services/group_mood.py` |
 | `GROUP_MOOD_MAX_DELTA` | `0.2` | 单条群心情事件上限（0.20，防小事刷满） | `services/group_mood.py` |
@@ -108,35 +115,72 @@
 | `GROUP_MOOD_MIN_PEOPLE` | `3` | 至少几个不同的人让心情掉，才算「群聊导致」（3） | `services/group_mood.py` |
 | `GROUP_MOOD_PERSON_DROP` | `0.4` | 某个人在窗口内净让心情掉多少 → 单独不理他（0.4） | `services/group_mood.py` |
 | `GROUP_MOOD_WINDOW_SEC` | `18000` | 群心情窗口（秒，默认 18000 = 5 小时；超时事件自动过期） | `services/group_mood.py` |
+| `MOOD_AD_BASE_AROUSAL` | `0.35` | 唤醒 a 的回落基线（0~1） | `services/mood.py` |
+| `MOOD_AD_BASE_DOMINANCE` | `0.5` | 掌控 d 的回落基线（0~1） | `services/mood.py` |
+| `MOOD_ANCHOR_COUNT_SKIPPED` | `1` | 1=被 relevance 跳过的窗口也计入锚点计数；0=只数真判读 | `services/mood.py` |
+| `MOOD_ANCHOR_DEADBAND` | `0.15` | 锚点死区：差值小于它则跳过 | `services/mood.py` |
+| `MOOD_ANCHOR_EVERY` | `20` | 锚点：每多少轮判读一次 | `services/mood.py` |
+| `MOOD_ANCHOR_GAIN` | `0.25` | 锚点增益 K_a = gain × confidence | `services/mood.py` |
+| `MOOD_ANCHOR_IDLE_MIN` | `30` | 锚点：静默多少分钟也触发 | `services/mood.py` |
+| `MOOD_ANCHOR_LEVEL1` | `0.35` | 锚点 level ±1 对应的绝对偏移 | `services/mood.py` |
+| `MOOD_ANCHOR_LEVEL2` | `0.7` | 锚点 level ±2 对应的绝对偏移 | `services/mood.py` |
+| `MOOD_ANCHOR_MAX_MOVE` | `0.2` | 锚点单次最大位移 | `services/mood.py` |
+| `MOOD_ANCHOR_P_ADD` | `0.02` | 锚点后 P 的回补量 | `services/mood.py` |
+| `MOOD_ANCHOR_TIMER` | `1` | 静默锚点定时器（1=开，0=只在下一条消息时补锚） | `services/mood_judge.py` |
 | `MOOD_ENV_MAX_DELTA` | `0.05` | 不是冲她来（别人之间/群气氛）时单次 Δ 上限（0.05） | `services/mood_judge.py` |
+| `MOOD_FAST_CONF` | `0.4` | 快速通道置信度 | `services/mood.py` |
+| `MOOD_FAST_FLOOR` | `-0.45` | 快速通道强负面钳位（只降不升） | `services/mood.py` |
+| `MOOD_FAST_FLOOR_LIGHT` | `-0.25` | 快速通道轻负面钳位 | `services/mood.py` |
+| `MOOD_FAST_P_FACTOR` | `1.5` | 快速通道 P 放大（>1 让下一轮判读能拉回；上限 1） | `services/mood.py` |
 | `MOOD_GLOBAL_SHARE` | `0.35` | 全局心情占会话心情的权重（0~1） | `services/mood.py` |
-| `MOOD_HALF_LIFE_HOURS` | `12` | 心情回到 0 的半衰期（小时，设计默认 12） | `services/mood.py` |
+| `MOOD_HALF_LIFE_A_GLOBAL_MIN` | `60` | 唤醒 a 的全局半衰期（分钟） | `services/mood.py` |
+| `MOOD_HALF_LIFE_A_GROUP_MIN` | `15` | 唤醒 a 的群聊半衰期（分钟） | `services/mood.py` |
+| `MOOD_HALF_LIFE_A_PRIVATE_MIN` | `60` | 唤醒 a 的私聊半衰期（分钟） | `services/mood.py` |
+| `MOOD_HALF_LIFE_D_GLOBAL_MIN` | `360` | 掌控 d 的全局半衰期（分钟） | `services/mood.py` |
+| `MOOD_HALF_LIFE_D_GROUP_MIN` | `120` | 掌控 d 的群聊半衰期（分钟） | `services/mood.py` |
+| `MOOD_HALF_LIFE_D_PRIVATE_MIN` | `360` | 掌控 d 的私聊半衰期（分钟） | `services/mood.py` |
+| `MOOD_HALF_LIFE_GLOBAL_MIN` | `360` | 全局心情半衰期（分钟） | `services/mood.py` |
+| `MOOD_HALF_LIFE_GROUP_MIN` | `30` | 群聊心情半衰期（分钟） | `services/mood.py` |
+| `MOOD_HALF_LIFE_HOURS` | `12` | ⚠️ LEGACY（P2 删）：旧单一半衰期 12h；新口径按场景 30min/2h/6h | `services/mood.py` |
+| `MOOD_HALF_LIFE_PRIVATE_MIN` | `120` | 私聊心情半衰期（分钟） | `services/mood.py` |
+| `MOOD_HARD_CAP` | `0.35` | 单次硬上限（护栏，当前参数下不触发） | `services/mood.py` |
 | `MOOD_IDLE_AFTER` | `300` | 空闲多少秒后心情开始衰减（默认 300 = 5 分钟；之后每 5 分钟向 0 走一步） | `services/mood.py` |
 | `MOOD_IDLE_STEP` | `1` | 每步走多少点（内部 -100~100 口径，1.0 ≈ 外口径 0.01） | `services/mood.py` |
 | `MOOD_IDLE_TICK` | `300` | 衰减步长（秒）：每这么久向 0 走一步（默认 300 = 5 分钟走 0.01） | `services/mood.py` |
 | `MOOD_JUDGE_CTX` | `8` | 判读时带多少条上下文（8 = 5~8 条，和主模型上下文同源同条数） | `services/mood_judge.py` |
 | `MOOD_JUDGE_FRESH_SEC` | `600` | 判读结果有效期（秒），过期不当「现在」 | `services/mood.py` |
+| `MOOD_JUDGE_MAX_PER_HOUR` | `30` | 每会话每小时最多判读几次（含补判窗口）；超了只判最后一窗 | `services/mood_judge.py` |
 | `MOOD_JUDGE_MIN_INTERVAL` | `60` | 两次判读的最小间隔（秒），防刷屏时来回震荡 | `services/mood_judge.py` |
 | `MOOD_JUDGE_REFRESH` | `300` | 她没主动写心情时，多久用群聊重新判一次（秒）。0 = 只在她说的时候判 | `services/mood_judge.py` |
-| `MOOD_JUDGE_SMOOTH` | `0.35` | 判读值平滑系数（0.35 = 每次只走 35% 的差，给心情惯性） | `services/mood.py` |
+| `MOOD_JUDGE_SMOOTH` | `0.35` | ⚠️ LEGACY（P2 删）：判读值平滑系数，旧公式用 | `services/mood.py` |
 | `MOOD_JUDGE_TIMEOUT` | `12` | 判读调用超时（秒） | `services/mood_judge.py` |
 | `MOOD_LABEL_MAX` | `60` | 心情词最多保留多少个 | `services/mood.py` |
-| `MOOD_LABEL_STEP` | `0.2` | 心情名词的分档步长（0.2 = 每 0.2 一个名词） | `services/mood.py` |
 | `MOOD_LABEL_TTL_HOURS` | `12` | 心情词的有效期（小时），过期不再当「现在」 | `services/mood.py` |
-| `MOOD_MAX_DELTA` | `0.5` | 单次「涨幅」上限（设计 0.50，只是护栏；防一边倒靠噪音丢弃） | `services/mood.py` |
+| `MOOD_MAX_DELTA` | `0.5` | ⚠️ LEGACY（P2 删）：单次涨幅上限，旧公式用 | `services/mood.py` |
 | `MOOD_MAX_SESSIONS` | `50` | 最多保留多少个会话的心情（防字典无限长） | `services/mood.py` |
-| `MOOD_MAX_STEP` | `0.3` | 单次判读最多改变多少心情（外口径，0.30 = 30 点），防一句话翻脸 | `services/mood.py` |
+| `MOOD_MAX_STEP` | `0.3` | ⚠️ LEGACY（P2 删）：单次判读最多改变多少，旧公式用 | `services/mood.py` |
 | `MOOD_NOISE_DELTA` | `0.03` | Δ 噪音门槛：|Δ| 小于它视为 0（0.03，不动数值/好感/刻痕） | `services/mood_judge.py` |
-| `MOOD_PASSIVE_MAX_DELTA` | `0.03` | 她没说话（被动观察）时单次 Δ 上限（0.03，旁观不背锅） | `services/mood_judge.py` |
+| `MOOD_P0` | `0.25` | 不确定度初值 | `services/mood.py` |
 | `MOOD_PEAK_MIN_DELTA` | `0.03` | 进入「峰值事件」候选的最小 |Δ|（0.03，防小事顶掉大事） | `services/mood.py` |
 | `MOOD_PEAK_WINDOW_SEC` | `7200` | 心情峰值事件的保质期（秒，默认 7200 = 2 小时；每件事最多挂 2 小时） | `services/mood.py` |
+| `MOOD_Q_RATE_BASE` | `0.02` | 过程噪声速率（每小时，基数） | `services/mood.py` |
+| `MOOD_Q_RATE_SLOPE` | `0.1` | 过程噪声速率（每小时，乘 reactivity） | `services/mood.py` |
+| `MOOD_RELEVANCE_GATE` | `0.25` | 窗口相关度低于此值只衰减不判读 | `services/mood.py` |
+| `MOOD_R_BASE` | `0.02` | 观测噪声基数 | `services/mood.py` |
+| `MOOD_R_SLOPE` | `0.6` | 观测噪声置信项系数 | `services/mood.py` |
+| `MOOD_SATURATION` | `0.6` | 饱和系数：Δ×(1−s×abs(v)) | `services/mood.py` |
+| `MOOD_SENS_MAX` | `1.4` | 人设敏感度上限 | `services/mood.py` |
+| `MOOD_SENS_MIN` | `0.6` | 人设敏感度下限 | `services/mood.py` |
+| `MOOD_STEP_1` | `0.1` | 观测步长 impact=±1（相对位移） | `services/mood.py` |
+| `MOOD_STEP_2` | `0.22` | 观测步长 impact=±2 | `services/mood.py` |
 | `MOOD_THINK_KEEP` | `30` | 判读心理活动保留多少条 | `services/mood_judge.py` |
+| `MOOD_WINDOW_MAX_SEC` | `300` | 判读窗口时间上限（秒）：不足 N 句但过了这么久也判（慢群防滞后） | `services/mood_judge.py` |
 
 ## 档案 / 好感
 
 | 参数 | 默认 | 说明 | 生效位置 |
 |---|---|---|---|
-| `AFFINITY_DAILY_CAP` | `0.15` | 同一个人每天好感净变化上限（0.15，防「持续跌」一天到底） | `services/profiles.py` |
+| `AFFINITY_DAILY_CAP` | `0.15` | ⚠️ LEGACY（P3 删）：旧好感日上限；新口径见 REL_DAILY_CAP | `services/profiles.py` |
 | `AFFINITY_TREND_WINDOW_SEC` | `1800` | 好感走势的统计窗口（秒） | `services/profiles.py` |
 | `AVATAR_PX` | `160` | 头像生成尺寸（像素） | `services/profile_card.py` |
 | `AVATAR_TTL_DAYS` | `7` | 头像缓存保留天数 | `services/profile_card.py` |
@@ -147,12 +191,24 @@
 | `PROFILE_MINE_MIN_MSGS` | `25` | 攒多少条发言挖一次 | `services/profile_miner.py` |
 | `PROFILE_MINE_SAMPLE` | `40` | 一次喂多少条他的发言 | `services/profile_miner.py` |
 | `PROFILE_MINE_TIMEOUT` | `25` | 档案挖掘模型超时（秒） | `services/profile_miner.py` |
+| `PROFILE_NOTE_MIN_DELTA` | `0.15` | 档案事情门槛：|Δ| 达到多少才写进档案（0.15 ≈ 只有 impact±2 的大事） | `services/profiles.py` |
+| `REL_INTIMACY_HALF_LIFE_DAYS` | `30` | 亲近半衰期（天） | `services/profiles.py` |
 | `SCENE_CARD_LINES` | `20` | 群场景卡片最多几行 | `services/profile_card.py` |
 
 ## 记忆
 
 | 参数 | 默认 | 说明 | 生效位置 |
 |---|---|---|---|
+| `ADDR_ASSERT_MIN` | `0.8` | ≥此值才敢断言「→ X」 | `services/group_scene.py` |
+| `ADDR_AT_OR_QUOTE` | `0.99` | @ 或引用她的置信度 | `services/group_scene.py` |
+| `ADDR_BACKCHANNEL` | `0.55` | 反应词/附和的置信度 | `services/group_scene.py` |
+| `ADDR_MAYBE_MIN` | `0.5` | 0.5~0.8 写「像是在回 X」；<0.5 写不确定 | `services/group_scene.py` |
+| `ADDR_NAME` | `0.7` | 正文点名的置信度 | `services/group_scene.py` |
+| `ADDR_QA_PAIR` | `0.65` | 上一句提问→这句回答的置信度 | `services/group_scene.py` |
+| `ADDR_QUOTE` | `0.95` | 引用（非 @）的置信度 | `services/group_scene.py` |
+| `ADDR_RECENT_MENTION` | `0.5` | 短句冲最近被提到的人的置信度 | `services/group_scene.py` |
+| `ADDR_VOCATIVE` | `0.8` | 开头称呼的置信度 | `services/group_scene.py` |
+| `ADDR_YOU` | `0.6` | 用了「你」的置信度 | `services/group_scene.py` |
 | `ARCHIVE_HOUR` | `3` | 每日归档执行的小时（0-23） | `plugins/memory_migration/__init__.py` |
 | `ARCHIVE_MINUTE` | `0` | 每日归档执行的分钟（0-59） | `plugins/memory_migration/__init__.py` |
 | `ARCHIVE_WINDOW_DAYS` | `30` | 归档覆盖最近多少天 | `plugins/memory_migration/__init__.py` |
@@ -162,10 +218,18 @@
 | `DIALOGUE_KEEP_DAYS` | `14` | 对话原文保留天数 | `services/dialogue_log.py` |
 | `MEMORY_REVISIT_AGE_DAYS` | `7` | 回访记忆：至少多少天前的事 | `services/memory_v2.py` |
 | `MEMORY_REVISIT_IDLE_DAYS` | `3` | 回访记忆：至少多久没提过 | `services/memory_v2.py` |
+| `MEM_MMR_CAND` | `3` | MMR 候选倍数（limit×N） | `services/memory_v2.py` |
+| `MEM_MMR_ENABLED` | `1` | 证据选择是否启用 MMR 多样性 | `services/memory_v2.py` |
+| `MEM_MMR_LAMBDA` | `0.7` | MMR 相关性权重（1=只看分数，0=只看差异） | `services/memory_v2.py` |
 | `RECALL_TEXT_MAX` | `600` | 单条记忆注入的最大字数 | `services/memory_v2.py` |
 | `REFLECT_HOUR` | `20` | 每日反思执行的小时（0-23） | `plugins/memory_migration/__init__.py` |
 | `REFLECT_MINUTE` | `0` | 每日反思执行的分钟（0-59） | `plugins/memory_migration/__init__.py` |
 | `REFLECT_WINDOW_DAYS` | `2` | 反思覆盖最近多少天 | `services/journal_agent.py` |
+| `RET_CHAR_LATENCY_MS` | `50` | 角色脑延迟目标（ms） | `services/memory_v2.py` |
+| `RET_EVIDENCE_MAX` | `5` | 最终注入证据条数上限 | `services/memory_v2.py` |
+| `RET_MAX_PER_PERSON` | `3` | 同一人最多几条（=5×60%） | `services/memory_v2.py` |
+| `RET_NEUTRAL_QUOTA` | `1` | 前 N 条至少 1 条中性/反向 | `services/memory_v2.py` |
+| `RET_SAME_PERSON_RATIO` | `0.6` | 同一人占证据的比例上限 | `services/memory_v2.py` |
 | `ROSTER_TTL` | `600` | 群成员名册缓存时间（秒） | `services/group_roster.py` |
 | `SCENE_SEED_RETRY` | `30` | 群场景首次生成的补试次数 | `services/group_scene.py` |
 | `SCENE_WINDOW_MSGS` | `20` | 「线程1 和我们的硬逻辑应该同时看 20 条来判断，而不是现在的五六条」） | `services/group_scene.py` |
@@ -186,8 +250,11 @@
 
 | 参数 | 默认 | 说明 | 生效位置 |
 |---|---|---|---|
+| `PROACTIVE_ACCEPT_BONUS` | `0.3` | accept_rate 对主动评分的加成系数 | `services/proactive.py` |
+| `PROACTIVE_ACCEPT_WINDOW_H` | `12` | 主动私聊后多久内对方回话算「接住了」（小时） | `services/proactive.py` |
 | `PROACTIVE_CHECK_SEC` | `600` | 主动私聊巡检间隔（秒） | `services/proactive.py` |
 | `PROACTIVE_COOLDOWN_H` | `6` | 两次主动私聊的最小间隔（小时） | `services/proactive.py` |
+| `PROACTIVE_GROUP_MAX_PER_DAY` | `3` | 群主动接话每天最多几次（每个群） | `services/proactive.py` |
 | `PROACTIVE_IDLE_MAX_H` | `72` | 超过多久算「太久没聊」（小时） | `services/proactive.py` |
 | `PROACTIVE_IDLE_MIN_H` | `2` | 至少多久没聊才考虑主动找（小时） | `services/proactive.py` |
 | `PROACTIVE_MAX_PER_DAY` | `2` | 主动私聊每人每天上限 | `services/proactive.py` |
@@ -195,6 +262,11 @@
 | `PROACTIVE_MIN_SCORE` | `0.9` | 候选人打分门槛 | `services/proactive.py` |
 | `PROACTIVE_QUIET_END` | `9` | 主动私聊免打扰结束小时 | `services/proactive.py` |
 | `PROACTIVE_QUIET_START` | `1` | 主动私聊免打扰开始小时 | `services/proactive.py` |
+| `RHYTHM_ACTIVE` | `1` | 表达节奏 active 的自驱乘数 | `services/proactive.py` |
+| `RHYTHM_OFF` | `1` | 表达节奏 off 的自驱乘数（=不漂移，不是不说话） | `services/proactive.py` |
+| `RHYTHM_SCATTERED` | `1.05` | 表达节奏 scattered 的自驱乘数 | `services/proactive.py` |
+| `RHYTHM_SUBTLE` | `0.9` | 表达节奏 subtle 的自驱乘数 | `services/proactive.py` |
+| `RHYTHM_WILD` | `1.1` | 表达节奏 wild 的自驱乘数 | `services/proactive.py` |
 
 ## 安静 / 破冰
 
@@ -211,15 +283,21 @@
 
 | 参数 | 默认 | 说明 | 生效位置 |
 |---|---|---|---|
+| `CTX_EVIDENCE` | `500` | 证据块上限 | `services/prompt_builder.py` |
+| `CTX_PROFILE` | `160` | 档案块上限（不含白月光） | `services/prompt_builder.py` |
+| `CTX_SOFT_CAP` | `2700` | 非 long_doc 的硬截断 | `services/prompt_builder.py` |
+| `CTX_SUMMARY` | `120` | 群摘要上限 | `services/prompt_builder.py` |
 | `PERSONA_GROUP_CHARS` | `0` | 人格文本在群聊里最多带多少字（0 = 不限） | `services/persona.py` |
 | `PERSONA_MAX_RELOADS_PER_DAY` | `2` | 改完人设不用重启容器，最多等 10 分钟就能生效。 | `services/persona.py` |
-| `PROMPT_BUDGET` | `2200` | 整份提示词的字数预算 | `services/prompt_builder.py` |
+| `PROMPT_BUDGET` | `2200` | 整份提示词的**字符**预算（与 DESIGN §3.3 同单位） | `services/prompt_builder.py` |
+| `RET_MEMORY_TOP` | `4` | 记忆块注入条数上限（0=不指定时用它） | `services/prompt_builder.py` |
 
 ## 模型调用
 
 | 参数 | 默认 | 说明 | 生效位置 |
 |---|---|---|---|
 | `CHAT_HISTORY_TURNS` | `6` | 对话历史轮数 | `services/llm.py` |
+| `CTX_HARD_CAP` | `12000` | long_doc 时的硬上限 | `services/llm.py` |
 | `GLM_MAX_TOKENS` | `800` | GLM 单次最大输出 token | `services/glm.py` |
 | `GLM_TIMEOUT` | `30` | GLM 调用超时（秒） | `services/glm.py` |
 | `HIST_LINE_BASE` | `80` | 历史里短消息给多少字 | `services/llm.py` |
@@ -230,9 +308,13 @@
 | `LLM_TRACE_KEEP_DAYS` | `7` | 模型调用 trace 保留天数 | `services/llm.py` |
 | `LLM_TRACE_MAX_CHARS` | `60000` | 单条 trace 最大字符数 | `services/llm.py` |
 | `LOCAL_MEMORY_DAYS` | `30` | 本地记忆回溯天数 | `services/llm.py` |
+| `LONG_DOC_ENABLED` | `1` | 长答模式总开关（1=用户明确要长答时放开输出/证据预算；0=回滚成普通回复） | `services/llm.py` |
+| `LONG_DOC_EVIDENCE` | `8` | 长答模式最多带几条证据（普通模式按 RET_EVIDENCE_MAX） | `services/llm.py` |
+| `LONG_DOC_MAX_TOKENS` | `2000` | 长答模式单次生成的最大 token | `services/llm.py` |
 | `MAX_REQ_ROUNDS` | `6` | 单次生成最多请求几轮 | `services/llm.py` |
 | `MAX_REQ_ROUNDS_FAST` | `2` | 快路径最多请求几轮 | `services/llm.py` |
 | `MAX_TOOL_TURNS` | `6` | 一次对话里最多几轮工具调用 | `services/llm.py` |
+| `RET_TOOLS_TOP` | `6` | 工具检索条数 | `services/llm.py` |
 | `SUMMARIZE_FALLBACK_MAX` | `1200` | 压缩失败时直接把原文给 DeepSeek（超过这个字数才截断，防止 prompt 爆炸） | `services/llm.py` |
 | `THINK_BUDGET_FAST` | `12` | 快路径思考预算（秒） | `services/llm.py` |
 | `THINK_BUDGET_SEC` | `60` | 一次回复的总思考预算（秒） | `services/llm.py` |
@@ -313,7 +395,8 @@
 
 | 参数 | 默认 | 说明 | 生效位置 |
 |---|---|---|---|
-| `AGENT_RECALL_TIMEOUT` | `6` | 算力机回忆接口超时（秒） | `services/agent_client.py` |
+| `AGENT_LIBRARY_TIMEOUT` | `14` | 图书馆 RAG 单次检索上限（秒，默认 14；实测 5~14s） | `services/agent_client.py` |
+| `AGENT_RECALL_TIMEOUT` | `3` | 算力机回忆接口超时（秒，默认 3；它在回复关键路径上） | `services/agent_client.py` |
 | `AGENT_REFLECT_QUEUE_TIMEOUT` | `600` | 算力机反思任务排队超时（秒） | `services/agent_client.py` |
 | `AGENT_REFLECT_TIMEOUT` | `180` | 算力机反思任务执行超时（秒） | `services/agent_client.py` |
 | `COVER_FULL_TTL` | `600` | 翻唱成品缓存时间（秒） | `plugins/song_cover/__init__.py` |
@@ -326,6 +409,8 @@
 | `COVER_VOICE_MAX_SEC` | `58` | 翻唱输入音频时长上限（秒） | `plugins/song_cover/__init__.py` |
 | `F0_PERIODICITY_MIN` | `0.45` | F0 周期度阈值：低于它的帧当噪声丢弃（0.45） | `services/song_gender.py` |
 | `PROBE_UPLOAD_TTL` | `900` | 探测上传的有效期（秒） | `plugins/song_cover/__init__.py` |
+| `RET_LIB_LATENCY_MS` | `3000` | 图书馆延迟目标（ms） | `services/agent_client.py` |
+| `RET_WORLD_TOP` | `3` | 图书馆候选池条数 | `services/agent_client.py` |
 | `RVC_INDEX_RATE_FEMALE` | `0.5` | 女声 RVC index 权重 | `plugins/song_cover/__init__.py` |
 | `RVC_INDEX_RATE_MALE` | `0.5` | 男声 RVC index 权重 | `plugins/song_cover/__init__.py` |
 | `RVC_PITCH_FEMALE` | `12` | 女声变调半音数 | `plugins/song_cover/__init__.py` |
@@ -356,7 +441,6 @@
 |---|---|---|---|
 | `HEARTBEAT_TIMEOUT_SEC` | `90` | 工具分发心跳超时（秒） | `plugins/tool_dispatcher/__init__.py` |
 | `HISTORY_MAX` | `20` | 模型侧历史消息条数 | `services/napcat_tools.py` |
-| `MAX_REPLY_CHARS` | `200` | .env 里留着 MAX_HISTORY 也不会有任何作用。 | `services/config.py` |
 | `NAPCAT_APPROVE_TTL` | `600` | 待批准请求有效期（秒） | `services/napcat_tools.py` |
 | `NAPCAT_TOOL_MAX_PER_MIN` | `20` | NapCat 工具每分钟最多调用次数 | `services/napcat_tools.py` |
 | `NAPCAT_TOOL_RESULT_MAX` | `550` | 回给模型的结果上限 | `services/napcat_tools.py` |
@@ -372,15 +456,98 @@
 | `BUBBLE_DELAY_BASE_MS` | `300` | 多气泡之间的基础停顿（毫秒） | `services/aura_logic.py` |
 | `BUBBLE_DELAY_MAX_MS` | `1600` | 多气泡停顿上限（毫秒，别让人等太久） | `services/aura_logic.py` |
 | `BUBBLE_DELAY_PER_CHAR` | `90` | 多气泡停顿按字数叠加（毫秒/字） | `services/aura_logic.py` |
+| `CTX_ANCHOR` | `200` | 引用锚点上限 | `services/ctx_budget.py` |
+| `CTX_CUSTOM` | `250` | 自定义样本上限（替代 style） | `services/white_moon.py` |
+| `CTX_ENFORCE` | `0` | 块级预算是否真裁剪（0=只告警，1=超限裁剪） | `services/ctx_budget.py` |
+| `CTX_EXPRESSION` | `120` | 口癖块上限 | `services/ctx_budget.py` |
+| `CTX_HISTORY` | `150` | 历史行上限 | `services/ctx_budget.py` |
+| `CTX_LONG_DOC_EVIDENCE` | `6000` | long_doc 时证据上限 | `services/ctx_budget.py` |
+| `CTX_LONG_DOC_LIBRARY` | `3000` | long_doc 时图书馆上限 | `services/ctx_budget.py` |
+| `CTX_MULTITARGET` | `120` | 多目标块上限 | `services/ctx_budget.py` |
+| `CTX_PERSONA` | `700` | 人格块上限（token） | `services/ctx_budget.py` |
+| `CTX_POST_RULES` | `320` | 硬提醒块上限 | `services/ctx_budget.py` |
+| `CTX_PROTOCOL` | `1500` | 协议块上限 | `services/ctx_budget.py` |
+| `CTX_RHYTHM` | `180` | 表达节奏上限 | `services/ctx_budget.py` |
+| `CTX_STATE` | `240` | 状态卡上限 | `services/ctx_budget.py` |
+| `CTX_STYLE` | `250` | 对方原话样本上限 | `services/ctx_budget.py` |
+| `CTX_STYLE_TOTAL` | `730` | 风格相关合计上限（不含 persona；≥ 各分项之和 730） | `services/ctx_budget.py` |
+| `CTX_TOOLS` | `300` | 工具说明上限（仅 intent=tool） | `services/ctx_budget.py` |
+| `CTX_WARN_SEC` | `600` | 同一个块超限告警的最小间隔（秒） | `services/ctx_budget.py` |
+| `CTX_WHITE_MOON` | `180` | 白月光 1 行事实上限 | `services/ctx_budget.py` |
 | `HARNESS_MAX_OUTPUT` | `3000` | Harness 桥回给 QQ 的最大字数 | `services/harness.py` |
 | `HARNESS_TIMEOUT` | `300` | Harness 桥单次调用最长秒数 | `services/harness.py` |
 | `MAX_BUBBLES` | `2` | 一条回复最多拆几个气泡 | `services/aura_logic.py` |
+| `MEM_BAD_BOOST` | `1.15` | 负性记忆存储加成（坏比好强） | `services/memdb.py` |
+| `MEM_SAL_FLOOR` | `0.045` | 倒 U 中段起点 w（u=low 时的值） | `services/memdb.py` |
+| `MEM_SAL_HIGH` | `0.6` | 倒 U 高段起点（u>此值：极端冲击回落） | `services/memdb.py` |
+| `MEM_SAL_LOW` | `0.15` | 倒 U 低段上界（u<此值：小冲击几乎不记） | `services/memdb.py` |
+| `MEM_SAL_SLOPE_LOW` | `0.3` | 倒 U 低段斜率（w=slope×u） | `services/memdb.py` |
+| `MEM_SAL_SLOPE_MID` | `2.1` | 倒 U 中段斜率 | `services/memdb.py` |
+| `MEM_SAL_TAIL` | `0.6` | 倒 U 极端回落的终点 w（u=1 时） | `services/memdb.py` |
+| `MEM_TAU_BOND` | `90` | bond 提取半衰期（天） | `services/memdb.py` |
+| `MEM_TAU_DEFAULT` | `30` | 未知 kind 的提取半衰期（天） | `services/memdb.py` |
+| `MEM_TAU_EVENT` | `30` | event 提取半衰期（天） | `services/memdb.py` |
+| `MEM_TAU_FACT` | `365` | fact 提取半衰期（天） | `services/memdb.py` |
+| `MEM_TAU_PREFERENCE` | `180` | preference 提取半衰期（天） | `services/memdb.py` |
+| `MEM_TAU_STYLE` | `365` | style 提取半衰期（天） | `services/memdb.py` |
+| `PERSONA_BASELINE_V` | `0` | 人设心情基线 -0.3~0.3（衰减回落点和锚点都叠在它上面） | `services/persona_traits.py` |
+| `PERSONA_EXPRESSIVENESS` | `0.5` | 人设表达欲 0~1（<0.3 视为冷/内敛，压借风格比例） | `services/white_moon.py` |
+| `PERSONA_FORGIVENESS` | `0.5` | 人设宽容 0~1：道歉回补 = 0.03×(0.5+forgiveness) | `services/persona_traits.py` |
+| `PERSONA_REACTIVITY` | `0.5` | 人设情绪反应 0~1：进 mood.observe 的 reactivity | `services/persona_traits.py` |
+| `PERSONA_SENSITIVITY` | `1` | 人设敏感度乘数（再夹到 MOOD_SENS_MIN/MAX） | `services/persona_traits.py` |
+| `PERSONA_TRUST_SPEED` | `0.5` | 人设信任速度 0~1：trust 正向步长 ×(0.5+trust_speed) | `services/persona_traits.py` |
+| `PERSONA_WARMTH` | `0.5` | 人设温度 0~1：好感步长 = 0.04 + 0.12×warmth | `services/persona_traits.py` |
+| `PIPELINE_BUDGET` | `16` | 回复前动态取数（心情/档案/记忆/图书馆）的总预算（秒） | `services/reply_pipeline.py` |
+| `PIPE_METRICS` | `1` | 流水线是否把每轮各步耗时落盘（周报 p95 用） | `services/reply_pipeline.py` |
+| `PIPE_STAGE_SAMPLES` | `500` | 流水线每步在内存里保留多少个耗时样本（算 p95） | `services/reply_pipeline.py` |
 | `POKE_MAX_PER_WINDOW` | `3` | 戳一戳屏蔽：窗口内最多回几次（超过就不回） | `services/poke_guard.py` |
 | `POKE_WINDOW_HOURS` | `2` | 戳一戳屏蔽的统计窗口（小时） | `services/poke_guard.py` |
+| `REL_AFFINITY_BASE` | `0` | 好感基线 | `services/relationship.py` |
+| `REL_AFFINITY_HALF_LIFE_DAYS` | `7` | 好感半衰期（天，再乘深度系数） | `services/relationship.py` |
+| `REL_CONTACT_NORM_N` | `50` | 近 7 天互动次数归一化的分母 | `services/relationship.py` |
+| `REL_DAILY_CAP` | `0.15` | 好感每日变化上限 | `services/relationship.py` |
+| `REL_DEPTH_CONTACT_COEF` | `0.5` | 深度系数里联系频率的权重 | `services/relationship.py` |
+| `REL_DEPTH_INTIMACY_COEF` | `2` | 深度系数里 intimacy 的权重 | `services/relationship.py` |
+| `REL_GRUDGE_HALF_LIFE_DAYS` | `14` | 记仇半衰期（天） | `services/relationship.py` |
+| `REL_INTIMACY_BASE` | `0` | 亲近基线 | `services/relationship.py` |
+| `REL_NEG_BASE` | `1.3` | 负面权重基数（坏比好强） | `services/relationship.py` |
+| `REL_NEG_SLOPE` | `0.6` | 负面权重里 forgiveness 的削弱系数 | `services/relationship.py` |
+| `REL_NOVELTY_COEF` | `0.6` | 防刷：novelty = 1/(1+c×n) | `services/relationship.py` |
+| `REL_RESPECT_BASE` | `0.3` | 尊重基线 | `services/relationship.py` |
+| `REL_RESPECT_DOWN` | `0.1` | 尊重负向步长 | `services/relationship.py` |
+| `REL_RESPECT_HALF_LIFE_DAYS` | `90` | 尊重半衰期（天） | `services/relationship.py` |
+| `REL_RESPECT_UP` | `0.05` | 尊重正向步长 | `services/relationship.py` |
+| `REL_TRUST_BASE` | `0.2` | 信任基线 | `services/relationship.py` |
+| `REL_TRUST_DOWN` | `0.25` | 信任失信步长 | `services/relationship.py` |
+| `REL_TRUST_HALF_LIFE_DAYS` | `45` | 信任半衰期（天） | `services/relationship.py` |
+| `REL_TRUST_UP` | `0.08` | 信任正向步长 | `services/relationship.py` |
+| `RET_FUSION_RRF` | `0` | 检索融合：0=加权求和，1=多路 RRF | `services/memdb.py` |
+| `RET_PLAN_CAND` | `400` | 规划器一次最多取多少候选 | `services/memdb.py` |
+| `RET_RECENCY_TAU_DAYS` | `30` | 新鲜度衰减时间常数（天） | `services/memdb.py` |
+| `RET_RRF_K` | `60` | RRF 融合常数（1=开启多路 RRF） | `services/memdb.py` |
+| `RET_STRENGTH_GAIN` | `0.1` | 命中后提取强度回补：r += gain×(1−r) | `services/memdb.py` |
+| `RET_STYLE_TOP` | `3` | 风格候选池条数 | `services/white_moon.py` |
+| `RET_TAG_TOP` | `5` | 每条记忆最多打几个 topic 标签 | `services/memdb.py` |
+| `RET_W_BM25` | `1` | 打分：关键词重合权重 | `services/memdb.py` |
+| `RET_W_RECENCY` | `0.4` | 打分：时间新鲜度权重 | `services/memdb.py` |
+| `RET_W_SALIENCE` | `0.5` | 打分：显著性 w（倒 U）权重 | `services/memdb.py` |
+| `RET_W_STRENGTH` | `0.6` | 打分：提取强度权重 | `services/memdb.py` |
+| `RET_W_STRUCT` | `1.2` | 打分：人/时间/情绪命中权重 | `services/memdb.py` |
+| `RET_W_TAG` | `0.8` | 打分：标签重合权重 | `services/memdb.py` |
 | `SEGMENT_HISTORY_KEEP` | `24` | 保留多少个「处理过的段」给上下文/翻历史 | `services/segments.py` |
 | `SEGMENT_MAX_MSGS` | `40` | 群聊分段：最多攒多少条（防刷屏） | `services/segments.py` |
 | `SEGMENT_MAX_SEC` | `30` | 群聊分段：最长攒多久必须处理（默认 30 秒） | `services/segments.py` |
 | `SEGMENT_WAIT_SEC` | `3.5` | 群聊分段：安静多少秒算「这一段说完了」（默认 3.5） | `services/segments.py` |
+| `STYLE_MMR_ENABLED` | `1` | 风格样本选择是否启用 MMR | `services/style_vault.py` |
+| `STYLE_MMR_LAMBDA` | `0.7` | 风格 MMR 相关性权重（λ=0.7） | `services/style_vault.py` |
+| `STYLE_VAULT_ENABLED` | `1` | 说话样本库：1=自动记每个人的原话（省流模式也记） | `services/style_vault.py` |
+| `STYLE_VAULT_MAX_SAMPLES` | `200` | 说话样本库：每个人保留最近多少条原话 | `services/style_vault.py` |
+| `STYLE_VAULT_MAX_UPLOAD_CHARS` | `4000` | 自定义风格：用户一次最多上传多少字 | `services/style_vault.py` |
+| `STYLE_VAULT_SAMPLE_CHARS` | `60` | 说话样本库：单条原话最多存多少字 | `services/style_vault.py` |
+| `WHITE_MOON_BORROW` | `0` | 白月光借风格总开关（0=只给 1 行事实，1=允许借句式） | `services/white_moon.py` |
+| `WHITE_MOON_BORROW_CHARS` | `120` | 白月光借风格块的字数上限 | `services/white_moon.py` |
+| `WHITE_MOON_BORROW_COLD_MAX` | `0.2` | 冷漠人设（expressiveness<0.3）的借风格上限 | `services/white_moon.py` |
+| `WHITE_MOON_BORROW_RATIO` | `0.3` | 借风格比例（只允许 0 / 0.3 / 0.5，代码会夹） | `services/white_moon.py` |
 | `WHITE_MOON_MIN_SCORE` | `3` | 白月光：至少多少分才算「最吃这个人的说话方式」 | `services/white_moon.py` |
 | `WHITE_MOON_STYLE_ITEMS` | `3` | 白月光：注入几条学到的说法 | `services/white_moon.py` |
 | `WHITE_MOON_STYLE_TTL` | `21600` | 白月光：说话方式多久重学一次（秒） | `services/white_moon.py` |

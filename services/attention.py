@@ -29,6 +29,8 @@
 
 import os
 
+from . import ctx_budget
+
 _DRIFT = {
     "subtle": "漂移档位：轻微。只在最近消息里有**非常自然**的触发点时才轻轻联想一句，大多数时候继续当前话题。",
     "active": "漂移档位：活跃。可以主动抓住新鲜、好笑、反差强或熟悉的细节接话，但回复仍要清楚、短、能被最近消息解释。",
@@ -65,7 +67,7 @@ def render(level: str = "", anchor: str = "", reaction: str = "") -> str:
     # ⚠️ 不要自带 `▍标题`：调用方（_behaviour_protocol 的「02d 注意力风格」）
     #    已经给了标题，再带一层就会出现「▍02d 注意力风格」下面又一行「▍注意力风格…」，
     #    模型看到两个同级标题，反而不知道哪个是主。
-    return "\n".join([
+    text = "\n".join([
         "· 可以被新鲜/好笑/反差强/熟人的细节短暂吸引，但必须有触发点；"
         "先接住再拐回正题，每轮最多一次明显跳跃。",
         "· 别人明确在问你什么就先答那个；不要自称分心、不要提 ADHD、不要说「我走神了」。",
@@ -73,6 +75,7 @@ def render(level: str = "", anchor: str = "", reaction: str = "") -> str:
         "· " + _ANCHOR.get(an, _ANCHOR["balanced"]),
         "· " + _REACTION.get(rc, _REACTION["natural"]),
     ])
+    return ctx_budget.observe("rhythm", text, source=lv)
 
 
 def status() -> str:

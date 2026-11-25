@@ -82,17 +82,23 @@ def _collect_profiles() -> dict:
 
 
 def _collect_memories(since_ts: float) -> dict:
-    """记忆目录（index）+ 窗口内记忆的详情（blocks）"""
-    idx = _read_json(memory_v2.INDEX_FILE, {"items": []}) or {"items": []}
-    items = idx.get("items", [])
+    """记忆目录 + 窗口内记忆的详情。
+
+    ⚠️ 走 `memory_v2.list_items()` / `recall_detail()`，不要直接读 index.json：
+    sqlite 后端没有那个文件，直接读会得到「0 条记忆」（2026-11-25 修）。
+    """
+    items = memory_v2.list_items(limit=300)
     recent = [
         d for d in items
-        if d.get("status") == "active"
-        and max(d.get("created_at", 0), d.get("last_hit_at", 0)) >= since_ts
+        if max(float(d.get("created_at") or 0), float(d.get("last_hit_at") or 0))
+        >= float(since_ts or 0)
     ]
     details = []
     for d in recent[:80]:
-        full = _read_json(memory_v2.BLOCK_DIR / f"{d['id']}.json", {}) or {}
+        try:
+            _full = memory_v2.recall_detail(d["id"]) or ""
+        except Exception:
+            _full = ""
         details.append({
             "id": d["id"],
             "kind": d.get("kind", ""),
@@ -100,7 +106,7 @@ def _collect_memories(since_ts: float) -> dict:
             "emotion_hit": d.get("emotion_hit", False),
             "importance": d.get("importance", 0.5),
             "summary": d.get("summary", ""),
-            "text_full": (full.get("text_full") or "")[:800],
+            "text_full": _full[:800],
         })
     catalog = [
         {
@@ -111,8 +117,7 @@ def _collect_memories(since_ts: float) -> dict:
             "emotion_hit": d.get("emotion_hit", False),
             "at": d.get("created_at", 0),
         }
-        for d in sorted(items, key=lambda x: -x.get("created_at", 0))[:120]
-        if d.get("status") == "active"
+        for d in sorted(items, key=lambda x: -float(x.get("created_at") or 0))[:120]
     ]
     return {
         "catalog": catalog,
@@ -204,15 +209,16 @@ def _find_by_keyword(keyword: str) -> list:
     if not kw:
         return []
     try:
-        idx = memory_v2._load_index() or {"items": []}
+        items = memory_v2.list_items(limit=500)
     except Exception:
         return []
     hits = []
-    for d in idx.get("items", []):
-        if d.get("status") != "active":
-            continue
-        full = _read_json(memory_v2.BLOCK_DIR / f"{d['id']}.json", {}) or {}
-        blob = f"{d.get('summary', '')}\n{full.get('text_full', '')}"
+    for d in items:
+        try:
+            _full = memory_v2.recall_detail(d["id"]) or ""
+        except Exception:
+            _full = ""
+        blob = f"{d.get('summary', '')}\n{_full}"
         if kw in blob:
             hits.append(d["id"])
     return hits

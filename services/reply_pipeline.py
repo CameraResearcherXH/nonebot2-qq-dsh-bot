@@ -23,9 +23,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import time
+from collections import deque
+from pathlib import Path
 
 from core import tuning
+from . import perf_stats, ctx_budget
 
 try:
     from nonebot import logger
@@ -36,6 +41,56 @@ except Exception:  # pragma: no cover
 
 BUDGET = tuning.f("PIPELINE_BUDGET")
 STATS: dict = {"runs": 0, "stage_ms": {}, "last": {}}
+
+# p95 周报（DESIGN §8：stages 记 ms/状态；每周看 p95，只优化最慢一块）
+_STAGE_SAMPLES = max(30, tuning.i("PIPE_STAGE_SAMPLES"))
+METRICS_ON = bool(tuning.i("PIPE_METRICS"))
+METRICS_FILE = Path(os.getenv("PIPE_METRICS_FILE", "data/metrics/pipeline_stages.jsonl"))
+# 指标文件按轮追加；超过 8MB 只留最近 5000 行，避免一年后变成巨型文件。
+METRICS_MAX_BYTES = 8 * 1024 * 1024
+METRICS_KEEP_LINES = 5000
+STAGE_SAMPLES: dict = {}          # name -> deque[ms]
+_TURN_MS: dict = {}               # 当前这一轮各步耗时
+
+
+def _pct(xs, q: float) -> float:
+    """分位数（最近邻法；样本少时也不会越界）。"""
+    vals = sorted(float(x) for x in (xs or []) if x is not None)
+    if not vals:
+        return 0.0
+    k = min(len(vals) - 1, max(0, int(round((len(vals) - 1) * float(q)))))
+    return vals[k]
+
+
+def p95_of(name: str) -> float:
+    return _pct(list(STAGE_SAMPLES.get(name) or []), 0.95)
+
+
+def _write_turn_metrics(session_key: str, stages: dict, cost: float) -> None:
+    if not METRICS_ON or not _TURN_MS:
+        return
+    try:
+        METRICS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "ts": time.time(),
+            "session": str(session_key or ""),
+            "cost_ms": round(float(cost or 0) * 1000, 1),
+            "stages": {k: round(float(v), 1) for k, v in _TURN_MS.items()},
+            "status": dict(stages or {}),
+        }
+        with METRICS_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        try:
+            if METRICS_FILE.stat().st_size > METRICS_MAX_BYTES:
+                lines = METRICS_FILE.read_text(
+                    encoding="utf-8", errors="ignore").splitlines()
+                METRICS_FILE.write_text(
+                    "\n".join(lines[-METRICS_KEEP_LINES:]) + "\n",
+                    encoding="utf-8")
+        except Exception:
+            pass
+    except Exception as e:
+        logger.debug(f"[PIPE] 写 p95 指标失败: {type(e).__name__}: {e}")
 
 # 每一步的小标题（≤30 字，用户 2026-11-24：每块要有清晰总结，方便检查）
 SUMMARY = {
@@ -59,24 +114,31 @@ def _hdr(name: str) -> str:
     return f"▍{name}｜{SUMMARY.get(name, '')}".rstrip("｜")
 
 
+# 只留「明确在提旧事 / 追问事实」的词；「那个 / 什么 / 怎么 / 知道」在闲聊里
+# 太常见，留着会让图书馆几乎每轮都触发（2026-11-25 真机日志实锤）。
 _LIB_QUESTION_HINTS = (
-    "？", "?", "吗", "呢", "谁", "什么", "怎么", "为什么", "为啥", "哪",
-    "多少", "记得", "之前", "上次", "以前", "曾经", "说过", "知道",
-    "是不是", "有没有", "还记得", "那个", "那件事", "后来",
+    "记得", "之前", "上次", "以前", "曾经", "说过", "还记得", "那件事", "后来",
+    "是不是", "有没有", "为什么", "为啥", "谁说的", "多少钱",
 )
 
 
 def _want_library(text: str) -> bool:
     """这条消息值不值得花 5~14s 查图书馆（久远归档）。
 
-    RAG 一次要 5~14s；对「哈哈哈」「好」这种没必要。只在像问事/提旧事时查。
+    RAG 一次要 5~14s。2026-11-25 修正：旧版「命中『那个/什么/怎么』或 ≥12 字」就查，
+    真机日志里几乎每条消息都触发（图书馆 1 命中/每轮），既拖慢流水线又往 prompt 里
+    塞无关事实。现在只认「明确提旧事 / 真在问事」两种。
     """
     t = str(text or "").strip()
     if len(t) < 4:
         return False
     if any(k in t for k in _LIB_QUESTION_HINTS):
         return True
-    return len(t) >= 12
+    # 问句 + 具体疑问词才查；纯陈述句不查
+    if ("？" in t or "?" in t) and any(
+            k in t for k in ("谁", "什么", "怎么", "哪", "多少", "吗", "呢")):
+        return True
+    return False
 
 
 def _mark(name: str, t0: float) -> None:
@@ -84,6 +146,8 @@ def _mark(name: str, t0: float) -> None:
     d = STATS["stage_ms"].setdefault(name, {"n": 0, "ms": 0.0})
     d["n"] += 1
     d["ms"] = (d["ms"] * (d["n"] - 1) + ms) / d["n"]
+    STAGE_SAMPLES.setdefault(name, deque(maxlen=_STAGE_SAMPLES)).append(ms)
+    _TURN_MS[name] = ms
 
 
 async def _step(name: str, coro, timeout: float, default=None):
@@ -113,6 +177,7 @@ async def build(
     """跑完整流水线，返回 {text, stages, summary, replied, cost}。"""
     t_all = time.monotonic()
     STATS["runs"] = int(STATS.get("runs") or 0) + 1
+    _TURN_MS.clear()
     blocks: list = []
     stages: dict = {}
     deadline = t_all + max(1.0, BUDGET)
@@ -158,6 +223,7 @@ async def build(
             _body = f"· 心情值 {_v:+.0f}（-100~100，只影响语气浓淡）"
             if _lb:
                 _body += f"\n· 她自己写的感觉：{_lb}"
+        _body = ctx_budget.observe("state", _body, source=session_key)
         blocks.append(_hdr("状态") + "\n" + _body[:460])
         stages["状态"] = "✓"
     except Exception as e:
@@ -191,14 +257,23 @@ async def build(
                 _lines.append(f"· {_t}：{_v[:60]}")
         if _bond:
             _lines.append(f"· 你对他的好感：{_bond}")
+        # 2026-11-25：这里以前再调一次 memory_v2.recall 取「印象最深的事」，
+        # 和下面的「记忆」块重复。现在改读档案自己的 bond.notes（已按 |Δ| 过滤过），
+        # 档案只放「大波动」的事，记忆块负责细节。
         _top = ""
         try:
-            from . import memory_v2
-            _hits = memory_v2.recall(_nm or "他", limit=3,
-                                     speaker_qq=speaker_qq, gid=gid) or []
-            if _hits:
-                _best = max(_hits, key=lambda h: float(h.get("salience") or 0))
-                _top = f"{str(_best.get('summary') or '')[:40]}（{_best.get('ago')}）"
+            _b = profiles.get_bond(speaker_qq) or {}
+            _notes = [n for n in (_b.get("notes") or [])
+                      if str(n.get("text") or "").strip()]
+            if _notes:
+                _best = max(_notes, key=lambda n: (abs(float(n.get("delta") or 0)),
+                                                   float(n.get("weight") or 0),
+                                                   float(n.get("at") or 0)))
+                _d = max(0.0, time.time() - float(_best.get("at") or 0))
+                _ago = (f"{int(_d // 60)} 分钟前" if _d < 3600 else
+                        f"{int(_d // 3600)} 小时前" if _d < 86400 else
+                        f"{int(_d // 86400)} 天前")
+                _top = f"{str(_best.get('text') or '')[:40]}（{_ago}）"
                 _lines.append(f"· 你俩印象最深的一件事：{_top}")
         except Exception:
             pass
@@ -241,8 +316,10 @@ async def build(
                      else _txt_s.strip()[:120])
         # 只对「像在问事/提旧事」的消息查图书馆；纯插科打诨不花这 5~14s。
         if _want_library(_lib_seed):
-            _lib_task = asyncio.create_task(
-                _ac0.recall(_lib_seed, speaker_qq=speaker_qq, recent_ctx=[]))
+            from . import config as _cfg
+            if _cfg.power_on("library"):
+                _lib_task = asyncio.create_task(
+                    _ac0.recall(_lib_seed, speaker_qq=speaker_qq, recent_ctx=[]))
     except Exception:
         _lib_task = None
 
@@ -365,7 +442,9 @@ async def build(
                 _wm = white_moon.render_style_only(gid, _tq, speaker_name)
                 if _wm:
                     # 自定义风格可能是一整套样本，给足 900 字；普通风格摘要很短
-                    blocks.append(_wm.strip()[:900])
+                    _wm = ctx_budget.observe("white_moon", _wm.strip(),
+                                             source=session_key)
+                    blocks.append(_wm[:900])
                     stages["白月光"] = "✓"
                 else:
                     stages["白月光"] = "—(没样本)"
@@ -380,7 +459,9 @@ async def build(
                      "session": str(session_key or ""),
                      "speaker_qq": str(speaker_qq or ""),
                      "speaker_name": str(speaker_name or ""),
-                     "src_text": str(text or "")[:120]}
+                     "src_text": str(text or "")[:120],
+                     "stage_ms": dict(_TURN_MS)}
+    _write_turn_metrics(session_key, stages, cost)
     logger.info(
         f"[PIPE] {session_key} {cost:.1f}s｜拉了 {','.join(k for k in STAGE_ORDER if k in stages) or '无'}"
         f"｜{len(text_out)} 字｜{stages}")
@@ -428,9 +509,24 @@ def stats_text() -> str:
     """`/测函数 流水线`：每一步的耗时 + 上次到底拿到了什么。"""
     if not STATS["runs"]:
         return "· 流水线：还没跑过"
-    parts = [f"· 流水线：跑了 {STATS['runs']} 次"]
-    for k, v in sorted(STATS["stage_ms"].items(), key=lambda kv: -kv[1]["ms"]):
-        parts.append(f"    {k}: {v['ms']:.0f}ms（{v['n']} 次）")
+    parts = [f"· 流水线：跑了 {STATS['runs']} 次"
+             f"（p95 按最近 ≤{_STAGE_SAMPLES} 次/步）"]
+    rows = []
+    for k, v in STATS["stage_ms"].items():
+        xs = list(STAGE_SAMPLES.get(k) or [])
+        rows.append((k, v, _pct(xs, 0.50), p95_of(k)))
+    rows.sort(key=lambda x: -x[3])
+    for i, (k, v, p50, p95) in enumerate(rows):
+        flag = "  ← 最慢" if i == 0 and len(rows) > 1 else ""
+        parts.append(f"    {k}: 均值 {v['ms']:.0f}ms｜p50 {p50:.0f}ms"
+                     f"｜p95 {p95:.0f}ms（{v['n']} 次）{flag}")
+    try:
+        rep = perf_stats.p95_report(7)
+        if rep.get("turns"):
+            parts.append(f"· 近 7 天：{rep['turns']} 轮｜整轮 p95 "
+                         f"{rep['turn_p95_ms']:.0f}ms｜最慢 {rep['slowest_stage']}")
+    except Exception:
+        pass
     last = STATS.get("last") or {}
     if last:
         _st = last.get("stages") or {}

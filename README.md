@@ -99,6 +99,20 @@ rvc_pipeline.py    RVC 音域对齐 / 变调 / 混音流水线
 
 依赖方向：`plugins → services → core`（`scripts/check_deps.py` 会检查）。
 
+## 质量闸门（改完代码先跑这个）
+
+```bash
+python3 scripts/verify_all.py            # 9 道闸门：编译/依赖/调参/名字/挂载/接线/功能链路/单测/三方
+python3 scripts/check_tuning.py --strict # 参数是否真接线（AST；注释里写键名不算）
+python3 scripts/check_design_docs.py --runtime --strict
+                                         # 文档数 = 设计常量 + 运行时接线/线上覆盖
+md5sum -c --quiet deploy_manifest.txt    # 仓库文件与部署清单一致
+```
+
+> 优先在容器里跑（`docker exec qq-grok-bot python3 scripts/verify_all.py`）：
+> 宿主机常常只有 Python 3.8，缺 `nonebot/httpx`，会出假失败。
+> 详见 [部署指南 §5](docs/deployment.md)。
+
 ## 文档
 
 从 [docs/README.md](docs/README.md) 开始：

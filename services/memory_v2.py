@@ -7,7 +7,9 @@
   - 过期：标 status="outdated"，不删
 """
 from core import tuning
+from . import memdb as _memdb
 import json
+import logging
 import math
 import os
 import re
@@ -17,10 +19,23 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
+_log = logging.getLogger(__name__)
+
 # recall 返回的原文长度上限。
 # block 里存的是完整原文（text_full，最多 2000 字），但一次召回 4~5 条全塞进
 # prompt 会直接把预算吃光，所以这里截断；复盘要全文时读 text_full 字段。
 RECALL_TEXT_MAX = tuning.i("RECALL_TEXT_MAX")
+# 检索口径（DESIGN §3.4）：证据 ≤5、每人 ≤3（=5×60%）、反向保底 1 条、角色脑 ≤50ms
+RET_EVIDENCE_MAX = tuning.i("RET_EVIDENCE_MAX")
+# RET_MEMORY_TOP（记忆块注入条数）在 prompt_builder.build_packet 里生效。
+RET_MAX_PER_PERSON = tuning.i("RET_MAX_PER_PERSON")
+RET_SAME_PERSON_RATIO = tuning.f("RET_SAME_PERSON_RATIO")
+RET_NEUTRAL_QUOTA = tuning.i("RET_NEUTRAL_QUOTA")
+RET_CHAR_LATENCY_MS = tuning.f("RET_CHAR_LATENCY_MS")
+# 检索二期：MMR 多样性（证据不能 5 条全是同一件事/同一个人）
+MMR_ENABLED = tuning.i("MEM_MMR_ENABLED")
+MMR_LAMBDA = tuning.f("MEM_MMR_LAMBDA")
+MMR_CAND = tuning.i("MEM_MMR_CAND")
 
 MEM_DIR = Path("data/memory")
 BLOCK_DIR = MEM_DIR / "blocks"
@@ -31,6 +46,33 @@ INDEX_FILE = MEM_DIR / "index.json"
 # 存储后端：json（现状，默认） / sqlite（services/memdb.py）
 # 切换方式：MEMORY_BACKEND=sqlite；回滚：改回 json，原 JSON 文件不删。
 BACKEND = (os.getenv("MEMORY_BACKEND", "json") or "json").strip().lower()
+# P4 检索规划器：sqlite 后端下默认启用（人→时间→情绪→标签→关键词）。
+# 回滚：RETRIEVAL_PLANNER=0 走旧的 recall()（单路关键词 + 加权分）。
+PLANNER = (os.getenv("RETRIEVAL_PLANNER", "true") or "true").strip().lower() in (
+    "1", "true", "yes", "on")
+
+# 双写（2026-11-25）：json 后端每写一条记忆，同时镜像到 sqlite。
+# 目的：先把 sqlite 的 memories 喂满，等两边条数一致再切 MEMORY_BACKEND=sqlite，
+# 避免「切完旧记忆搜不到」。默认开；MEMORY_DUAL_WRITE=0 可关。
+DUAL_WRITE = (os.getenv("MEMORY_DUAL_WRITE", "1") or "1").strip().lower() in (
+    "1", "true", "yes", "on")
+
+
+def _dual_mirror(**kw) -> str:
+    """把一条 json 记忆镜像到 sqlite；失败只记 debug，绝不影响主链路。"""
+    if BACKEND == "sqlite" or not DUAL_WRITE:
+        return ""
+    try:
+        from . import memdb
+        mid = memdb.remember(**kw)
+        # 用 print 而不是 logger：memory_v2 的 logger 在容器里没有 handler，
+        # INFO 会静默丢弃（2026-11-25 真机验证时发现 [MEM] 一条都看不到）。
+        print(f"[MEM] dual-write {str(mid)[:10]} "
+              f"turn={str(kw.get('turn_id') or '')[:12]}", flush=True)
+        return mid
+    except Exception as e:
+        _log.debug(f"[MEM] dual-write 失败: {type(e).__name__}: {e}")
+        return ""
 
 
 # ================== 基础存储 ==================
@@ -91,7 +133,8 @@ def remember(
     mood_word: str = "",
     mood_value: float | None = None,
     # 2026-11-20：记忆的「刻痕」来自**涨幅 Δ**，不是当前心情水平。
-    #   delta   —— 这件事让她的心情变了多少（-2~+2，判读原值之差）
+    #   delta   —— 这次的步长（±0.10 / ±0.22，由 impact 档位决定），不是心情水平
+    #   mood_value —— 更新后的心情水平（-1~1），两者不要混用
     #   salience—— min(1, |delta|/0.5)，决定 💥 档位 / 检索加成 / 遗忘速度
     #   valence —— sign(delta)，好/坏
     delta: float | None = None,
@@ -132,6 +175,13 @@ def remember(
     _val = (float(valence) if valence is not None
             else (0.0 if _delta in (None, 0) else (1.0 if _delta > 0 else -1.0)))
     _ehit = bool(emotion_hit) or _ew >= 0.5
+    _mirror_kw = dict(
+        text=text, kind=kind, about_qq=about_qq, tags=tags,
+        importance=importance, emotion_hit=emotion_hit,
+        emotion_weight=emotion_weight, mood_word=mood_word,
+        mood_value=mood_value, gid=gid, session=session,
+        delta=delta, salience=salience, valence=valence,
+        turn_id=turn_id, mind=mind)
     tokens = tokenize(text)
     token_set = set(tokens)
 
@@ -167,6 +217,7 @@ def remember(
             if mind:
                 full["mind"] = str(mind)[:100]
             f.write_text(json.dumps(full, ensure_ascii=False, indent=2), encoding="utf-8")
+            _dual_mirror(**_mirror_kw)
             return d["id"]
 
     # 2) 高度相似（Jaccard >= 0.85）→ 合并进旧记忆
@@ -211,6 +262,7 @@ def remember(
         if mind:
             full["mind"] = str(mind)[:100]
         f.write_text(json.dumps(full, ensure_ascii=False, indent=2), encoding="utf-8")
+        _dual_mirror(**_mirror_kw)
         return best_id
 
     # 3) 全新的记忆 → 写
@@ -265,6 +317,7 @@ def remember(
         "tokens": tokens,
     })
     _save_index(idx)
+    _dual_mirror(**_mirror_kw)
     return mid
 
 def upsert_turn(turn: dict) -> str:
@@ -286,7 +339,7 @@ def upsert_turn(turn: dict) -> str:
 
 
 _PATCHABLE = ("delta", "salience", "valence", "mood_word", "mood_value",
-              "mind", "title", "importance")
+              "mind", "title", "importance", "about_qq")
 
 
 def patch_turn(turn_id: str, **fields) -> bool:
@@ -473,24 +526,105 @@ def _emo_of(d: dict) -> float:
     return 0.6 if d.get("emotion_hit") else 0.0
 
 
-def _forget_factor(now: float, last_hit: float, emotion_weight: float = 0.0) -> float:
-    """
-    越久没被想起 → 权重越低（但不会归零）。
+def _forget_factor(now: float, last_hit: float, emotion_weight: float = 0.0,
+                   kind: str = "event") -> float:
+    """越久没被想起 → 权重越低（但不会归零）。
 
-    维度②：情绪越强，衰减越慢 —— `30 * (1 + 2*emo)` 天的时间常数：
-      emo=0 → 30 天（30 天后 37%）
-      emo=0.5 → 60 天
-      emo=1.0 → 90 天（90 天后才 37%）
+    emotion §6：衰减按 **kind 的提取半衰期 τ_kind**（event 30 / bond 90 /
+    fact 365 / preference 180 / style 365 天），不再是「情绪越强越慢」。
+    显著性改由倒 U 的 `salience_weight()` 进入打分（极端冲击会回落）。
     """
     days = max(0.0, (now - last_hit) / 86400.0)
-    tau = 30.0 * (1.0 + 2.0 * max(0.0, min(1.0, float(emotion_weight or 0))))
-    return math.exp(-days / tau)
+    return math.exp(-days / max(1.0, _memdb.tau_days(kind)))
+
+
+def _tok_set(d: dict) -> set:
+    """取一条证据的 token 集合（sqlite 行给空格串，json 索引给 list）。"""
+    raw = (d or {}).get("tokens")
+    if isinstance(raw, (set, list, tuple)):
+        return {str(x) for x in raw if str(x).strip()}
+    if isinstance(raw, str) and raw.strip():
+        return set(raw.split())
+    return set(tokenize(str((d or {}).get("summary") or (d or {}).get("text") or "")))
+
+
+def _diversify(scored: list, limit: int) -> list:
+    """证据选法（DESIGN §3.4）：先按人分组，每人 ≤ cap；再 MMR 去近重复。
+
+    cap = min(RET_MAX_PER_PERSON, round(limit × RET_SAME_PERSON_RATIO))，
+    5 条时 = min(3, 3) = 3。另保底 RET_NEUTRAL_QUOTA 条中性/反向证据，
+    避免 top5 全同向（「反向保底」）。
+
+    MMR（检索二期）：候选先多取 `limit×MEM_MMR_CAND` 条，再按
+    `λ×相关性 − (1−λ)×与已选的最大相似度` 贪心选。只按分数排会
+    让「同一件事被记了 3 遍」占满 5 条证据。
+    """
+    if limit <= 0 or not scored:
+        return []
+    cap = max(1, min(RET_MAX_PER_PERSON,
+                     int(round(limit * RET_SAME_PERSON_RATIO)) or 1))
+    want = max(limit, limit * max(1, int(MMR_CAND or 1)))
+    cand, per = [], {}
+    for sc, d in scored:
+        who = str((d.get("about_qq") if isinstance(d, dict) else "") or "")
+        if who and per.get(who, 0) >= cap:
+            continue
+        per[who] = per.get(who, 0) + 1
+        cand.append((sc, d))
+        if len(cand) >= want:
+            break
+    # 候选不够（人或配额把池子砍空）→ 忽略 cap 补足，宁可重复也不能空
+    if len(cand) < limit:
+        seen = {id(d) for _, d in cand}
+        for sc, d in scored:
+            if id(d) in seen:
+                continue
+            cand.append((sc, d))
+            if len(cand) >= limit:
+                break
+
+    if int(MMR_ENABLED or 0) and len(cand) > limit:
+        from . import mmr
+        max_sc = max((float(s or 0) for s, _ in cand), default=1.0) or 1.0
+        # 先给每条候选算一次 token 集合：MMR 要比较 ~O(k²) 对，
+        # 每对都 split 一次字符串会把 15ms 花在同一个动作上（实测）。
+        _toks = {id(d): _tok_set(d) for _, d in cand}
+
+        def _sim(a, b):
+            ta = _toks.get(id(a[1])) or set()
+            tb = _toks.get(id(b[1])) or set()
+            if not ta or not tb:
+                return 0.0
+            return len(ta & tb) / max(1, len(ta | tb))
+
+        picked = mmr.pick(
+            cand, limit,
+            relevance=lambda x: float(x[0] or 0) / max_sc,
+            similarity=_sim,
+            lam=float(MMR_LAMBDA or 0.7))
+    else:
+        picked = cand[:limit]
+
+    # 反向/中性保底：全同向时替换掉分数最低的一条
+    if RET_NEUTRAL_QUOTA > 0 and picked:
+        def _neu(d):
+            try:
+                return abs(float((d or {}).get("delta") or 0.0)) <= 0.001
+            except Exception:
+                return True
+        have = sum(1 for _, d in picked if _neu(d))
+        if have < RET_NEUTRAL_QUOTA:
+            for sc, d in scored:
+                if _neu(d) and all(d is not x for _, x in picked):
+                    picked[-1] = (sc, d)
+                    break
+    return picked
 
 
 def recall(
     query: str,
     *,
-    limit: int = 5,
+    limit: int = 0,
     speaker_qq: str = "",
     min_score: float = 0.05,
     max_age_days: float = 0.0,
@@ -514,11 +648,31 @@ def recall(
         和翻页不算 —— 否则「越常被翻目录的记忆越不遗忘」，
         遗忘曲线会被自己的检索行为污染（2026-11-17 审计）。
     """
+    limit = int(limit or RET_EVIDENCE_MAX)
+    _t0 = time.time()
     if BACKEND == "sqlite":
         from . import memdb
-        return memdb.recall(query, limit=limit, speaker_qq=speaker_qq,
-                            min_score=min_score, max_age_days=max_age_days,
-                            gid=gid, mark_hit=mark_hit)
+        # 先多取候选（MMR/每人配额需要替换空间），最后只把真正选中的记为命中。
+        _cand = max(limit, limit * max(1, int(MMR_CAND or 1)))
+        if PLANNER:
+            _rows = memdb.recall_planned(
+                query, limit=_cand, speaker_qq=speaker_qq,
+                min_score=min_score, max_age_days=max_age_days,
+                gid=gid, mark_hit=False)
+        else:
+            _rows = memdb.recall(query, limit=_cand, speaker_qq=speaker_qq,
+                                 min_score=min_score, max_age_days=max_age_days,
+                                 gid=gid, mark_hit=False)
+        _pairs = [(float((r or {}).get("score") or 0.0), r) for r in (_rows or [])]
+        _picked = _diversify(_pairs, limit)
+        if _picked and mark_hit:
+            memdb.note_hits([r.get("id") for _, r in _picked])
+        _ms = (time.time() - _t0) * 1000.0
+        # 50ms 目标是 **sqlite 角色脑** 的口径；json 后端是 O(N) 全量扫描（实测 ~1s），
+        # 在这里告警只会刷屏，所以只在 sqlite 下报。
+        if BACKEND == "sqlite" and _ms > RET_CHAR_LATENCY_MS:
+            _log.warning(f"[RECALL] 角色脑 {_ms:.0f}ms > 目标 {RET_CHAR_LATENCY_MS:.0f}ms")
+        return [r for _, r in _picked]
     idx = _load_index()
     docs = [d for d in idx["items"] if d.get("status") == "active"]
     if not docs:
@@ -555,19 +709,23 @@ def recall(
 
         w_imp = 0.5 + d.get("importance", 0.5)  # 0.5~1.5
 
-        # 维度②：情绪强度参与打分（0 → 1.0 倍，1 → 3.5 倍）
+        # 维度②：显著性 w（倒 U）参与打分（中等冲击最显著，极端回落）
         _ew = _emo_of(d)
-        w_emo = 1.0 + 2.5 * _ew
+        w_emo = 1.0 + 2.0 * _memdb.salience_weight(_ew)
 
-        # 维度①：时间衰减，但情绪越强衰减越慢
-        w_forget = _forget_factor(now, d.get("last_hit_at", now), _ew)
+        # 维度①：提取强度按 kind 的 τ_kind 衰减（event 30 / fact 365 天）
+        w_forget = _forget_factor(now, d.get("last_hit_at", now), _ew,
+                                  kind=str(d.get("kind") or "event"))
 
         score = base * w_speaker * w_imp * w_emo * w_forget
         if score >= min_score:
             scored.append((score, d))
 
     scored.sort(key=lambda x: -x[0])
-    top = scored[:limit]
+    top = _diversify(scored, limit)
+    _ms = (time.time() - _t0) * 1000.0
+    if BACKEND == "sqlite" and _ms > RET_CHAR_LATENCY_MS:
+        _log.warning(f"[RECALL] 角色脑 {_ms:.0f}ms > 目标 {RET_CHAR_LATENCY_MS:.0f}ms")
 
     # 命中 → 更新 last_hit_at / hit_count（浏览目录不算，见 mark_hit 说明）
     if top and mark_hit:
@@ -619,6 +777,21 @@ def recent_about(qq: str, *, gid: str = "", limit: int = 3) -> list:
         return memdb.recent_about(qq, gid=gid, limit=limit)
     except Exception:
         return []
+
+
+def list_items(limit: int = 300, since_ts: float = 0.0) -> list:
+    """统一的 active 记忆列表（json 读索引；sqlite 读 memories 表）。
+
+    ⚠️ 不要直接读 `INDEX_FILE`：sqlite 后端下那个文件是空的，
+    周报 / 复盘 / 日记会以为「一条记忆都没有」。
+    """
+    if BACKEND == "sqlite":
+        from . import memdb
+        return memdb.list_memories(limit=limit, since_ts=since_ts)
+    idx = _load_index()
+    return [d for d in idx.get("items", [])
+            if d.get("status") == "active"
+            and float(d.get("created_at") or 0) >= float(since_ts or 0)]
 
 
 def recall_catalog(query: str, *, offset: int = 0, limit: int = 10,
@@ -712,6 +885,12 @@ def revisit_candidate(about_qq: str, *, min_age_days: float | None = None,
             min_idle_days = tuning.f("MEMORY_REVISIT_IDLE_DAYS")
         except Exception:
             min_idle_days = 3.0
+    if BACKEND == "sqlite":
+        from . import memdb
+        r = memdb.revisit_candidate(
+            str(about_qq), min_age_days=float(min_age_days),
+            min_idle_days=float(min_idle_days))
+        return r or None
     try:
         idx = _load_index()
     except Exception:
@@ -1064,6 +1243,64 @@ def health_report(dup_threshold: float = 0.8,
       ③ 主题分布 / 情绪刻痕占比
     只读不改，给 `/记忆体检` 用。
     """
+    if BACKEND == "sqlite":
+        from . import memdb
+        memdb.init()
+        c = memdb._conn()
+        now = time.time()
+        total = c.execute("SELECT count(*) FROM memories").fetchone()[0]
+        active_n = c.execute(
+            "SELECT count(*) FROM memories WHERE status='active'").fetchone()[0]
+        emo_n = c.execute(
+            "SELECT count(*) FROM memories WHERE status='active' AND salience>=0.5"
+        ).fetchone()[0]
+        # ① 近 200 条做 token Jaccard（和 json 版同口径，量级可控）
+        rows = c.execute(
+            "SELECT id,title,detail,tokens FROM memories WHERE status='active' "
+            "ORDER BY ts DESC LIMIT 200").fetchall()
+        sets = [(r["id"], (r["title"] or r["detail"] or "")[:40],
+                 set((r["tokens"] or "").split())) for r in rows]
+        sets = [x for x in sets if x[2]]
+        dups = []
+        for i in range(len(sets)):
+            for j in range(i + 1, len(sets)):
+                inter = len(sets[i][2] & sets[j][2])
+                if not inter:
+                    continue
+                jac = inter / len(sets[i][2] | sets[j][2])
+                if jac >= dup_threshold:
+                    dups.append({"a": sets[i][0], "a_text": sets[i][1],
+                                 "b": sets[j][0], "b_text": sets[j][1],
+                                 "sim": round(jac, 2)})
+        dups.sort(key=lambda x: -x["sim"])
+        # ② 长期未命中
+        stale_rows = c.execute(
+            "SELECT id,title,detail,last_hit_at FROM memories "
+            "WHERE status='active' AND hit_count=0 AND last_hit_at<=? "
+            "ORDER BY last_hit_at ASC LIMIT 10",
+            (now - float(stale_days) * 86400,)).fetchall()
+        stale = [{"id": r["id"], "text": (r["title"] or r["detail"] or "")[:40],
+                  "days": round((now - float(r["last_hit_at"] or now)) / 86400, 1)}
+                 for r in stale_rows]
+        stale_total = c.execute(
+            "SELECT count(*) FROM memories WHERE status='active' "
+            "AND hit_count=0 AND last_hit_at<=?",
+            (now - float(stale_days) * 86400,)).fetchone()[0]
+        # ③ 分布
+        tags = [{"t": r[0], "n": r[1]} for r in c.execute(
+            "SELECT tag_value,count(*) n FROM memory_tags "
+            "GROUP BY tag_value ORDER BY n DESC LIMIT 8")]
+        kinds = [{"k": r[0], "n": r[1]} for r in c.execute(
+            "SELECT kind,count(*) n FROM memories WHERE status='active' "
+            "GROUP BY kind ORDER BY n DESC")]
+        return {
+            "total": total, "active": active_n, "outdated": total - active_n,
+            "emotion_hit": emo_n,
+            "dups": dups[:10], "dup_total": len(dups),
+            "stale": stale, "stale_total": stale_total,
+            "tags": [(x["t"], x["n"]) for x in tags],
+            "kinds": [(x["k"], x["n"]) for x in kinds],
+        }
     idx = _load_index()
     items = idx["items"]
     active = [d for d in items if d.get("status") == "active"]

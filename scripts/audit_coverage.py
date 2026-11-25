@@ -178,10 +178,18 @@ def check_placeholders():
 
 # ---------------- G 参数没人读 ----------------
 def check_unread_params():
-    from core.tuning import DEFAULTS
+    """参数空转 = 有默认值、但代码里没人读。
+
+    `tuning.UNWIRED` 里的是**已登记**的设计先行键（口径定了、实现还没接），
+    不算硬伤；它们由 `check_tuning.py` 反向盯着（接线后必须从名单删掉）。
+    这里只报「名单外」的空转，避免新加的键悄悄不生效。
+    """
+    from core.tuning import DEFAULTS, UNWIRED
     all_text = "\n".join(read(f) for f in py_files("plugins", "services", "core"))
     unused = []
     for k in DEFAULTS:
+        if k in UNWIRED:
+            continue
         if re.search(r'tuning\.(?:f|i|raw|get)\(\s*"%s"' % re.escape(k), all_text):
             continue
         unused.append(k)
@@ -263,6 +271,11 @@ def main():
     print("\n【G】tuning 里登记但代码没读：%d" % len(unread))
     for x in unread[:args.top]:
         print("   ", x)
+    try:
+        from core.tuning import UNWIRED as _uw
+        print("    已登记的设计先行键（tuning.UNWIRED，不算硬伤）：%d 个" % len(_uw))
+    except Exception:
+        pass
 
     print("\n【H】注册了工具但 /技能 关不掉（没归属组）：%d" % len(uncovered))
     for x in uncovered[:40]:

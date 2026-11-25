@@ -39,7 +39,7 @@ from services.access import is_owner, display_name, nickname_variants
 from services import (profiles, memory_v2, mood, group_roster, referee,
                        dialogue_log, group_scene, scene_auditor, conv_state)
 from services import view_frequency as vf_mod
-from services.config import GROUP_WATCH_MODE  # noqa: E402
+from services.config import GROUP_WATCH_MODE, POWER_MODE, power_on  # noqa: E402
 from services import (attention, expression, chat_switch, proactive, mood_judge,
                       profile_miner, quiet_advisor, skill_switch, segments,
                       poke_guard)
@@ -90,6 +90,9 @@ PRIVATE_SLEEP = os.getenv("PRIVATE_SLEEP", "false").lower() in ("1", "true", "ye
 # 私聊：同一条规矩，≤20 直接发，超过走合并转发。
 GROUP_MAX_HANZI = tuning.i("GROUP_MAX_HANZI")
 PRIVATE_MAX_HANZI = tuning.i("PRIVATE_MAX_HANZI")
+# 输出气泡规矩（DESIGN §9.1）：单泡 ≤40 汉字、单轮 ≤2 泡；超过 2 泡走合并转发，不截断。
+OUT_BUBBLE_CHARS = tuning.i("OUT_BUBBLE_CHARS")
+OUT_BUBBLES_MAX = tuning.i("OUT_BUBBLES_MAX")
 # 系统长文（视频总结等）超过多少字才用合并转发（太短没必要做成卡片）
 LONG_FORWARD_MIN = tuning.i("LONG_FORWARD_MIN")
 RANDOM_CHAT_ENABLED = os.getenv("RANDOM_CHAT_ENABLED", "true").lower() == "true"
@@ -142,7 +145,6 @@ GROUP_INTERJECT_OVERRIDES = _parse_group_interject_overrides(
 USE_LOCAL_TTS = os.getenv("USE_LOCAL_TTS", "false").lower() == "true"
 # 私聊「正在输入」状态（NapCat 的 set_input_status，群聊不可靠，只私聊用）
 TYPING_STATUS = os.getenv("TYPING_STATUS", "true").lower() == "true"
-SHORT_QUERY_WINDOW_SEC = tuning.i("SHORT_QUERY_WINDOW_SEC")
 
 # 主动插话的「文字气泡」要不要随机转成语音（0 = 永远纯文字）
 # ⚠️ 原来这段走 services.reply.reply_with_multimodal，它内部有 30% 概率直接调
@@ -233,6 +235,11 @@ last_lyrics = defaultdict(str)
 session_queues = defaultdict(asyncio.Queue)
 session_last_reply = defaultdict(float)
 session_workers = {}
+# 本轮是否已经通过 `send` 工具发过东西（2026-11-25）：
+#   用来判断「她潜水」到底是「不想说」还是「已经用工具回过了」。
+_LAST_TOOL_SEND = defaultdict(float)
+# 被 @ 了却潜水：只记一笔，方便 `docker logs | grep AT-MISS` 复盘。
+_AT_SILENT = defaultdict(int)
 recent_group_msgs = defaultdict(lambda: deque(maxlen=MAX_GROUP_RECENT))
 # 👇 和 recent_group_msgs 一一对应的时间戳。
 #    主动插话原来把 recentTimes 全写成 [now]*n，导致「最近 5 分钟有几条消息」
@@ -986,7 +993,9 @@ def _spawn_mood_judge(session_key: str, label: str, ctx_lines, think: str = "",
                       src: str = "", reply: str = "", speaker_qq: str = "",
                       passive: bool = False, hint: str = "",
                       repair: bool = False, force: bool = False,
-                      turn_id: str = "", addressed: bool = False) -> None:
+                      turn_id: str = "", addressed: bool = False,
+                      records=None, address_qq: str = "",
+                      address_kind: str = "", address_conf: float = 0.0) -> None:
     """
     后台跑心情判读（影子）。异常自己吞掉，别让 create_task 冒「never retrieved」。
 
@@ -1011,30 +1020,29 @@ def _spawn_mood_judge(session_key: str, label: str, ctx_lines, think: str = "",
 
     async def _run():
         try:
-            # 她没写 THINK → 先补一句心里话，再判读（这样每条回复都有记录）。
-            # 被动观察（passive）不补：那条不是她说的，补了会污染「逐条对照」。
-            if not think and not passive:
-                try:
-                    await mood_judge.backfill_think(session_key, src=src, reply=reply)
-                except Exception as e:
-                    logger.debug(f"[MOOD-JUDGE] 补心里话失败: {type(e).__name__}: {e}")
+            # 2026-11-25：她没写 THINK 时**不再自动补写**。
+            # 补出来的只是猜测，既不写 mood_think.json，也不参与判读（ADR-038），
+            # 每缺一条还多花一次模型调用。缺就记一笔 miss，用命中率去改协议。
+            # 需要看「她会怎么想」时，手动跑 `mood_judge.backfill_think`（只进 inferred）。
             _res = await mood_judge.judge_and_store(
                 session_key, label, ctx_lines,
                 think=think, speaker_qq=speaker_qq,
+                # 她这条在回什么：判读 prompt 里单独给一行，避免它去 8 条上下文里猜
+                src=src,
+                address_qq=address_qq, address_kind=address_kind,
+                address_conf=address_conf,
                 hint=hint, repair=repair, force=force,
                 turn_id=turn_id,
                 # 👇 这两项决定 Δ 会不会被压小（2026-11-22）：
                 #    passive  = 她没说话，只是看到 → 旁观不该背锅
                 #    addressed = 这条是不是在叫她 → 不是冲她来的最多 ±0.05
-                passive=bool(passive), addressed=bool(addressed)) or {}
-            # 被动观察：把判读出来的 mind 也当成「她心里的活动」落一条，
-            # 这样「没说话但心里有想法」也能在 /测函数 心情 里看到。
-            if passive and _res.get("ok") and _res.get("mind"):
-                try:
-                    mood_judge.note_think(session_key, _res["mind"],
-                                          src=src, reply="", auto=True)
-                except Exception:
-                    pass
+                passive=bool(passive), addressed=bool(addressed),
+                # 👇 段内按 8 条 / 5min 切窗判读（P4：段内消息不能丢）
+                records=records) or {}
+            # 2026-11-25 删除：以前把判读模型猜的 `mind` 当成她的心理活动，
+            # 以 auto=True 写进 mood_think.json。那是**猜测**，不是她写的 THINK，
+            # 会把标注源和状态卡一起污染（ADR-038）。猜测现在只进
+            # `data/mood_think_inferred.json`，任何展示都不读。
         except Exception as e:
             logger.debug(f"[MOOD-JUDGE] 后台判读异常: {type(e).__name__}: {e}")
 
@@ -2030,6 +2038,13 @@ async def _early_observe(event: MessageEvent) -> None:
     现在拆成独立的 priority=1、block=False 观察器，先于所有插件执行。
     """
     text = event.get_plaintext().strip()
+    # 2026-11-25：@ 收件埋点。以前日志里数不出「被 @ 了几次、回了几次」，
+    # 只能靠人肉感觉「她老不回」。现在 `grep '\[AT\]'` 就能对账。
+    try:
+        if isinstance(event, GroupMessageEvent) and event.is_tome():
+            logger.info(f"[AT] {event.group_id} {event.user_id} @她：{text[:40]}")
+    except Exception:
+        pass
     try:
         _sk = (f"group_{event.group_id}" if isinstance(event, GroupMessageEvent)
                else f"private_{event.user_id}")
@@ -2085,6 +2100,12 @@ async def _early_observe(event: MessageEvent) -> None:
                     logger.debug(f"[PROFILE-MINE] 触发失败: {type(e).__name__}: {e}")
         elif isinstance(event, PrivateMessageEvent):
             _uid = str(event.user_id)
+            # 主动私聊闭环：她最近找过这个人 → 这次回话算「接住了」
+            try:
+                if not _is_self_qq(_uid, event):
+                    proactive.note_reply(_uid, text)
+            except Exception as _pe:
+                logger.debug(f"[PROACTIVE] note_reply 失败: {type(_pe).__name__}: {_pe}")
             if _uid in ALLOWED_PRIVATE and not _is_self_qq(_uid, event):
                 dialogue_log.log_msg(f"private_{_uid}", _msg_label(event),
                                      _uid, _t, kind="user")
@@ -2099,6 +2120,11 @@ async def _early_observe(event: MessageEvent) -> None:
             mood.touch(f"private_{event.user_id}")
     except Exception:
         pass
+
+    # 2026-11-25：快速通道护栏已删除（P0-4）。
+    # 以前「@她/引用她 + 辱骂词」会直接 `v = min(v, -0.45)`，是拿**对方的话**猜她的心情；
+    # 实测大量「@她 + 傻鱼」她都是顺着玩笑接的。现在心情只由她的 [[THINK]] 经 judge 更新，
+    # 她没往心里去就不会掉。
 
 
 def _lite_hard_signal(event, gid, uid, text: str = "",
@@ -2248,10 +2274,34 @@ async def _need_reply(event: MessageEvent) -> bool:
         # 引用别人的话里出现她名字 ≠ 在叫她（否则别人转述一句就被莫名唤醒）
         _t_own = _QUOTE_BLOCK.sub("", t).strip() or t
 
+        # 2026-11-25：**只 @ 不说话**也要给一句回应。
+        # 以前 `t` 为空 → 整段 `elif t and ...` 不执行 → 一路落到 `return False`，
+        # 等于被 @ 了装死（用户实测：「艾特她不回复」）。
+        # 这里把空 @ 合成一条文本，后面照常入队；同时打开 pending，
+        # 他接下来补的那句话会按「补话」处理（_focus_take_pending）。
+        if not _t_own and event.is_tome() and not _is_self:
+            t = "【他 @ 了你，但这条没写内容】"
+            _t_own = t
+            try:
+                event._enriched_text = t
+            except Exception:
+                pass
+            try:
+                _focus_start(f"group_{gid}", uid, pending=True)
+            except Exception:
+                pass
+            logger.info(f"[AT] {gid} 空 @ → 给一句回应，并等他补话")
+
         # 👇 群里另一只 bot：它的回复要进上下文（她得知道对方说了什么），
         #    但**默认不触发我们回复**，否则两个 bot 会互聊到天亮。
         #    真正的用途是拿它做三方核对，见 services/referee.py。
         _is_peer = uid in referee.PEER_QQS
+
+        # ⚠️ 这两个只在下面 `elif t and ...` 里赋值；省流门/后面几处都要用，
+        #    所以先初始化。否则「纯媒体消息 / 空文本」走到 lite 门会 NameError，
+        #    被 nonebot 当成 Rule 异常 → 整条消息不处理。
+        _rq = ""
+        _scene_meta = None
 
         if _is_self:
             # 她自己（以及本账号上其它插件）发出去的话：
@@ -2319,6 +2369,21 @@ async def _need_reply(event: MessageEvent) -> bool:
                         to_conf=float((_scene_meta or {}).get("to_conf") or 0.0))
                 except Exception:
                     pass
+                # 👇 互动边（P1 / addressing §3.2）：高置信「谁 → 谁」落盘，
+                #    给社交图 / 主动找人 / 「他最近都在跟谁说话」用。
+                try:
+                    _ek = str((_scene_meta or {}).get("to_kind") or "")
+                    _eq = str((_scene_meta or {}).get("to_qq") or "")
+                    _ec = float((_scene_meta or {}).get("to_conf") or 0.0)
+                    if (_ek in ("person", "bot") and _eq and _eq != uid
+                            and _ec >= tuning.f("ADDR_ASSERT_MIN")):
+                        from services import memdb as _mdb_e
+                        _mdb_e.note_edge(from_qq=uid, to_qq=_eq,
+                                         session=f"group_{gid}", conf=_ec)
+                        logger.info(f"[EDGE] {gid} {uid} → {_eq}"
+                                    f"（{_ek}, conf {_ec:.2f}）")
+                except Exception as _ee:
+                    logger.debug(f"[EDGE] 落盘失败: {type(_ee).__name__}: {_ee}")
                 # 🎭 说话样本库（2026-11-24）：每个人的原话都记一条。
                 #    放在省流模式 return 之前 → **省流模式也会收**；
                 #    只写文本，不调模型，不影响回复速度。
@@ -2363,7 +2428,8 @@ async def _need_reply(event: MessageEvent) -> bool:
             # 👇 表达学习：每攒够 N 条真人消息，后台挖一次「这个群 / 这个人怎么说话」。
             #    学的是**语气和句式**（和 lorebook 的知识互补），失败静默，不影响聊天。
             try:
-                if expression.enabled() and GROUP_WATCH_MODE != "lite":
+                if (expression.enabled() and GROUP_WATCH_MODE != "lite"
+                        and power_on("expression")):
                     _EXP_COUNT[gid] = int(_EXP_COUNT.get(gid) or 0) + 1
                     if _EXP_COUNT[gid] >= expression.EVERY:
                         _EXP_COUNT[gid] = 0
@@ -2465,18 +2531,20 @@ async def _need_reply(event: MessageEvent) -> bool:
         except Exception as e:
             logger.debug(f"[SWITCH] 查询安静失败: {type(e).__name__}: {e}")
 
-            # 👇 2026-11-24 省流模式：观察/白月光/心情照记，但**只有硬信号才入队**。
-            #    用户：「让用户选择关注群消息，或者接话/回复时拉附近 8 条上下文。
-            #          判定是否接话用硬逻辑（收发件人 + 艾特）。」
-            if GROUP_WATCH_MODE == "lite":
-                _hard = _lite_hard_signal(
-                    event, gid, uid, text=_t_own,
-                    reply_qq=_rq, scene_meta=_scene_meta)
-                if not _hard:
-                    logger.debug(f"[LITE] {gid} 不是在叫她 → 只记上下文，不入队")
-                    return False
-                logger.info(f"[LITE] {gid} 硬信号命中（@/引用/喊名字/收件人是她）→ 接话")
-                return True
+        # 👇 2026-11-24 省流模式：观察/白月光/心情照记，但**只有硬信号才入队**。
+        #    用户：「让用户选择关注群消息，或者接话/回复时拉附近 8 条上下文。
+        #          判定是否接话用硬逻辑（收发件人 + 艾特）。」
+        # ⚠️ 2026-11-25 修：这段以前被缩进在 `except` 里，只有安静查询抛异常才生效，
+        #    正常路径下 lite 完全等于 full（审计 G36 只做字符串位置检查，没发现）。
+        if GROUP_WATCH_MODE == "lite":
+            _hard = _lite_hard_signal(
+                event, gid, uid, text=_t_own,
+                reply_qq=_rq, scene_meta=_scene_meta)
+            if not _hard:
+                logger.debug(f"[LITE] {gid} 不是在叫她 → 只记上下文，不入队")
+                return False
+            logger.info(f"[LITE] {gid} 硬信号命中（@/引用/喊名字/收件人是她）→ 接话")
+            return True
 
         # 👇 LATER 等消息期间已经读过的消息，不再单独回一次（用户 2026-11-12：
         #    「拉了未来记录的时候实际上是已读然后总结回复之前那条了。
@@ -2656,6 +2724,38 @@ async def _early_observe_handler(event: MessageEvent):
 
 
 chat = on_message(rule=Rule(_need_reply), priority=10, block=False)
+
+
+# 静默锚点定时器（2026-11-25）：以前「静默 30min 锚点」只在**下一条消息**带来
+# THINK 时才顺便判一次 idle，群彻底安静就永远不纠偏。这里给一个独立循环。
+#
+# ⚠️ 写成 `@_driver.on_bot_connect` 而不是 `@get_driver().on_bot_connect`：
+#    「装饰器里套调用」是 3.9+ 语法（PEP 614），宿主 3.8 的 ast 解析不了，
+#    check_names / check_tuning 会整文件降级。行为完全一样（get_driver()
+#    本来也是在 import 时调用）。
+_driver = get_driver()
+
+
+@_driver.on_bot_connect
+async def _start_anchor_timer(bot):
+    if getattr(_start_anchor_timer, "_started", False):
+        return
+    _start_anchor_timer._started = True
+
+    async def _loop():
+        await asyncio.sleep(90)          # 先让启动流程跑完
+        while True:
+            try:
+                await mood_judge.anchor_tick()
+            except Exception as e:
+                logger.debug(f"[ANCHOR] tick 失败: {type(e).__name__}: {e}")
+            await asyncio.sleep(300)     # 5 分钟一轮
+
+    try:
+        asyncio.create_task(_loop())
+        logger.info("[ANCHOR] 静默锚点定时器已启动（每 5 分钟）")
+    except Exception as e:
+        logger.debug(f"[ANCHOR] 启动失败: {type(e).__name__}: {e}")
 
 # 2026-11-20 工程结构化：把实现注册到 core，供新插件统一调用
 try:
@@ -3021,7 +3121,7 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
         return
     qq = str(event.user_id)
     memory_v2.remember(text=fact, kind="fact", about_qq=qq, importance=0.8)
-    profiles.add_bond_note(qq, fact[:40])
+    # 2026-11-25：事实只进记忆，不进档案（档案只收心情大波动的事，避免和记忆重复）
     await bot.send(event, "✅ 记住了，我写进小本本里了。")
 
 
@@ -4750,7 +4850,7 @@ async def _session_worker(bot: Bot, session_key: str):
                     # 👇 先让「审核 LLM」纠错/补齐硬逻辑，再组装现场
                     #    只审 大家/不确定/低置信 的消息；@/引用 不审。
                     #    失败/超时静默退回硬逻辑，不影响回复。
-                    if scene_auditor.enabled():
+                    if scene_auditor.enabled() and power_on("audit"):
                         _t_audit = time.monotonic()
                         try:
                             await asyncio.wait_for(
@@ -4986,8 +5086,16 @@ async def _session_worker(bot: Bot, session_key: str):
                 # 让判读把好感回暖、心情回升写进去。用户 2026-11-20：
                 # 「道歉可以破冰，可以回暖好感以及回升一些心情。」
                 _thaw_note = str(getattr(ev, "_thaw_note", "") or "")
-                _judge_src = (segments.short(_seg_records, n=4)
+                # 判读只需要知道「她这条在接哪句」：最后 2 条、每条 56 字，
+                # 并剥掉引用块（引用是更早的别人的话，会把判读带偏）。
+                # 2026-11-25 真机：n=4/80 字拼出来是一坨 200 字截断文本，判读没法用。
+                _judge_src = (segments.short(_seg_records, n=2, width=56)
                               if _seg_records else f"{speaker_name}: {text}")
+                try:
+                    _judge_src = re.sub(r"〔引用[^〕]*〕", "", _judge_src)
+                    _judge_src = re.sub(r"\s+", " ", _judge_src).strip()[:160]
+                except Exception:
+                    pass
                 # 👇 她明确引用/回复了某一条 → 这次心情/好感算到**那个人**头上，
                 #    不再默认算给「这一段最后一个说话的人」（回复错人的另一半原因）。
                 _reply_to_qq = ""
@@ -5009,15 +5117,22 @@ async def _session_worker(bot: Bot, session_key: str):
                 except Exception:
                     _reply_to_qq = ""
                 _judge_qq = _reply_to_qq or speaker_qq
+                # 收发件人（D21）：这一段最后一条的 Address，只有高置信才用于归因；
+                # 低置信一律退回「正在说话的人」，避免把好感记错人。
+                _addr = (_seg_records[-1] if _seg_records else {}) or {}
                 _spawn_mood_judge(
                     session_key, _mood_label, ctx, _think,
                     src=_judge_src,
                     reply=_myreply, speaker_qq=_judge_qq,
+                    address_qq=str(_addr.get("to_qq") or ""),
+                    address_kind=str(_addr.get("to_kind") or ""),
+                    address_conf=float(_addr.get("to_conf") or 0.0),
                     hint=(f"他刚道歉/哄她（原来的心结：{_thaw_note}）"
                           if _thaw_note else ""),
                     repair=bool(_thaw_note), force=bool(_thaw_note),
                     turn_id=_turn_id,
-                    addressed=bool(_addressed))
+                    addressed=bool(_addressed),
+                    records=_seg_records)
             except Exception as e:
                 logger.debug(f"[MOOD-JUDGE] 触发失败: {type(e).__name__}: {e}")
 
@@ -5224,7 +5339,9 @@ async def _session_worker(bot: Bot, session_key: str):
                 # 档案只收「让她心情明显动过」的事：判据是 |Δ|，不是当前水平。
                 # 0.15 ≈ 一次"明显被戳到"；小事（±0.05）不写进档案。
                 # 档案同样只看「真的动过」：|Δ| >= 门槛；没判读时才退回强情绪。
-                _bond_worthy = (_hit_by_judge
+                # 2026-11-25：档案门槛比记忆高（默认 0.15），只收大波动的事。
+                _bond_min = float(getattr(profiles, "PROFILE_MIN_DELTA", 0.15))
+                _bond_worthy = ((bool(_jd_fresh) and abs(float(_jdelta or 0)) >= _bond_min)
                                 or ((not _jd_fresh) and _strong_emo))
                 if _bond_worthy:
                     try:
@@ -5295,6 +5412,38 @@ async def _session_worker(bot: Bot, session_key: str):
                 logger.debug(f"[MEM] 写记忆失败: {e}")
 
             if parsed["silent"]:
+                # 2026-11-25：区分「被 @ 却潜水」和「本来就不该回」。
+                # 以前两者都只打一行「潜水」，日志里看不出她是不是装死。
+                _addr = False
+                try:
+                    _addr = bool(getattr(ev, "is_tome", lambda: False)())
+                except Exception:
+                    _addr = False
+                if _addr:
+                    _recent = time.time() - float(
+                        _LAST_TOOL_SEND.get(session_key) or 0.0)
+                    _quiet = False
+                    try:
+                        _quiet = bool(chat_switch.is_off(session_key)[0])
+                    except Exception:
+                        _quiet = False
+                    if _recent < 120:
+                        logger.info(f"[AT] {session_key} 已用工具回过"
+                                    f"（{_recent:.0f}s 前）→ 这次潜水正常")
+                    elif _quiet:
+                        logger.info(f"[AT] {session_key} 静音中 → 潜水")
+                    else:
+                        _AT_SILENT[session_key] += 1
+                        logger.info(f"[AT-MISS] {session_key} 被 @ 却潜水"
+                                    f"（第 {_AT_SILENT[session_key]} 次）")
+                        # 兜底：至少给一个字。被叫了完全不理，比回得不好更伤体验。
+                        try:
+                            await bot.send(ev, random.choice(
+                                ["嗯？", "怎么了", "在。", "我在听"]))
+                            _LAST_TOOL_SEND[session_key] = time.time()
+                            logger.info(f"[AT] {session_key} 兜底回了一句")
+                        except Exception as _ae:
+                            logger.debug(f"[AT] 兜底发送失败: {type(_ae).__name__}: {_ae}")
                 logger.info(f"[CHAT] {session_key} 潜水")
                 # 沉默也记一次「刚处理过」：安静状态下一批消息接连进来时，
                 # 别每条都立刻再调一次模型（REPLY_INTERVAL 至少隔一下）。
@@ -5393,6 +5542,32 @@ async def _session_worker(bot: Bot, session_key: str):
 
             # 按顺序发送
             _is_group = isinstance(ev, GroupMessageEvent)
+
+            # 👇 气泡上限（DESIGN §9.1）：单轮 ≤OUT_BUBBLES_MAX 泡。
+            #    超了不截断 —— 把尾部合并成一个气泡，交给下面的「超长→合并转发」处理。
+            #    long_doc（用户明确要长答）例外：允许 >2 泡，整段走合并转发。
+            _long_doc_send = False
+            try:
+                _long_doc_send = bool(llm_mod.is_long_doc(text))
+            except Exception:
+                _long_doc_send = False
+            if (_is_group and not _long_doc_send
+                    and OUT_BUBBLES_MAX > 0 and len(items) > OUT_BUBBLES_MAX):
+                _head = items[:OUT_BUBBLES_MAX - 1]
+                _tail = items[OUT_BUBBLES_MAX - 1:]
+                _tail_text = "".join(
+                    str(i.get("value") or "") for i in _tail
+                    if i.get("kind") == "text")
+                _tail_other = [i for i in _tail if i.get("kind") != "text"]
+                items = _head + [{"kind": "text", "value": _tail_text}] + _tail_other
+                # 2026-11-25（P2-3）：**不再丢弃**非文字泡。
+                # DESIGN §9.1 是「不截断」；表情/语音合不进文字泡，就让它们多占一条。
+                # 口径改为：**文字泡 ≤ OUT_BUBBLES_MAX**，表情/语音不占文字名额。
+                if len(items) > OUT_BUBBLES_MAX:
+                    logger.info(f"[OUT] 文字泡已合并到 {OUT_BUBBLES_MAX}，"
+                                f"另有 {len(_tail_other)} 个非文字泡保留不丢")
+                logger.info(f"[OUT] 气泡 {len(_head) + len(_tail)} 个 > "
+                            f"{OUT_BUBBLES_MAX} → 尾部合并，不截断")
 
             # ⚠️ 这个列表之前漏了初始化：第一个气泡发完后 said.append 会抛 NameError，
             #    被外层 except 吞掉 → 多气泡回复只发出去第一条，后面的全丢。
@@ -5527,7 +5702,7 @@ async def _session_worker(bot: Bot, session_key: str):
                     #    以前是 >20 字直接截断，经常砍在半句话上。
                     #    带真 @ / 引用回复的没法塞进卡片，这两种才退回截断。
                     if _is_group:
-                        _g_limit = group_tuning.max_hanzi(session_key, GROUP_MAX_HANZI)
+                        _g_limit = group_tuning.max_hanzi(session_key, OUT_BUBBLE_CHARS)
                         if not _long and hanzi_count(val) > _g_limit:
                             if not at_names and not _explicit_rid:
                                 if await _send_long_as_forward(
@@ -5760,6 +5935,7 @@ async def _random_chat_loop(bot: Bot):
     while True:
         try:
             if (RANDOM_CHAT_ENABLED and GROUP_WATCH_MODE != "lite"
+                    and power_on("proactive")
                     and skill_switch.is_enabled("proactive.interject")):
                 now_ts = time.time()
                 now_ms = int(now_ts * 1000)
@@ -5977,10 +6153,17 @@ async def _random_chat_loop(bot: Bot):
                         continue
                     _vf.activate(_ext)
 
+                    # 群主动接话日上限（proactive §A）：每个群每天 ≤ N 次
+                    _gdone = proactive.group_count_today(gid)
+                    if _gdone >= proactive.GROUP_MAX_PER_DAY:
+                        logger.info(f"[PROACTIVE] {gid} 今天已主动 {_gdone} 次"
+                                    f"（上限 {proactive.GROUP_MAX_PER_DAY}）→ 跳过")
+                        continue
                     logger.info(f"[GROUP] {gid} 主动插话: {decision['reason']}")
                     # 先占住这个群的插话名额：LLM 调用/发送失败也不要在下个 tick 重试，
                     # 否则同一条话会被插两次（"接话两次"的另一半原因）。
                     last_random_chat[gid] = time.time()
+                    proactive.mark_group_sent(gid)
                     # 这段上下文已经看过（不管最后是开口还是潜水）→ 下个 tick 不再重复判断
                     _interject_seen[gid] = _latest_human_ts
 
@@ -5994,7 +6177,7 @@ async def _random_chat_loop(bot: Bot):
                     _scene_txt = ""
                     try:
                         _bid = _self_id(bot=bot)
-                        if scene_auditor.enabled():
+                        if scene_auditor.enabled() and power_on("audit"):
                             try:
                                 await asyncio.wait_for(
                                     scene_auditor.audit_recent(
@@ -6135,7 +6318,7 @@ async def _random_chat_loop(bot: Bot):
                                 )
                                 # 主动插话也可能 @ 人：能拉到名册就发真 @，否则退化成文字
                                 _at_names, _body = _split_at_tags(strip_html(val))
-                                _g_limit = group_tuning.max_hanzi(gid, GROUP_MAX_HANZI)
+                                _g_limit = group_tuning.max_hanzi(gid, OUT_BUBBLE_CHARS)
                                 _sent = False
                                 # 👇 和主回复同一条规矩：20 字以上走合并转发（不截断）；
                                 #    带 @ 的塞不进卡片，才退回截断。
@@ -7105,6 +7288,11 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
             str(event.group_id) if isinstance(event, GroupMessageEvent) else "")
         await _test_fn.finish(callname.status(_tgt_qq or "", _cg))
 
+    if what.startswith(("上下文", "预算", "ctx", "context")):
+        # /测函数 上下文 —— 各块实际字数 vs CTX_* 预算（默认只统计不裁剪）
+        from services import ctx_budget as _cb
+        await _test_fn.finish(_cb.report_text())
+
     if what.startswith(("流水线", "pipeline", "取数")):
         # /测函数 流水线 —— 每一步耗时 + 上次拉了哪些块；
         # 加「全」打印完整内容（和 /看模板 流水线 同源）。
@@ -7395,7 +7583,7 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
                 await _test_fn.finish("🎬 群聊现场\n· 回放失败：这个群没有可用消息。")
             logger.info(f"[SCENE] 回放 {_tag} → {_scope}")
         try:
-            if _scope and scene_auditor.enabled():
+            if _scope and scene_auditor.enabled() and power_on("audit"):
                 _pending = len(group_scene.needs_audit(_scope))
                 logger.info(f"[SCENE-AUDIT] 自检强制审核 {_scope}，待审 {_pending} 条")
                 _changed = await asyncio.wait_for(
@@ -7922,7 +8110,7 @@ async def _daily_summary_loop():
 _loop_flags = {"random": False, "summary": False, "proactive": False}
 
 
-@get_driver().on_bot_connect
+@_driver.on_bot_connect
 async def _start_loops(bot: Bot):
     if RANDOM_CHAT_ENABLED and not _loop_flags["random"]:
         _loop_flags["random"] = True
@@ -8044,6 +8232,14 @@ async def _tool_send(args: dict) -> str:
         return f"没发出去：{type(e).__name__}"
 
     done.update(used)
+    # 记一笔：这一轮她已经用工具发过东西了。
+    # 「潜水」分支靠它区分「不想说」和「已经回过了」（2026-11-25）。
+    try:
+        _sk = (f"group_{ev.group_id}" if isinstance(ev, GroupMessageEvent)
+               else f"private_{ev.user_id}")
+        _LAST_TOOL_SEND[_sk] = time.time()
+    except Exception:
+        pass
     return "发出去了"
 
 
@@ -10354,9 +10550,8 @@ async def _video_worker():
                     tags=["视频", "B站"],
                     importance=0.7,
                 )
-                _label = _msg_label(ev) if ev else ""
-                profiles.add_bond_note(_who, f"看了{_label}发来的B站视频《{title}》")
-                logger.info(f"[VIDEO-TOOL] 视频总结已写入记忆/档案（about_qq={_who}）")
+                # 2026-11-25：看视频是事实，只进记忆，不进档案（档案只收心情大波动的事）
+                logger.info(f"[VIDEO-TOOL] 视频总结已写入记忆（about_qq={_who}）")
             except Exception as _e:
                 logger.warning(f"[VIDEO-TOOL] 写记忆失败: {type(_e).__name__}: {_e}")
             logger.info("[VIDEO-TOOL] 总结已发回")

@@ -70,10 +70,12 @@ def collect_defined(tree):
                 names.add(a.arg)
         elif isinstance(node, ast.Global) or isinstance(node, ast.Nonlocal):
             names.update(node.names)
-        elif isinstance(node, ast.MatchAs):
+        # match 语句是 3.10+ 语法；宿主 3.8 的 ast 没有这些节点类型。
+        # 用 getattr 兜底，让本脚本在 3.8 也能跑（容器 3.11 走完整分支）。
+        elif isinstance(node, getattr(ast, "MatchAs", ())):
             if node.name:
                 names.add(node.name)
-        elif isinstance(node, ast.MatchStar):
+        elif isinstance(node, getattr(ast, "MatchStar", ())):
             if node.name:
                 names.add(node.name)
     return names

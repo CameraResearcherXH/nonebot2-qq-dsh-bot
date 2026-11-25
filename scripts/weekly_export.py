@@ -228,6 +228,15 @@ def export(days: int = 7, max_lines: int = 0) -> Path:
     except Exception:
         pass
 
+    # ---------------- 七、性能 p95（只看最慢一块） ----------------
+    try:
+        from services import perf_stats
+        add("\n## 七、性能 p95（最近 %d 天）\n" % days)
+        add(perf_stats.render_md(days).split("\n", 1)[-1])
+        add("")
+    except Exception as e:
+        add(f"\n## 七、性能 p95\n\n（读不到：{type(e).__name__}）\n")
+
     add("\n---\n\n**请现在按最上面的输出格式给出体检结果。**\n")
 
     md_path.write_text("\n".join(L), encoding="utf-8")

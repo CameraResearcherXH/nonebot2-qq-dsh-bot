@@ -216,10 +216,18 @@ def addressee_of(r: dict) -> str:
         return "→ 你"
     if kind == "bot":
         return "→ 你"
-    if kind == "person" and name:
-        return f"→ {name}" if conf >= 0.5 else f"→ 大概{name}"
-    if kind == "unknown" and name:
-        return f"→ {name}?"
+    # 2026-11-25（P2-7）：按 DESIGN §3.5 的三档渲染 ——
+    #   ≥0.8 断言「→ X」；0.5~0.8「像是在回 X」；<0.5「不确定」。
+    # 以前 0.5 就直接断言，会把「正文点名 0.7」写成确定收件人。
+    if kind in ("person", "unknown") and name:
+        if conf >= 0.8:
+            return f"→ {name}"
+        if conf >= 0.5:
+            return f"→ 像是在回{name}"
+        return "→ 不确定"
+    # 无信号（to_reason=none）：是「不知道对谁」，不是「大家」
+    if kind == "group" and str((r or {}).get("to_reason") or "") == "none":
+        return "→ 不确定"
     return "→ 大家"
 
 

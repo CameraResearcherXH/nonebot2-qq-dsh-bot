@@ -189,13 +189,70 @@ OneBot V11 | Bot <QQ> connected
 ## 5. 验证
 
 ```bash
-# 宿主机（代码/配置一致性）
+# 代码/配置一致性（宿主机或容器内都行；容器内更准，见下方说明）
 python3 scripts/verify_all.py
 
-# 容器内（功能链路）
-docker exec qq-grok-bot python3 scripts/audit_features.py --strict
-docker exec qq-grok-bot python3 scripts/selftest_all.py
+# 容器内（真实依赖 + 真实 .env）
+docker exec qq-grok-bot python3 scripts/verify_all.py
+docker exec qq-grok-bot python3 scripts/verify_rollbacks.py
 docker exec qq-grok-bot python3 scripts/test_new_features.py
+docker exec qq-grok-bot python3 scripts/audit_features.py --strict
+```
+
+> **为什么优先在容器内跑**：宿主机常常只有 python 3.8，缺 `nonebot/httpx`，
+> 且 3.8 解析不了 3.9+ 语法（`match`、装饰器里套调用），会出一堆假失败。
+> 容器是 3.11，才是线上真实环境。
+
+### 5.1 三项「口径/接线」检查（2026-11-25 起）
+
+```bash
+# ① 调参表：AST 找真实读点 + 揪「模块级常量读了不用」
+docker exec qq-grok-bot python3 scripts/check_tuning.py --strict
+
+# ② 设计文档：默认只查「文档 ↔ 设计常量」；--runtime 额外查接线与线上覆盖
+docker exec qq-grok-bot python3 scripts/check_design_docs.py --runtime --strict
+
+# ③ 部署清单：仓库文件 md5 必须和清单一致
+md5sum -c --quiet deploy_manifest.txt
+```
+
+`check_tuning` 的三条硬规则：
+
+1. 数值型 `float(os.getenv("X", "1.0"))` 一律不允许（必须 `tuning.f/i`）；
+2. `tuning.f/i/raw/get("X")` 的键必须注册在 `core/tuning.py::DEFAULTS`；
+3. `FILES` 声明的文件里必须真有这个键的字面量，且模块级常量必须真被用到
+   （`LEGACY` / `UNWIRED` 豁免）。**注释里写一句键名不再算接线。**
+
+### 5.2 真实日志回滚（NapCat 日志 ↔ 设计文档）
+
+```bash
+# ⚠️ 用 docker logs --since 截窗口，不要只靠 --after：
+#    [RECALL] 角色脑 … 这类行没有 "11-25 HH:MM" 前缀，--after 过滤不到。
+docker logs --since 2h qq-grok-bot 2>&1 \
+  | docker exec -i qq-grok-bot python3 scripts/verify_napcat_log.py \
+      --log - --data-dir data
+```
+
+输出 `PASS / FAIL / SKIP` 三态；**SKIP 表示这段日志没覆盖到该场景，不是失败**。
+重启/部署后建议只取部署之后的窗口（`--since 10m`），避免把旧版本的慢样本算进来。
+
+### 5.3 升级一版代码的标准动作
+
+```bash
+# 1) 备份将被覆盖的文件
+tar czf /home/admin/backup_$(date +%m%d_%H%M).tgz \
+    core services plugins scripts docs deploy_manifest.txt
+
+# 2) 上传（services/core/docs 是 admin 属主；plugins/scripts 是 root 属主）
+rsync -az --no-group --no-owner --no-perms -R core services docs \
+      qqbot:/home/admin/qq-grok-bot/
+scp scripts/xxx.py qqbot:/tmp/ && \
+  ssh qqbot "sudo install -m 644 -o root -g root /tmp/xxx.py /home/admin/qq-grok-bot/scripts/xxx.py"
+
+# 3) 重启（bind mount，改完 restart 即生效）
+docker restart qq-grok-bot && docker logs --tail 30 qq-grok-bot
+
+# 4) 跑 5.0 / 5.1 / 5.2 的检查
 ```
 
 群里发：
@@ -264,7 +321,32 @@ AUDIT_PROVIDER=deepseek
 GROUP_WATCH_MODE=full
 ```
 
-省流模式下不主动插话、不做表达学习；接话时上下文仍是最近 8 条 + 记忆。私聊不受影响。
+省流模式下不主动插话、不做表达学习；上下文条数仍由 `MAX_GROUP_RECENT`（默认 16）控制，
+**没有单独的「只拉 8 条」分支**（旧文档写错了，2026-11-25 更正）。私聊不受影响。
+
+## 5.9 运行档位（`POWER_MODE`，和 5.8 正交）
+
+```ini
+# full = 所有段全开（默认）
+# eco  = 节能：关掉花钱的判定类调用（审核 / 图书馆 / 主动插话 / 表达蒸馏），
+#        但「记录」永远不省（上下文 / 白月光 / 风格语料 / 心情 touch / 硬信号）
+POWER_MODE=full
+```
+
+两者关系：`GROUP_WATCH_MODE` 管**回不回**（接话范围），`POWER_MODE` 管**算不算**（成本档位）。
+代码入口：`services/config.py::power_on(stage)`；eco 下 `/状态` 仍会显示档位。
+建议组合：`lite + eco` = 只在叫她时才算；`full + eco` = 全都读、但便宜地读。
+
+### 5.10 记忆双写（`MEMORY_DUAL_WRITE`，2026-11-25）
+
+```ini
+# 1（默认）= json 每写一条，同时镜像到 sqlite；0 = 只写 json
+MEMORY_DUAL_WRITE=1
+```
+
+用途：先把 `data/memory.db` 喂满，再切 `MEMORY_BACKEND=sqlite`，避免「切完旧记忆搜不到」。
+对账：`python3 scripts/check_memory_dual.py --strict`（要求 sqlite ≥ json 90%、
+最近 200 条 turn_id 全在）。切后端前先备份 `data/memory.db`。
 
 ## 6. 可选：算力机（画图 / 翻唱 / 语音 / 视频）
 

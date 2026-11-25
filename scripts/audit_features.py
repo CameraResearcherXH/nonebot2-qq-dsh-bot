@@ -400,13 +400,17 @@ def check_g16():
         bad.append("群心情净变化没封顶 ±1")
     if "MAX_DELTA" not in gm:
         bad.append("群心情没有单条事件上限")
-    # 心情必须按设计 §13.1 线性累加；不许再用「饱和阻尼」这种补丁
+    # 心情必须按设计 §3.1 线性累加；不许再用「饱和阻尼」这种补丁
     if "room ** 1.5" in md:
         bad.append("心情又被加了饱和阻尼（设计是 clamp(v+Δ)，防一边倒靠入口噪音丢弃）")
     if "MOOD_NOISE_DELTA" not in mj or "NOISE_DELTA" not in mj:
         bad.append("Δ 入口没有噪音丢弃（旁观会被算成负分）")
-    if "PASSIVE_MAX_DELTA" not in mj:
-        bad.append("被动观察没有 Δ 上限（她没说话也会被扣心情）")
+    # ADR-038（2026-11-25）：没有 THINK 的旁观窗口只记录、不写状态。
+    # 旧的 PASSIVE_MAX_DELTA（被动 Δ 上限）已随通道一起删除，不能再要求它存在。
+    if "if passive:" not in mj or "只记录不写状态" not in mj:
+        bad.append("旁观窗口没有早退（她没说话也会被扣心情）")
+    if "PASSIVE_MAX_DELTA" in mj:
+        bad.append("还残留 PASSIVE_MAX_DELTA（ADR-038 已删被动通道）")
     if "passive=bool(passive)" not in chat:
         bad.append("chat 没把 passive 传给判读（旁观不背锅失效）")
     if "MOOD_HALF_LIFE_HOURS" not in md or "MOOD_HALF_LIFE_HOURS" not in tn:

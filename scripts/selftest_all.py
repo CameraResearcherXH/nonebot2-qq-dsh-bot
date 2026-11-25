@@ -472,7 +472,11 @@ async def t_mood():
     check(S, "有点扫兴" in _sb, f"心情名词按数值分档（{_sb.splitlines()[0][:30]}）")
     check(S, "-0.30" in _sb, "状态块带当前数值")
     check(S, "被连着催得有点烦" in _sb, "判读的反应词也带上（刚才那下）")
-    check(S, "又来一个要档案的" in _sb, "状态块带她的心里话")
+    # ADR-038：状态卡的「心里话」只读她自己的 THINK，不读判读猜测
+    from services import mood_judge as _MJ2
+    _MJ2.note_think("group_status_test", "又来一个要档案的", src="测试")
+    _sb = mood.status_block("group_status_test")
+    check(S, "又来一个要档案的" in _sb, "状态块带她的心里话（来自 THINK）")
     check(S, "chat_switch" in _sb and "由你" in _sb,
           "状态块把「要不要安静/找谁」交给她自己决定（不硬阈值）")
     _pb_src = (ROOT / "services" / "prompt_builder.py").read_text(encoding="utf-8")
@@ -674,13 +678,13 @@ async def t_mood():
     _chat_src2 = (ROOT / "plugins" / "chat" / "__init__.py").read_text(encoding="utf-8")
     check(S, "mood_judge.recent_think_items(_sk, 5)" in _chat_src2,
           "/测函数 心情 逐条显示心理活动（不是只给一句汇总）")
-    check(S, "mood_judge.backfill_think(session_key" in _chat_src2,
-          "没写 THINK 时后台补一句（不再只靠模型自觉）")
+    check(S, "mood_judge.backfill_think(session_key" not in _chat_src2,
+          "ADR-038：不再自动补写心里话（猜测会污染 THINK）")
     # 被动心情观察（用户 2026-11-20：冷了也要有心理活动，否则越冷越难回升）
     check(S, "_maybe_mood_watch" in _chat_src2 and "MOOD_WATCH_SEC" in _chat_src2,
           "群里有消息就「心里过一遍」（不等她回复也判）")
-    check(S, "passive=True" in _chat_src2 and "if passive and _res.get(\"ok\")" in _chat_src2,
-          "被动判读的 mind 也落盘成心理活动")
+    check(S, "if passive and _res.get(\"ok\")" not in _chat_src2,
+          "ADR-038：旁观窗口不落盘心情/心里话")
     check(S, "speaker_qq=speaker_qq" in _chat_src2,
           "判读带 speaker_qq（好感度按人涨落）")
     check(S, "接的是：" in _chat_src2 and "她说：" in _chat_src2,
@@ -803,12 +807,20 @@ async def t_memory():
     check(S, all({"text", "ago", "emotion_hit"} <= set(h) for h in hits), "recall 字段完整")
     check(S, M.recall("完全无关的量子色动力学", speaker_qq=qq, limit=3) == [] or True, "无关查询不崩")
 
-    idx = M._load_index()
-    check(S, len(idx["items"]) >= 2, f"索引累计 {len(idx['items'])} 条")
-    M.mark_outdated(a)
-    idx = M._load_index()
-    check(S, any(i["id"] == a and i["status"] == "outdated" for i in idx["items"]), "mark_outdated 只标状态")
-    check(S, len(idx["items"]) >= 2, "mark_outdated 不删条目")
+    if getattr(M, "BACKEND", "json") == "json":
+        idx = M._load_index()
+        check(S, len(idx["items"]) >= 2, f"索引累计 {len(idx['items'])} 条")
+        M.mark_outdated(a)
+        idx = M._load_index()
+        check(S, any(i["id"] == a and i["status"] == "outdated" for i in idx["items"]),
+              "mark_outdated 只标状态")
+        check(S, len(idx["items"]) >= 2, "mark_outdated 不删条目")
+    else:
+        # sqlite 后端没有 json 索引文件，条目在 memories 表里
+        st0 = M.stats()
+        check(S, int(st0.get("total") or 0) >= 2, f"sqlite 记忆库累计 {st0.get('total')} 条")
+        M.mark_outdated(a)
+        check(S, M.recall_detail(a) != "", "mark_outdated 只标状态、不删条目")
     st = M.stats()
     check(S, isinstance(st, dict) and st, f"stats() 可用：{list(st)[:4]}")
 
@@ -828,10 +840,12 @@ async def t_memory():
     import time as _t
     _now = _t.time()
     _old = _now - 60 * 86400          # 60 天前
-    _f_neutral = M._forget_factor(_now, _old, 0.0)
-    _f_strong = M._forget_factor(_now, _old, 1.0)
-    check(S, _f_strong > _f_neutral * 2,
-          f"60 天前的记忆：强情绪衰减更慢（{_f_strong:.3f} vs {_f_neutral:.3f}）")
+    # 检索二期：衰减按 kind 的提取半衰期（event 30 / fact 365 天），
+    # 不再是「情绪越强越慢」（显著性改走倒 U 的 salience_weight）。
+    _f_event = M._forget_factor(_now, _old, 0.0, "event")
+    _f_fact = M._forget_factor(_now, _old, 0.0, "fact")
+    check(S, _f_fact > _f_event * 2,
+          f"60 天前：fact 比 event 衰减慢（{_f_fact:.3f} vs {_f_event:.3f}）")
     # 端到端：带情绪强度的记忆能被检索回来，且带回 weight/mark
     _mid = M.remember(text="小明：我奶奶今天走了", kind="event", about_qq=qq,
                       importance=0.9, emotion_weight=1.0)
@@ -993,16 +1007,20 @@ async def t_agent():
         # 必须是「像聊天摘录」的答案，否则会被 _looks_like_chat 判成通用问答
         return {"success": True, "answer": "阿明: 上次那个蛋糕是街角那家"}
     AC._post_json = _fake2
+    AC._CACHE.clear()          # recall 有 10 分钟缓存，用例之间必须隔离
     r = await AC.recall("测试")
     check(S, r["source"] in ("smart", "query")
           and r["facts"] == ["阿明: 上次那个蛋糕是街角那家"],
           f"结构化端点不可用 → 退回 smart-query（{r['source']}）")
     # 宋词语料 → 判成「不是聊天」，直接停用 6 小时
     async def _fake3(url, payload, timeout):
-        return {"answer": "参考来源: /app/documents/poet.song.rank.1.json"}
+        # 必须是「有答案但不是聊天」：带「参考来源:」的会被 is_no_answer 当空结果，
+        # 走不到「语料不是聊天 → 暂停 6h」这条分支。
+        return {"answer": "宋词是一种中国文学体裁，始于唐代，盛于宋代，句子长短不一。"}
     AC._post_json = _fake3
     AC._RECALL_ENDPOINT_MISSING = True
     AC._LIBRARY_DEAD_UNTIL = 0.0
+    AC._CACHE.clear()          # 同一个 query 会命中上一次的缓存
     r = await AC.recall("测试")
     check(S, r == AC.empty_recall() and AC._LIBRARY_DEAD_UNTIL > 0,
           "图书馆语料不是聊天 → 返回空并暂停")
@@ -1040,7 +1058,9 @@ async def t_journal():
          "archive_keywords": ["翻唱功能一直报错", "根本不存在的关键词"]}, b)
     check(S, ap["journal"] and Path(ap["journal"]).exists(), f"日记落盘：{ap['journal']}")
     check(S, ap["impression"] == "他很轴但值得陪", "印象提炼")
-    check(S, profiles.get_profile(qq)["long_term_impression"] == "他很轴但值得陪", "印象写回档案")
+    _itgt = J._pick_impression_target(b)
+    check(S, profiles.get_profile(_itgt)["long_term_impression"] == "他很轴但值得陪",
+          f"印象写回档案（{_itgt or '空目标'}）")
     check(S, ap["archived"] == 1, f"关键词唯一命中才归档（archived={ap['archived']}）")
 
     # 命中多条 → 跳过
@@ -1438,9 +1458,11 @@ async def t_vision():
                    for s in _L3.tools_for("group_1")]
         if _gnames:
             _L3.GROUP_TOOL_DENY.add(_gnames[0])
-            _n2 = len(_L3.tools_for("group_1"))
+            _after = [((s.get("function") or {}).get("name"))
+                      for s in _L3.tools_for("group_1")]
             _L3.GROUP_TOOL_DENY.discard(_gnames[0])
-            check(S, _n2 == len(_gnames) - 1,
+            # top-N 会补位，条数不一定少，但被屏蔽的那个必须不在
+            check(S, _gnames[0] not in _after,
                   f"GROUP_TOOL_DENY 真的能屏蔽群聊工具（{_gnames[0]}）")
         else:
             skip(S, "群聊没有挂任何工具，跳过 GROUP_TOOL_DENY")
@@ -1602,12 +1624,15 @@ async def t_text():
     # prompt 侧的字数铁律
     try:
         from services.llm import _length_rule
+        from core import tuning as _t
         g = _length_rule("group_123")
         p = _length_rule("private_456")
-        check(S, "20" in g and "合并转发" in g,
-              f"群聊规则：{g[:40]}…")
-        check(S, "20" in p and "合并转发" in p,
-              f"私聊规则：{p[:40]}…")
+        _ob = int(_t.i("OUT_BUBBLE_CHARS"))
+        _pm = int(_t.i("PRIVATE_MAX_HANZI"))
+        check(S, str(_ob) in g and "合并转发" in g,
+              f"群聊规则 {_ob} 字：{g[:40]}…")
+        check(S, str(_pm) in p and "合并转发" in p,
+              f"私聊规则 {_pm} 字：{p[:40]}…")
     except Exception as e:
         check(S, False, "导入 services.llm._length_rule 失败", f"{type(e).__name__}: {e}")
 
@@ -3661,8 +3686,10 @@ async def t_referee():
     S = "referee"
     from services import referee as R, glm as G
 
-    check(S, "100000017" in R.PEER_GROUPS, f"监听群：{sorted(R.PEER_GROUPS)}")
-    check(S, "2267107632" in R.PEER_QQS, f"peer：{sorted(R.PEER_QQS)}")
+    # 不绑定具体号码（默认已清空，只有 .env 显式配置才生效）：
+    # 这里只验证解析成 set、且能按配置工作。
+    check(S, isinstance(R.PEER_GROUPS, set) and isinstance(R.PEER_QQS, set),
+          f"peer 配置可解析：groups={len(R.PEER_GROUPS)} / qqs={len(R.PEER_QQS)}")
     check(S, G.GLM_MODEL.startswith("glm-"), f"GLM 模型：{G.GLM_MODEL}")
     check(S, G.GLM_MODEL == "glm-5.3-flash", "默认 glm-5.3-flash（多模态）")
     check(S, isinstance(G.GLM_VISION_MODEL, str) and G.GLM_VISION_MODEL,
@@ -3934,15 +3961,17 @@ async def t_weekly():
 
     # dry-run 不写库
     from services import memory_v2 as _M
-    before = len(_M._load_index().get("items", []))
+    # 用 list_items()：json/sqlite 两种后端都能读（以前直接读 index.json）
+    before = len(_M.list_items(limit=1000))
     WA.apply(parsed, dry_run=True)
-    after = len(_M._load_index().get("items", []))
+    after = len(_M.list_items(limit=1000))
     check(S, before == after, "dry-run 不写记忆")
 
     # 真写
     WA.apply(parsed, dry_run=False)
-    idx = _M._load_index()
-    tags = [d for d in idx["items"] if "weekly_check" in (d.get("tags") or [])]
+    tags = [d for d in _M.list_items(limit=1000)
+            if "weekly_check" in str(d.get("tags") or "")
+            or "weekly_check" in str(d.get("summary") or "")]
     check(S, len(tags) >= 4, f"纠正已写入记忆 {len(tags)} 条")
 
     # ---- 联动 ----
@@ -4921,9 +4950,21 @@ async def t_napcat():
         check(S, "group" in L.TOOL_SCOPES.get(n, set()), f"{n} 群聊也挂")
     g = [s.get("function", {}).get("name") for s in L.tools_for("group_1")]
     p = [s.get("function", {}).get("name") for s in L.tools_for("private_1")]
-    check(S, "napcat_call" in g and "sing" not in g, f"群聊只挂 napcat（{g}）")
+    # top-N 之后群聊只保证「必留工具」；具体第 7 个以后会被相关性排序挤掉
+    check(S, {"send", "stay_silent"} <= set(g), f"群聊必留 send/stay_silent（{g}）")
     # 私聊必须包含群聊挂的那些（scope 是超集，不是替换）
-    check(S, set(g) <= set(p) and "napcat_call" in p, f"私聊挂全部（{p}）")
+    check(S, set(g) <= set(p), f"私聊是群聊的超集（{p}）")
+    # napcat_call 不是必留工具（top-N 会按相关性挤掉），但 scope 必须覆盖群聊：
+    # 关掉 top-N 看全量，验证「挂载」这个契约（检索效果由相关性排序决定）。
+    _old_top = L.RET_TOOLS_TOP
+    try:
+        L.RET_TOOLS_TOP = 0
+        _gall = [((s.get("function") or {}).get("name"))
+                 for s in L.tools_for("group_1")]
+    finally:
+        L.RET_TOOLS_TOP = _old_top
+    check(S, "napcat_call" in _gall and "sing" in _gall,
+          f"关掉 top-N 时群聊挂全部工具（含 napcat_call）")
     # 常驻 token 要小：说明靠 napcat_help 按需拉
     hint = NT.menu_hint(True)
     check(S, len(hint) < 900, f"常驻提示 {len(hint)} 字（要短，参数表按需查）")
@@ -6370,7 +6411,9 @@ async def t_moodjudge():
         check(S, _r.get("ok") and _r.get("word") == "憋着一口气",
               f"判读名词（{_r.get('word')}）")
         # 2026-11-20 定稿：判读给的是**涨幅 delta**，不是当前心情值
-        check(S, _r.get("delta") == -0.46, f"涨幅两位小数（{_r.get('delta')}）")
+        # 2026-11-25：模型给的是 value，delta 由 impact 本地推导（±0.10 / ±0.22）
+        check(S, _r.get("impact") == -2 and _r.get("delta") == -0.22,
+              f"涨幅按 impact 推导（impact={_r.get('impact')} Δ={_r.get('delta')}）")
         check(S, "value" not in _r,
               "判读结果不再给当前心情值（只给涨幅，水平由系统累计）")
         # 2026-11-20 定稿：判读不再直接给 affinity，改给 cause，
@@ -6379,8 +6422,8 @@ async def t_moodjudge():
               f"判读给出 cause（{_r.get('cause')}）")
         check(S, hasattr(MJ, "AFFINITY_GAIN"), "好感系数 AFFINITY_GAIN 可配置")
         _prompt = str((_Client.last.get("json") or {}).get("messages", [{}])[-1].get("content") or "")
-        check(S, "心情判读员" in _prompt and "两位小数" in _prompt,
-              "prompt 是「判读员」口径")
+        check(S, "心情判读员" in _prompt and "impact" in _prompt,
+              "prompt 是「判读员」口径（要 impact，不再要两位小数）")
         check(S, "心理活动" in _prompt and "最近" in _prompt, "判读看了心理活动 + 群聊上下文")
         check(S, _prompt.count("第49句") == 1 and "第0句" not in _prompt,
               "只把最近 20 条塞进 prompt")
@@ -6393,22 +6436,25 @@ async def t_moodjudge():
     _old_j = MJ.judge
 
     async def _fake(words, ctx=None, *, think="", prev_word="", prev_value=0.0,
-                    hint="", repair=False, archive=""):
+                    hint="", repair=False, archive="", src="", **kw):
         # 判读给的是涨幅
-        return {"ok": True, "word": "被夸得有点飘", "delta": 0.42,
-                "why": "他夸了她", "src": words, "at": time.time()}
+        return {"ok": True, "word": "被夸得有点飘", "impact": 2, "delta": 0.42,
+                "confidence": 0.9, "why": "他夸了她", "src": words,
+                "at": time.time()}
 
     try:
         MJ.judge = _fake
         _v0 = float(mood.get_mood(_k).get("value") or 0.0) / 100.0
-        _res = await MJ.judge_and_store(_k, "被夸得有点飘，但还装作没事", _ctx, force=True)
+        _res = await MJ.judge_and_store(_k, "被夸得有点飘，但还装作没事", _ctx,
+                                        force=True, think="被夸得有点飘，但还装作没事")
         check(S, _res.get("ok"), "判读写回成功")
         _j = mood.get_judge(_k)
         # 2026-11-22：Δ 上限按设计 0.5，0.42 原样落库（防一边倒靠入口噪音丢弃）
         check(S, _j.get("word") == "被夸得有点飘" and abs(float(_j.get("delta")) - 0.42) < 1e-6,
               f"mood 里存下了涨幅（{_j.get('word')}/Δ{_j.get('delta')}）")
-        check(S, abs(float(_j.get("value")) - (_v0 + 0.42)) < 1e-3,
-              f"心情值是累加的（{_v0:+.2f} + 0.42 → {_j.get('value')}）")
+        # v2 链路：心情值 = impact → z → K 步进（不再直接累加 delta）
+        check(S, abs(float(_res.get("v_after") or 0.0) - _v0) > 0.01,
+              f"心情按 impact 步进（{_v0:+.3f} → {_res.get('v_after')}）")
         check(S, "judge" in mood.get_mood(_k), "get_mood 带 judge 字段")
         # 衰减一次再看，判读不能被丢掉（_decay 只回 value 会丢）
         mood.set_label("再写一次心情", _k)
@@ -6451,7 +6497,7 @@ async def t_moodjudge():
     _old_j2 = MJ.judge
 
     async def _fake2(words, ctx=None, *, think="", prev_word="", prev_value=0.0,
-                     hint="", repair=False, archive=""):
+                     hint="", repair=False, archive="", src="", **kw):
         return {"ok": True, "word": "有点敷衍", "delta": -0.2, "why": "都在闲扯",
                 "src": (words or (ctx or [""])[-1]), "at": time.time()}
 
@@ -6464,7 +6510,10 @@ async def t_moodjudge():
         _r3 = await MJ.judge_and_store(_k2, "", None, force=True)
         check(S, _r3.get("ok") and _r3.get("word") == "有点敷衍",
               f"她没写也能按群聊判（{_r3.get('word')}）")
-        check(S, mood.get_judge(_k2).get("word") == "有点敷衍", "结果写回了 mood")
+        # ADR-038：没有她的 THINK/原话 → passive，只诊断不写状态
+        check(S, _r3.get("passive") is True
+              and mood.get_judge(_k2).get("word") != "有点敷衍",
+              "没写 THINK → 只诊断不写状态（passive）")
         # 没写时的刷新闸门：刚判过就不再判
         _r4 = await MJ.judge_and_store(_k2, "", None)
         check(S, (not _r4.get("ok")) and ("s 后" in str(_r4.get("err")) or "节流" in str(_r4.get("err"))),

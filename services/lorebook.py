@@ -137,6 +137,13 @@ def scan(gid: str, text: str, turn=None) -> dict:
     if not gid:
         return {"before": [], "post": [], "ids": []}
     turn = int(turn if turn is not None else current_turn(gid))
+    # 扫描深度（SillyTavern 的 depth 语义）：只看最近 SCAN_DEPTH 行。
+    # prompt_builder 传进来的 scan_text 是「最近几轮群聊 + 当前这句」，
+    # 关键词在更早的行里命中不该触发 —— 否则老梗会被反复捞出来。
+    if SCAN_DEPTH > 0:
+        _lines = str(text or "").splitlines()
+        if len(_lines) > SCAN_DEPTH:
+            text = "\n".join(_lines[-SCAN_DEPTH:])
     ck = (gid, turn)
     if ck in _CACHE:
         return _CACHE[ck]

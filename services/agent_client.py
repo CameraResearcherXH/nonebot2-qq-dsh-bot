@@ -54,6 +54,9 @@ _RECALL_ENDPOINT_MISSING = False
 _RECALL_PROMPT = "{q}"
 
 RECALL_TIMEOUT = tuning.f("AGENT_RECALL_TIMEOUT")
+# 图书馆延迟目标 / 候选池条数（retrieval §7）：超目标只告警，不阻断
+LIB_LATENCY_MS = tuning.f("RET_LIB_LATENCY_MS")
+WORLD_TOP = max(1, tuning.i("RET_WORLD_TOP"))
 # 图书馆（RAG v3）实测一次 5~14s：2.5s 超时 = 每条消息都白等然后判「不可用」。
 # 2026-11-24 用户实测「小明是如何解决温室效应的」→ 13.4s 才返回弱智吧内容。
 LIB_TIMEOUT = tuning.f("AGENT_LIBRARY_TIMEOUT")
@@ -252,9 +255,16 @@ async def recall(
     hit = _CACHE.get(ck)
     if hit and time.time() - float(hit[0]) < float(hit[2]):
         return dict(hit[1])
+    _t0 = time.monotonic()
     out = await _recall_impl(
         q, speaker_qq=speaker_qq, mood_value=mood_value,
         recent_ctx=recent_ctx, timeout=timeout)
+    _ms = (time.monotonic() - _t0) * 1000.0
+    if _ms > LIB_LATENCY_MS:
+        logger.warning(f"[AGENT] 图书馆 {_ms:.0f}ms > 目标 {LIB_LATENCY_MS:.0f}ms")
+    # 候选池截断：RAG 偶尔回很多条，只留最靠前的 WORLD_TOP 条进 prompt
+    if out and out.get("facts"):
+        out["facts"] = list(out["facts"])[:WORLD_TOP]
     ttl = _CACHE_TTL_OK if (out or {}).get("facts") else _CACHE_TTL_EMPTY
     _CACHE[ck] = (time.time(), dict(out or empty_recall()), ttl)
     if len(_CACHE) > 300:
