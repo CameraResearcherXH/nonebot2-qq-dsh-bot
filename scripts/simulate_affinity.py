@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""好感模型 v2 的数值模拟（只算数，不碰线上数据）。
+"""好感模型 v2.1 的数值模拟（只算数，不碰线上数据）。
 
-用途：调参 / 评审时先看曲线，别直接改线上。
-公式定义见 docs/affinity-quantification-design.md。
+模型：a = bond + Σ traces（ACT-R 式幂律痕迹求和）
+  每条事件/陪伴都是一条会衰减的「痕迹」，天生解决「幂律不能增量叠加」的问题，
+  也让「陪伴抵消衰减」有解析解（见 docs/affinity-quantification-design.md §2.5）。
 
 用法：
-    python3 scripts/simulate_affinity.py            # 默认参数
-    python3 scripts/simulate_affinity.py --json     # 给别的脚本用
+    python3 scripts/simulate_affinity.py            # 全部表
+    python3 scripts/simulate_affinity.py --json     # 机器可读
 """
 from __future__ import annotations
 
@@ -15,18 +16,19 @@ import json
 import math
 
 # ---------------- 参数（与设计文档 §3 一致）----------------
-F_MAX = 0.60          # 深度能提供的「bond」上限
-F_EXP = 1.5           # bond 随投入 I 的指数（越大越陡）
-T_HEAT = 10.0         # 热度分量衰减时间常数（天）
-P_HEAT = 0.5          # 幂律指数
-T_NEG = 30.0          # 负好感的遗忘时间常数（天）
-P_NEG = 0.5
-STEP = {1: 0.045, 2: 0.090}   # |impact| → 基础步长
-SAT_POS = 0.70        # 正向饱和指数 (1-a)^γ
-SAT_NEG = 0.35        # 负向饱和指数 (1-|a|)^γ
-NEG_BIAS = 1.7        # 负面事件权重（Baumeister 2001 / Gottman 5:1）
-CLAMP = 0.20          # 单次步长硬上限
-DAILY_CAP = 0.15      # 每日同向净变化上限
+T_TRACE = 10.0        # 痕迹衰减时间常数（天）
+P_TRACE = 0.5         # 幂律指数（ACT-R d≈0.5）
+BOND_MAX = 0.60       # bond 上限
+BOND_EXP = 1.5        # bond 随投入 I 的陡度
+BOND_HL_D = 180.0     # bond 自身极慢衰减（半年减半）
+STEP = {1: 0.030, 2: 0.070}   # |impact| → 基础步长
+SAT_POS = 0.70        # 正向饱和指数
+SAT_NEG = 0.35        # 负向饱和指数
+NEG_BIAS = 1.6        # 负面事件权重
+REPAIR_BASE = 0.16    # 道歉破冰基础步长（只对负好感生效）
+COMP_W = 0.004        # 一次「陪伴」（闲聊一句）的痕迹权重
+COMP_CAP = 0.75       # 光靠陪伴最多到 0.75：再往上要靠事件/投入
+TRACE_MAX = 400       # 每人最多保留多少条痕迹（按天聚合，裁最弱的）
 
 PERSONAS = [
     # 名字, 记录条数, 认识天数, 近7天消息数, 当前好感
@@ -37,142 +39,227 @@ PERSONAS = [
     ("讨厌的人", 6, 60, 40, -0.60),
 ]
 
+# 现网 v1 的 intimacy / 近期互动（仅用于对比）
+CUR = {"新认识": (0.10, 0.10), "普通群友": (0.30, 0.25),
+       "好朋友": (0.98, 1.00), "挚友": (0.98, 1.00), "讨厌的人": (0.30, 0.20)}
+
+
+def clamp(v: float, lo: float = -1.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, v))
+
 
 def investment(notes: float, days: float, msgs: float) -> float:
-    """投入 I ∈ [0,1]：相处记录 / 认识时长 / 近期互动，各占一部分。"""
     return (0.50 * min(1.0, notes / 20.0)
             + 0.30 * min(1.0, days / 120.0)
             + 0.20 * min(1.0, msgs / 150.0))
 
 
-def bond_of(a: float, inv: float) -> float:
-    """不随时间衰减的「底子」：只对正好感存在；投入越深越大。"""
-    if a <= 0:
+def bond_of(inv: float) -> float:
+    return BOND_MAX * (max(0.0, inv) ** BOND_EXP)
+
+
+def trace_w(kind, a: float, *, conf: float = 1.0, novelty: float = 1.0,
+            grudge: float = 0.0) -> float:
+    """一条痕迹的初始权重。kind: 'repair' / 'comp' / +1 / +2 / -1 / -2。"""
+    a = clamp(a)
+    if kind == "repair":
+        return REPAIR_BASE * (1.0 - abs(a)) ** 0.35 * (1.0 - 0.5 * grudge)
+    if kind == "comp":
+        # 陪伴有天花板：日常闲聊能把关系养到 0.75 左右，
+        # 再往上必须靠「事件」（被夸/一起经历事情）和 bond 投入。
+        room = max(0.0, (COMP_CAP - max(0.0, a)) / COMP_CAP)
+        return COMP_W * (1.0 - abs(a)) ** 0.5 * room
+    k = int(kind)
+    if abs(k) not in STEP:
         return 0.0
-    beta = F_MAX * (max(0.0, inv) ** F_EXP)
-    return min(a, a * beta)
+    base = STEP[abs(k)] * max(0.0, conf) * max(0.0, novelty)
+    if k > 0:
+        return base * (1.0 - abs(a)) ** SAT_POS
+    return -base * NEG_BIAS * (1.0 - abs(a)) ** SAT_NEG
 
 
-def decay(a: float, inv: float, days: float, grudge: float = 0.0) -> float:
-    """t 天没互动后的好感（幂律 + 底子）。"""
-    if days <= 0:
-        return a
-    if a >= 0:
-        b = bond_of(a, inv)
-        heat = a - b
-        return b + heat * (1.0 + days / T_HEAT) ** (-P_HEAT)
-    # 负好感：不会自己变正，只是慢慢淡
-    tn = T_NEG * (1.0 + 2.0 * max(0.0, grudge))
-    return a * (1.0 + days / tn) ** (-P_NEG)
+def value_of(bond: float, traces, now: float = 0.0) -> float:
+    """a = bond + Σ w·(1+Δt/T)^-p。"""
+    s = 0.0
+    for t, w in traces:
+        s += w * (1.0 + max(0.0, now - t) / T_TRACE) ** (-P_TRACE)
+    return clamp(bond + s)
 
 
-def step(impact: int, a: float, conf: float = 1.0, novelty: float = 1.0,
-         grudge: float = 0.0) -> float:
-    """一次事件让好感动多少（impact ∈ {-2,-1,0,1,2}）。"""
-    k = abs(int(impact))
-    if k not in STEP:
-        return 0.0
-    base = STEP[k]
-    if impact > 0:
-        # 两头都饱和：高好感难再涨，负好感也难靠一次好话翻正
-        sat = (1.0 - abs(a)) ** SAT_POS
-        d = base * sat * max(0.0, conf) * max(0.0, novelty) * (1.0 - 0.5 * grudge)
+def add_trace(traces, now: float, w: float):
+    """同一天的多条痕迹合并成一条（否则长尾会被条数上限裁掉）。
+
+    幂律 p=0.5 的记忆很长：如果按「最近 N 条」裁剪，等于把一年前的陪伴
+    全部删掉，陪伴永远攒不起来。所以按天聚合，再按权重裁最弱的。
+    """
+    if abs(w) < 1e-6:
+        return traces
+    if traces and int(traces[-1][0]) == int(now):
+        t0, w0 = traces[-1]
+        traces[-1] = (t0, w0 + w)
     else:
-        sat = (1.0 - abs(a)) ** SAT_NEG
-        d = -base * NEG_BIAS * sat * max(0.0, conf) * max(0.0, novelty)
-    return max(-CLAMP, min(CLAMP, d))
+        traces.append((now, w))
+    if len(traces) > TRACE_MAX:
+        traces.sort(key=lambda x: -abs(x[1]))
+        traces = sorted(traces[:TRACE_MAX], key=lambda x: x[0])
+    return traces
 
 
-def current_decay(a: float, intimacy: float, contact: float, days: float) -> float:
-    """现网 v1：指数衰减到 0，τ = 7天 × 深度系数。"""
+# ---------------------------------------------------------------- 衰减
+def decay_v2(a0: float, inv: float, days: float) -> float:
+    b = bond_of(inv) if a0 > 0 else 0.0
+    b = min(b, max(0.0, a0))
+    heat = a0 - b
+    if heat >= 0:
+        return clamp(b + heat * (1.0 + days / T_TRACE) ** (-P_TRACE))
+    return clamp(a0 * (1.0 + days / 30.0) ** (-0.5))
+
+
+def decay_v1(a0: float, intimacy: float, contact: float, days: float) -> float:
     depth = max(0.1, (1.0 + 2.0 * intimacy) * (1.0 + 0.5 * contact))
-    tau = 7.0 * depth
-    return a * math.pow(0.5, days / tau)
+    return a0 * math.pow(0.5, days / (7.0 * depth))
 
 
-# 现网各人设的 intimacy / 近期互动归一化（用于对比）
-CUR = {"新认识": (0.10, 0.10), "普通群友": (0.30, 0.25),
-       "好朋友": (0.98, 1.00), "挚友": (0.98, 1.00), "讨厌的人": (0.30, 0.20)}
-
-
-def table_compare() -> list:
-    out = []
-    for name, n, d, m, a0 in PERSONAS:
-        inv = investment(n, d, m)
-        it, ct = CUR[name]
-        row = {"who": name, "a0": a0}
-        for label, days in (("1周", 7), ("1月", 30), ("3月", 90)):
-            row[label + "v1"] = round(current_decay(a0, it, ct, days) - a0, 3)
-            row[label + "v2"] = round(decay(a0, inv, days) - a0, 3)
-        out.append(row)
-    return out
-
-
+# ---------------------------------------------------------------- 表
 def table_decay() -> list:
     out = []
     for name, n, d, m, a0 in PERSONAS:
         inv = investment(n, d, m)
-        row = {"who": name, "a0": a0, "I": round(inv, 3),
-               "bond": round(bond_of(a0, inv), 3)}
+        it, ct = CUR[name]
+        row = {"who": name, "a0": a0, "I": round(inv, 3)}
         for label, days in (("1周", 7), ("1月", 30), ("3月", 90), ("1年", 365)):
-            v = decay(a0, inv, days)
-            row[label] = round(v, 3)
-            row[label + "Δ"] = round(v - a0, 3)
+            row[label] = round(decay_v2(a0, inv, days), 3)
+            row[label + "Δ"] = round(row[label] - a0, 3)
+            row[label + "v1Δ"] = round(decay_v1(a0, it, ct, days) - a0, 3)
         out.append(row)
     return out
 
 
-def table_step() -> list:
+def table_events() -> list:
     out = []
-    for name, n, d, m, a0 in PERSONAS:
-        row = {"who": name, "a": a0}
-        for k in (2, -2):
-            row[("+%d" % k) if k > 0 else ("%d" % k)] = round(step(k, a0), 3)
-        out.append(row)
+    for a in (-0.80, -0.50, 0.0, 0.30, 0.60, 0.90):
+        out.append({
+            "a": a,
+            "+2": round(trace_w(2, a), 3),
+            "+1": round(trace_w(1, a), 3),
+            "-1": round(trace_w(-1, a), 3),
+            "-2": round(trace_w(-2, a), 3),
+            "道歉": round(trace_w("repair", a), 3),
+            "陪伴": round(trace_w("comp", a), 3),
+        })
     return out
+
+
+def sim_daily(per_day: int, days: int = 365, a0: float = 0.0,
+              extra_events=()) -> list:
+    """每天 per_day 句闲聊（陪伴痕迹），可插入 (day, kind) 事件。"""
+    traces, bond = [], 0.0
+    ev = dict(extra_events)
+    curve = []
+    for d in range(days):
+        for _ in range(per_day):
+            a = value_of(bond, traces, d)
+            traces = add_trace(traces, d, trace_w("comp", a))
+        if d in ev:
+            a = value_of(bond, traces, d)
+            traces = add_trace(traces, d, trace_w(ev[d], a))
+        if d in (0, 6, 29, 89, 179, 364):
+            curve.append((d + 1, round(value_of(bond, traces, d), 3)))
+    return curve
+
+
+def sim_breakice(a0: float = -0.60) -> list:
+    """讨厌的人：第 0/1/3 天各一次真诚道歉，之后正常聊天。"""
+    traces = [(0, a0)]
+    out = []
+    for d, kind in ((0, "repair"), (1, "repair"), (3, "repair")):
+        a = value_of(0.0, traces, d)
+        traces = add_trace(traces, d, trace_w(kind, a))
+        out.append((d + 1, round(value_of(0.0, traces, d), 3)))
+    for d in (6, 29, 89):
+        out.append((d + 1, round(value_of(0.0, traces, d), 3)))
+    return out
+
+
+def breakeven_w(a_target: float, per_day: int = 1, days: int = 365) -> float:
+    """每天 per_day 句陪伴、持续 days 天，恰好把好感维持在 a_target 所需的单句权重。"""
+    lo, hi = 0.0, 0.05
+    for _ in range(40):
+        mid = (lo + hi) / 2
+        traces = []
+        for d in range(days):
+            for _ in range(per_day):
+                a = value_of(0.0, traces, d)
+                room = max(0.0, (COMP_CAP - max(0.0, a)) / COMP_CAP)
+                traces = add_trace(traces, d,
+                                   mid * (1.0 - abs(a)) ** 0.5 * room)
+        if value_of(0.0, traces, days) < a_target:
+            lo = mid
+        else:
+            hi = mid
+    return round((lo + hi) / 2, 4)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
-    dec, stp = table_decay(), table_step()
+
+    dec, evt = table_decay(), table_events()
+    daily = {n: sim_daily(n) for n in (1, 3, 10)}
+    brk = sim_breakice()
+    be = {a: breakeven_w(a, 1) for a in (0.3, 0.5)}
     if args.json:
-        print(json.dumps({"decay": dec, "step": stp}, ensure_ascii=False, indent=1))
+        print(json.dumps({"decay": dec, "events": evt,
+                          "daily": daily, "breakice": brk,
+                          "breakeven_w": be}, ensure_ascii=False, indent=1))
         return 0
 
-    print("=" * 84)
-    print("好感模型 v2：时间衰减（t 天完全没互动后剩多少）")
-    print("=" * 84)
-    print("%-8s %5s %5s %6s | %-14s %-14s %-14s %-14s"
-          % ("人设", "a0", "I", "bond", "1周", "1月", "3月", "1年"))
+    print("=" * 92)
+    print("A. 时间衰减：v1（现网）vs v2.1")
+    print("=" * 92)
+    print("%-8s %5s %5s | %-15s %-15s %-15s" %
+          ("人设", "a0", "I", "1月(v1/v2)", "3月(v1/v2)", "1年 v2"))
     for r in dec:
-        cells = []
-        for k in ("1周", "1月", "3月", "1年"):
-            cells.append("%.2f(%+.2f)" % (r[k], r[k + "Δ"]))
-        print("%-8s %5.2f %5.2f %6.2f | %-14s %-14s %-14s %-14s"
-              % (r["who"], r["a0"], r["I"], r["bond"], *cells))
+        print("%-8s %5.2f %5.2f | %-15s %-15s %-15s" %
+              (r["who"], r["a0"], r["I"],
+               "%+.2f/%+.2f" % (r["1月v1Δ"], r["1月Δ"]),
+               "%+.2f/%+.2f" % (r["3月v1Δ"], r["3月Δ"]),
+               "%.2f" % r["1年"]))
 
     print()
-    print("=" * 84)
-    print("现网 v1 vs v2：一个月/三个月掉多少（Δ）")
-    print("=" * 84)
-    print("%-8s %5s | %-16s %-16s %-16s"
-          % ("人设", "a0", "1周(v1/v2)", "1月(v1/v2)", "3月(v1/v2)"))
-    for r in table_compare():
-        print("%-8s %5.2f | %-16s %-16s %-16s"
-              % (r["who"], r["a0"],
-                 "%+.2f / %+.2f" % (r["1周v1"], r["1周v2"]),
-                 "%+.2f / %+.2f" % (r["1月v1"], r["1月v2"]),
-                 "%+.2f / %+.2f" % (r["3月v1"], r["3月v2"])))
+    print("=" * 92)
+    print("B. 事件映射：同一次事件，在不同好感下推动多少")
+    print("=" * 92)
+    print("%6s %9s %9s %9s %9s %9s %9s" %
+          ("当前a", "被夸+2", "被夸+1", "被伤-1", "被伤-2", "道歉", "闲聊一句"))
+    for r in evt:
+        print("%6.2f %9.3f %9.3f %9.3f %9.3f %9.3f %9.3f" %
+              (r["a"], r["+2"], r["+1"], r["-1"], r["-2"],
+               r["道歉"], r["陪伴"]))
 
     print()
-    print("=" * 84)
-    print("好感模型 v2：单次事件步长（impact=±2，conf=1，novelty=1）")
-    print("=" * 84)
-    print("%-8s %6s %12s %12s" % ("人设", "a", "被夸 +2", "被伤 -2"))
-    for r in stp:
-        print("%-8s %6.2f %12.3f %12.3f" % (r["who"], r["a"], r["+2"], r["-2"]))
+    print("=" * 92)
+    print("C. 陪伴 vs 衰减：每天聊 N 句、连续 365 天，好感会走到哪")
+    print("=" * 92)
+    print("%-10s %s" % ("每天句数", "第1天 / 1周 / 1月 / 3月 / 半年 / 1年"))
+    for n, curve in daily.items():
+        print("%-10s %s" % (n, " / ".join("%.2f" % v for _, v in curve)))
+    print("（起点 0.00；没有别的事件，只有「陪伴」痕迹）")
+
+    print()
+    print("=" * 92)
+    print("D. 讨厌的人道歉破冰（a0=-0.60，第 1/2/4 天各一次道歉）")
+    print("=" * 92)
+    print(" → ".join("第%d天 %.2f" % (d, v) for d, v in brk))
+
+    print()
+    print("=" * 92)
+    print("E. 抵消系数：每天 1 句陪伴，要把好感稳在目标值，单句需要多重")
+    print("=" * 92)
+    for a, w in be.items():
+        print("  稳住 %.1f → 单句权重 ≥ %.4f（默认 %.4f，≈ 每天 %.1f 句）"
+              % (a, w, COMP_W, w / COMP_W))
     return 0
 
 

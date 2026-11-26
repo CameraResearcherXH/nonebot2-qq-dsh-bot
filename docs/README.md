@@ -29,7 +29,7 @@
 | [emotion-dynamics-design.md](emotion-dynamics-design.md) | 心情步进+锚点 / 关系衰减 / 人设量化 / 安静主动 |
 | [retrieval-design.md](retrieval-design.md) | 角色脑 sqlite / 时间·情绪过滤 / 关键词工程 / RAG 分离 / 评测 |
 | [style-white-moon-design.md](style-white-moon-design.md) | 风格四层 / 白月光定位 / 注意力额度 / 借风格护栏 |
-| [affinity-quantification-design.md](affinity-quantification-design.md) | **好感量化 v2 设计稿**：两分量（bond/heat）+ 幂律衰减 + 两头饱和（待拍板） |
+| [affinity-quantification-design.md](affinity-quantification-design.md) | **好感量化 v2.1 设计稿**：痕迹求和 + 事件映射表 + 道歉破冰 + 陪伴抵消系数（待拍板） |
 | [emotion-annotation-spec.md](emotion-annotation-spec.md) | 200 条情绪标注规范（抽样/字段/一致率） |
 | [attention-design.md](attention-design.md) | 上下文预算 / 位置排序 / 引用锚点 / 标签预过滤 / 成本 |
 | [prompt-skeleton-design.md](prompt-skeleton-design.md) | 各块最终文本 / 空块规则 / 证据升序 / anchor / 分气泡 |
