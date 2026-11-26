@@ -58,6 +58,8 @@
 | [usage-report.md](usage-report.md) | 用量与 prompt 体检 |
 | [verification-runbook.md](verification-runbook.md) | **线上验证**：NapCat 日志 ↔ 设计断言怎么对账 |
 | [verification-report-20261125-debt.md](verification-report-20261125-debt.md) | **本轮验证报告**：三项工程债闭环 + 8 个假接线键收口（含真实日志回滚） |
+| [red-packet-feasibility.md](red-packet-feasibility.md) | **红包可行性**：NapCat/OneBot 没有收发接口；收需原生插件，发不可行 |
+| [verification-report-20261126-fixes.md](verification-report-20261126-fixes.md) | **本轮验证报告**：@ 后续被冷却吞 / 亲近突降 / B站短链 / 部署侧 3 类问题 |
 | [maibot-analysis.md](maibot-analysis.md) | 外部参考：MaiBot 思路分析 |
 
 ### 历史（已被 v2 取代，勿当现行）

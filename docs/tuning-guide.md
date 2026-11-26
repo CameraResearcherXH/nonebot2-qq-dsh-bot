@@ -118,11 +118,29 @@ ADDR_RECENT_MENTION 默认 0.50（短句冲人「找打了」→ 指向最近被
 ### 3.8 回复太长 / 太碎
 
 ```text
-OUT_BUBBLE_CHARS  默认 40（单泡汉字上限）
-OUT_BUBBLES_MAX   默认 2（单轮气泡上限）
+OUT_BUBBLE_CHARS   默认 40（单泡汉字上限）
+OUT_BUBBLES_MAX    默认 2（单轮气泡上限）
+GROUP_MAX_HANZI    默认 20（群聊单条目标长度，显示宽度）
+PRIVATE_MAX_HANZI  默认 20（私聊同上）
+LONG_FORWARD_MIN   默认 120（系统长文转合并转发卡片的下限）
 ```
 
-> 太碎 → `BUBBLE_CHARS` 60；太啰嗦 → 40 保持不变、靠人设收紧。
+> 太碎 → `OUT_BUBBLE_CHARS` 60；太啰嗦 → 40 保持不变、靠人设收紧。
+> **注意**：这些是「超过就转合并转发」的阈值，不是截断。写成 1000 不会让话更长，
+> 只会让一条几千字直接刷屏 —— 启动日志会 `[ENV] ⚠️` 提醒。
+
+### 3.8b 回完一句后下一句不理
+
+```text
+GROUP_REPLY_COOLDOWN  默认 45（秒）
+REPLY_INTERVAL        同一会话两次回复的最小间隔
+FOCUS_FOLLOW_COUNT    被 @ 后关注几条（默认 3）
+FOCUS_TIMEOUT         关注窗口有效期（默认 120s）
+```
+
+> 45s 冷却只拦「没点她」的消息；**@ / 喊名字 / 关注窗口内的人**不受影响。
+> 觉得太粘 → 调小 `FOCUS_FOLLOW_COUNT`；觉得「只理艾特、后面不接」→ 先确认日志里
+> 不是 `[COOLDOWN]` 而是模型自己 `stay_silent`。
 
 ### 3.9 长文档答不全
 

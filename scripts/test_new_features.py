@@ -1242,6 +1242,58 @@ try:
 except Exception as _e:
     check("ADDR 可导入", False, f"{type(_e).__name__}: {_e}")
 
+# ---- 2026-11-26 回归：亲近曲线 / B站短链 / 启动配置体检 ----
+try:
+    from services.profiles import intimacy_from_score as _ifs
+    check("INT：亲近线性 + 软上限（score=3 → 0.98）",
+          abs(_ifs(3.0) - 0.98) < 1e-9, str(_ifs(3.0)))
+    check("INT：score=1.5 → 0.50（不再被饱和曲线砍半）",
+          abs(_ifs(1.5) - 0.5) < 1e-9, str(_ifs(1.5)))
+    check("INT：score=100 → 0.98（不会到 1.00）",
+          abs(_ifs(100.0) - 0.98) < 1e-9, str(_ifs(100.0)))
+except Exception as _e:
+    check("INT 可导入", False, f"{type(_e).__name__}: {_e}")
+
+try:
+    from services.link_preview import pick_final_url as _pick
+    _quiz = "https://www.bilibili.com/blackboard/activity-abc.html"
+    check("BILI：活动页/测试题保持原样（不被改成视频）",
+          _pick(_quiz, "推荐视频 BV1atse6EEfx") == _quiz, _pick(_quiz, "BV1atse6EEfx"))
+    check("BILI：直播页保持原样",
+          _pick("https://live.bilibili.com/123", "") == "https://live.bilibili.com/123")
+    check("BILI：JS 跳转页才从 HTML 抠 BV",
+          _pick("https://b23.tv/abc", "var x='BV1atse6EEfx'")
+          == "https://www.bilibili.com/video/BV1atse6EEfx")
+    check("BILI：video 页原样返回",
+          _pick("https://www.bilibili.com/video/BV1atse6EEfx?p=1", "")
+          == "https://www.bilibili.com/video/BV1atse6EEfx?p=1")
+except Exception as _e:
+    check("BILI 可导入", False, f"{type(_e).__name__}: {_e}")
+
+try:
+    from services import env_guard as _eg
+    _save_env = {k: os.environ.get(k) for k in
+                 ("ALLOWED_GROUPS", "ALLOWED_PRIVATE", "OWNER_QQ", "SUPERUSERS")}
+    for _k in _save_env:
+        os.environ.pop(_k, None)
+    _w = _eg.check()
+    check("ENV：白名单为空必须告警",
+          any("ALLOWED_GROUPS" in x for x in _w)
+          and any("ALLOWED_PRIVATE" in x for x in _w), str(_w[:2]))
+    os.environ["ALLOWED_GROUPS"] = "111"
+    os.environ["ALLOWED_PRIVATE"] = "222"
+    os.environ["OWNER_QQ"] = "222"
+    _w2 = _eg.check()
+    check("ENV：填好后不再告警白名单",
+          not any("ALLOWED_GROUPS" in x or "ALLOWED_PRIVATE" in x for x in _w2))
+    for _k, _v in _save_env.items():
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
+except Exception as _e:
+    check("ENV 可导入", False, f"{type(_e).__name__}: {_e}")
+
 print("PASS %d / FAIL %d" % (len(PASS), len(FAIL)))
 if FAIL:
     print("失败：" + "、".join(FAIL))

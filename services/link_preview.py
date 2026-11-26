@@ -99,6 +99,26 @@ def card_from_message(event) -> dict:
         return {}
 
 
+def pick_final_url(final: str, html: str = "") -> str:
+    """短链展开后该用哪个地址（纯函数，方便单测）。
+
+    规则：
+      1. 已经落在 bilibili.com 的**任何**页面 → 原样返回。
+         ⚠️ 2026-11-26：以前只看 final 里有没有 BV，没 BV 就去 HTML 里抓 ——
+         活动页 / 测试题 / 专栏 / 直播页里常常嵌着推荐视频的 BV，于是整条链接
+         被改写成 /video/BVxxxx，群友点进去就变成视频（实测「B 站测试题没法做」）。
+      2. final 还是 b23.tv（服务端没 302，返回的是 JS 跳转页）→ 才从 HTML 抠 BV。
+      3. 都没有 → 返回 final 本身。
+    """
+    final = str(final or "")
+    if "bilibili.com" in final:
+        return final
+    m = _BV_RE.search(html or "")
+    if m:
+        return f"https://www.bilibili.com/video/{m.group(1)}"
+    return final
+
+
 async def _expand_short(url: str) -> str:
     """b23.tv 短链 → 真实地址（优先跟 302，不行就从返回 HTML 里抓 BV）。"""
     try:
@@ -107,18 +127,17 @@ async def _expand_short(url: str) -> str:
                                               "Referer": "https://www.bilibili.com/"}) as c:
             r = await c.get(url)
             final = str(r.url)
-            if _BV_RE.search(final):
-                logger.info(f"[LINK] b23.tv 302 成功：{final[:80]}")
-                return final
-            # 有些 b23.tv 不 302，而是 200 返回一个 JS 跳转页 —— 从 HTML 里抠 BV
-            m = _BV_RE.search(r.text or "")
-            if m:
-                logger.info(f"[LINK] b23.tv 没 302，从 HTML 里抓到 {m.group(0)}")
-                return f"https://www.bilibili.com/video/{m.group(0)}"
-            logger.warning(
-                f"[LINK] b23.tv 解析不到 BV：HTTP {r.status_code} final={final[:100]!r} "
-                f"body前80字={(r.text or '')[:80]!r}"
-            )
+            out = pick_final_url(final, r.text or "")
+            if out != final:
+                logger.info(f"[LINK] b23.tv 没 302，从 HTML 里抓到 BV → {out[:80]}")
+            elif "bilibili.com" in out:
+                logger.info(f"[LINK] b23.tv 展开：{out[:100]}")
+            else:
+                logger.warning(
+                    f"[LINK] b23.tv 解析不到 BV：HTTP {r.status_code} final={final[:100]!r} "
+                    f"body前80字={(r.text or '')[:80]!r}"
+                )
+            return out
     except Exception as e:
         logger.warning(f"[LINK] 短链展开失败: {type(e).__name__}: {e}")
     return url

@@ -251,11 +251,37 @@ def redact_secrets(dest: Path) -> list:
     return hits
 
 
-# .env.example 里必须清空的键（密钥 / 私人号码 / 私人名单）
-_ENV_CLEAR_KEYS = {
-    "SUPERUSERS", "ALLOWED_GROUPS", "ALLOWED_PRIVATE", "OWNER_QQ",
-    "NAPCAT_ACCOUNT", "SELF_ID", "SELF_ALIASES",
+# 身份类键：不能留空（留空 = 群聊/私聊全部不理，新人会以为机器人坏了），
+# 统一换成一眼就知道要改的占位号。
+_ENV_PLACEHOLDER = {
+    "SUPERUSERS": '["123456789"]',
+    "OWNER_QQ": "123456789",
+    "ALLOWED_GROUPS": "111111111",
+    "ALLOWED_PRIVATE": "123456789",
+    "NAPCAT_ACCOUNT": "123456789",
+    "SELF_ID": "123456789",
+    "SELF_ALIASES": "",
 }
+
+# 名字里带 KEY/TOKEN 不等于就是密钥：`GLM_MAX_TOKENS=800`、`VIDEO_MAX_KEY_FRAMES=12`
+# 这种是普通参数，2026-11-25 前被一起清空，导致别人部署后行为和我们不一致。
+_STRONG_SECRET_HINTS = ("SECRET", "PASSWORD", "PASSWD", "COOKIE", "TOKEN",
+                        "API_KEY", "APIKEY", "PRIVATE_KEY")
+_WEAK_SECRET_HINTS = ("KEY", "PASS")
+
+
+def _is_plain_value(val: str) -> bool:
+    """数字 / 布尔 / 短枚举（如 glm、sqlite）= 普通参数，不该被当成密钥清空。"""
+    v = str(val or "").strip().strip("\"'")
+    if not v:
+        return True
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", v):
+        return True
+    if v.lower() in ("true", "false", "on", "off", "yes", "no"):
+        return True
+    if re.fullmatch(r"[A-Za-z0-9_./:-]{1,24}", v) and not re.search(r"\d", v):
+        return True
+    return False
 
 # 私人基础设施地址 → 公开默认值（2026-11-24：阿里云专属工作区 / 自建站不能进发行仓）
 _ENV_REWRITE = {
@@ -269,7 +295,8 @@ def gen_env_example(dest: Path) -> int:
     src = ROOT / ".env"
     if not src.exists():
         return 0
-    out = ["# 自动生成：密钥与私人名单已清空；普通参数保留当前值，按需修改。", ""]
+    out = ["# 自动生成：密钥已清空；白名单/账号用 123456789 占位（必须改成你自己的）。",
+           "# 数字 / 布尔 / 短枚举类参数保留我们线上的值，可直接用。", ""]
     n = 0
     for line in src.read_text(encoding="utf-8", errors="ignore").splitlines():
         m = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", line)
@@ -283,9 +310,13 @@ def gen_env_example(dest: Path) -> int:
             val, comment = val.split("#", 1)
             comment = "#" + comment
         val = val.strip()
-        secret = (key in _ENV_CLEAR_KEYS
-                  or any(t in key for t in ("SECRET", "KEY", "TOKEN", "COOKIE", "PASS")))
-        if secret:
+        _ku = key.upper()
+        _strong = any(t in _ku for t in _STRONG_SECRET_HINTS)
+        _weak = any(t in _ku for t in _WEAK_SECRET_HINTS)
+        if key in _ENV_PLACEHOLDER:
+            val = _ENV_PLACEHOLDER[key]
+        elif (_strong or _weak) and not _is_plain_value(val):
+            # 只有「看起来真是密钥」才清空；数字/布尔/短枚举保留（见 _is_plain_value）
             val = ""
         elif key in _ENV_REWRITE:
             val = _ENV_REWRITE[key]
@@ -316,9 +347,10 @@ def gen_node_env_example(dest: Path) -> int:
         if "#" in val:
             val, comment = val.split("#", 1)
             comment = "#" + comment
-        # 密钥类一律留空；普通参数保留原值当示例
-        if (any(t in key for t in ("SECRET", "KEY", "TOKEN", "COOKIE", "PASS"))
-                or key in ("DASHSCOPE_BASE_URL",)):
+        # 密钥类留空；数字/布尔/短枚举这种普通参数保留（`*_MAX_TOKENS` 也是普通参数）
+        _ku = key.upper()
+        _hit = any(t in _ku for t in _STRONG_SECRET_HINTS + _WEAK_SECRET_HINTS)
+        if (_hit and not _is_plain_value(val)) or key in ("DASHSCOPE_BASE_URL",):
             val = ""
         out.append("%s=%s" % (key, val.rstrip() + (" " + comment.strip() if comment.strip() else "")))
         n += 1

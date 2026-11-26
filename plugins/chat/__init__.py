@@ -2568,7 +2568,12 @@ async def _need_reply(event: MessageEvent) -> bool:
         try:
             _cool = tuning.f("GROUP_REPLY_COOLDOWN")
             _last_reply = float(session_last_reply.get(f"group_{gid}") or 0.0)
-            _addressed_now = (event.is_tome()
+            # ⚠️ 2026-11-26：被 @ 之后开启的「关注窗口」不能被这条冷却一刀切。
+            #    真机日志：@ 她 → 回一句 → 45s 内同一个人接着说 → 全被
+            #    `[COOLDOWN] 刚回过 Ns，这条没点她` 吞掉，用户看到的就是
+            #    「只理了艾特，下一句没理」。关注窗口本来就是「接完还能跟上」。
+            _focusing = _focus_active(f"group_{gid}", str(event.user_id))
+            _addressed_now = (event.is_tome() or _focusing
                               or _calls_me_by_name(
                                   _t_own, f"group_{gid}", str(event.user_id)))
             if (_cool > 0 and not _addressed_now and _last_reply > 0

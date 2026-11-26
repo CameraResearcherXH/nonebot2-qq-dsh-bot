@@ -266,6 +266,33 @@ docker restart qq-grok-bot && docker logs --tail 30 qq-grok-bot
 | `/用量` | token 用量 + 图表 |
 | `/测函数 prompt` | prompt 分段占比 + 缓存 |
 
+## 5.4 关键 `.env` 对照表（我们线上值，不是猜的）
+
+发行仓的 `.env.example` 就是按线上 `.env` 生成的（密钥清空、白名单换占位号）。
+下面这些值**决定行为**，配错就会出现「不理人 / 刷屏 / 卡住」：
+
+| 键 | 线上值 | 作用 / 配错的后果 |
+|---|---|---|
+| `ALLOWED_GROUPS` | 你的群号 | **为空 = 所有群都不回** |
+| `ALLOWED_PRIVATE` | 你的 QQ | **为空 = 所有私聊都不回** |
+| `OWNER_QQ` / `SUPERUSERS` | 你的 QQ | 为空 = 没有主人，管理类工具全不可用 |
+| `GROUP_NEED_AT` | `true` | true = 群里只在 @/引用/喊名字时回 |
+| `GROUP_WATCH_MODE` | `full` | `lite` = 只回硬信号（省 token，但会显得冷淡） |
+| `OUT_BUBBLE_CHARS` | `40` | 单泡字数；写成 1000 就会整段刷屏 |
+| `OUT_BUBBLES_MAX` | `2` | 单轮气泡数；超了转合并转发 |
+| `GROUP_MAX_HANZI` | `20` | 群聊单条目标长度（显示宽度） |
+| `PRIVATE_MAX_HANZI` | `20` | 私聊同上 |
+| `LONG_FORWARD_MIN` | `120` | 系统长文（视频总结等）转卡片的下限 |
+| `GROUP_REPLY_COOLDOWN` | `45` | 回完一句后，**没点她**的消息只记上下文；@/喊名字/关注窗口不受限 |
+| `REPLY_INTERVAL` | 见 `.env` | 同一会话两次回复的最小间隔 |
+| `SLEEP_HOUR_START/END` | 见 `.env` | 群聊睡眠时段（私聊由 `PRIVATE_SLEEP` 控制） |
+| `MEMORY_BACKEND` | `sqlite` | `json` 是旧后端（O(N) 扫描，慢）；切换前先备份 `data/` |
+| `NODE_COMPUTE` | `1` | 没有算力机就设 `0`，否则相关工具会等超时 |
+| `CODE_AGENT` | `self_tool` | 改成 `harness` 需要另配桥 |
+| `USE_LOCAL_TTS` | `true` | 没有算力机时建议 `false`，否则每条语音先白等再降级 |
+
+> 启动日志里会打印一行 `[ENV]` 体检结果；`/自检` 也会显示当前生效的回复长度/观察模式/记忆后端。
+
 ## 5.5 算力机 / 本机插件（`NODE_COMPUTE`）
 
 `.env`：
@@ -389,6 +416,12 @@ tar czf backup-$(date +%F).tgz data .env
 | 工具调不到 | `plugin.toml` 没声明 / 分类没写进人格卡 | 看 [third-party-integration.md](third-party-integration.md) |
 | 容器内 verify 说清单不一致 | 镜像是旧清单 | 在**宿主机**跑 `verify_deploy.py`，清单按实际文件重算 |
 | 磁盘满 | 日志/图片/语音堆积 | 配 docker 日志轮转；定期清 `data/temp*` |
+| **群聊/私聊完全不理人** | `ALLOWED_GROUPS` / `ALLOWED_PRIVATE` 为空 → 所有消息在准入层就被丢掉 | 填上群号/QQ；启动日志有 `[ENV] ⚠️` 提示 |
+| **时不时不理人（尤其 @ / 私聊）** | ① 白名单没填全 ② `SLEEP_HOUR_START/END` 撞上睡眠时段 ③ 群里 45s 回复冷却（关注窗口内已豁免） | 看 `[COOLDOWN]` / `[SWITCH]` / `[SLEEP]` 日志；`GROUP_REPLY_COOLDOWN` 可调 |
+| **一条回复几千字、不转合并转发** | `OUT_BUBBLE_CHARS` / `GROUP_MAX_HANZI` 被写成 1000 之类 | 正常是 `OUT_BUBBLE_CHARS=40`、`GROUP_MAX_HANZI=20`、`LONG_FORWARD_MIN=120`；启动会告警 |
+| **每次回复卡 4 分钟** | 某个工具/补资料轮次没超时（网页、视频、图书馆、算力机任务） | 已给每轮补资料加整轮预算；仍慢就看 `[LLM] 🔁 工具第 N 轮` 后面跟的秒数 |
+| **猪猪 / 原神 / 表情包「拉不到内容」** | 这些插件依赖 `data/` 或上游接口，发行仓不带 `data/` | 属正常：没数据时对应功能应降级/跳过，不影响聊天 |
+| 想让她收发红包 | NapCat/OneBot 没有红包 API | 见 [red-packet-feasibility.md](red-packet-feasibility.md) |
 
 ## 9. 安全
 

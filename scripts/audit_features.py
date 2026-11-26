@@ -413,6 +413,10 @@ def check_g16():
         bad.append("还残留 PASSIVE_MAX_DELTA（ADR-038 已删被动通道）")
     if "passive=bool(passive)" not in chat:
         bad.append("chat 没把 passive 传给判读（旁观不背锅失效）")
+    # 2026-11-26：@ 之后的「关注窗口」不能被回复冷却吞掉
+    #（用户：只理了艾特，下一句没理）
+    if "_focusing = _focus_active(" not in chat or "_addressed_now" not in chat:
+        bad.append("回复冷却没有给关注窗口开口（@ 后下一句会被吞）")
     if "MOOD_HALF_LIFE_HOURS" not in md or "MOOD_HALF_LIFE_HOURS" not in tn:
         bad.append("心情半衰期不可调")
     if "MEMORY_EMOTION_MIN_DELTA" not in chat:

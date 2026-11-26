@@ -18,6 +18,12 @@ from services.dep_trace import install as _install_dep_trace
 
 _install_dep_trace()
 
+# 启动期配置体检：白名单为空 / 回复长度被配成 1000 / TTS 与算力机开关矛盾
+# 这类「配了但没生效」的问题，只在启动日志里显眼地报一次（不阻断启动）。
+from services.env_guard import check as _env_check
+
+_env_check()
+
 from services.config import NODE_COMPUTE, CODE_AGENT
 
 # 加载自研插件（NoneBot 只扫一层，不递归子目录）。

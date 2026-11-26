@@ -641,6 +641,20 @@ def affinity_trend(qq: str, window_sec: float = 0) -> dict:
 INTIMACY_HL_D = tuning.f("REL_INTIMACY_HALF_LIFE_DAYS")
 
 
+def intimacy_from_score(score: float) -> float:
+    """相处量 → 亲近 0~1（线性 + 软上限 0.98）。
+
+    2026-11-26：11-25 试过的饱和曲线 score/(score+3) 会让 15 个群友的亲近
+    从 1.00 一夜掉到 0.50（用户反馈「好感掉了 0.5」），已回退。
+    现在只把「恰好 1.00」压到 0.98，避免 τ_aff 被顶满；其余和旧口径一致。
+    """
+    try:
+        s = float(score or 0.0)
+    except Exception:
+        s = 0.0
+    return min(0.98, s / 3.0) if s > 0 else 0.0
+
+
 def intimacy(qq: str) -> float:
     """
     关系温度 0~1：由相处记录条数、情绪权重、时间衰减算出来。
@@ -670,11 +684,8 @@ def intimacy(qq: str) -> float:
             score += (0.10 * w + bonus) * recency
         except Exception:
             continue
-    # 2026-11-25：改成饱和曲线，避免「攒够 20 条就 1.00」。
-    #   旧口径 score/3 是线性的：20 条记录（score≈5）直接顶满，240 人里 7 个 1.00，
-    #   而 1.00 会让 affinity 衰减最慢（τ 被拉到最大）。
-    #   现在 score=3→0.5、6→0.67、12→0.8，永远逼近 1 但不到 1。
-    base = (score / (score + 3.0)) if score > 0 else 0.0
+    # 2026-11-26：改回线性 + 软上限 0.98（公式与理由见 intimacy_from_score）。
+    base = intimacy_from_score(score)
     # 显式好感度最多贡献 ±0.25：吵一架会掉一截，但不会把老朋友直接清零
     try:
         base += get_affinity(qq) * 0.25

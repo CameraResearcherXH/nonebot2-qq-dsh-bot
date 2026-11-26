@@ -3313,7 +3313,17 @@ async def call_llm(
                 _rounds += 1
                 _before = reply
                 try:
-                    reply = await _fulfill_requests(reply, msgs, client, headers)
+                    # ⚠️ 2026-11-26：单轮补资料也必须吃整轮预算。以前只在「轮与轮之间」
+                    #    检查 _left，一个慢工具（网页/视频/图书馆/算力机）就能把一次回复
+                    #    拖到几分钟（别人部署后反馈「每次回复卡 4 分钟」）。
+                    reply = await asyncio.wait_for(
+                        _fulfill_requests(reply, msgs, client, headers),
+                        timeout=max(3.0, min(30.0, _left)),
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("[REQ] 补资料超时（超过本轮预算）→ 不再等，直接开口")
+                    reply = _REQ_RE.sub("", reply).strip()
+                    break
                 except Exception as e:
                     logger.warning(f"[REQ] 补资料失败: {type(e).__name__}: {e}")
                     reply = _REQ_RE.sub("", reply).strip()
