@@ -20,13 +20,18 @@ logger.info("🚀 [加载检测] 音频分离调度中心正在初始化...")
 #    8080 一旦对外（比如给外部客户调 /api/cover），这个 secret 就是
 #    「拉任意任务文件 / 伪造心跳 / 提交任务」的万能钥匙。
 #    算力机 node.env 里的 API_SECRET 必须改成同一个值。
-API_SECRET = os.getenv("API_SECRET", "").strip() or "my_super_secret_key_123"
-if API_SECRET == "my_super_secret_key_123":
-    logger.warning(
-        "⚠️ [SECURITY] API_SECRET 用的是默认值 my_super_secret_key_123。"
-        "8080 对外暴露前，务必在 .env 设一个长随机 API_SECRET，"
-        "并同步改算力机 node.env 里的 API_SECRET。"
+# 2026-11-27 脱敏：不再有硬编码默认值（默认值等于「谁都知道的钥匙」）。
+API_SECRET = os.getenv("API_SECRET", "").strip()
+if not API_SECRET:
+    logger.error(
+        "❌ [SECURITY] 没有配置 API_SECRET（.env）→ 算力机接口**全部拒绝**。"
+        "请设一个长随机值，并同步写进算力机 node.env 的 API_SECRET。"
     )
+
+
+def _auth_failed(secret) -> bool:
+    """没配 secret 时一律拒绝 —— 不能让「空 == 空」变成免密。"""
+    return (not API_SECRET) or (str(secret or "") != API_SECRET)
 
 # 心跳超时：算力机超过这么久没心跳就算离线。
 # 原来写死 30 秒 —— 算力机心跳间隔只要稍长一点（或网络抖一下），
@@ -115,7 +120,7 @@ async def heartbeat(secret: str = "", caps: str = ""):
     （split + rvc_mix，要往返两次 76MB wav）。
     老版本 node.py 不上报 caps，就会自动走两段式，不会卡住。
     """
-    if secret != API_SECRET: return {"error": "auth failed"}
+    if _auth_failed(secret): return {"error": "auth failed"}
     STATUS["last_heartbeat"] = time.time()
     if caps:
         parsed = {c.strip() for c in caps.split(",") if c.strip()}
@@ -126,7 +131,7 @@ async def heartbeat(secret: str = "", caps: str = ""):
 
 @router.get("/api/tasks/pull")
 async def pull_task(secret: str = ""):
-    if secret != API_SECRET: return {"error": "auth failed"}
+    if _auth_failed(secret): return {"error": "auth failed"}
     for task_id, task in list(STATUS["tasks"].items()):
         if task.get("status") == "pending":
             task["status"] = "processing"
@@ -144,7 +149,7 @@ async def pull_task(secret: str = ""):
 @router.get("/api/tasks/status")
 async def tasks_status(secret: str = ""):
     """调试用：一眼看清算力机心跳和所有任务状态。"""
-    if secret != API_SECRET: return {"error": "auth failed"}
+    if _auth_failed(secret): return {"error": "auth failed"}
     age = time.time() - STATUS["last_heartbeat"] if STATUS["last_heartbeat"] else -1
     return {
         "heartbeat_age_sec": round(age, 1),
@@ -167,7 +172,7 @@ async def download_input(task_id: str, secret: str = "", field: str = ""):
       extra_input  → task["extra_input"]（翻唱任务里的伴奏）
     这样算力机拉第二个文件不用新加路由。
     """
-    if secret != API_SECRET:
+    if _auth_failed(secret):
         return JSONResponse({"error": "auth failed"}, status_code=403)
 
     task = STATUS["tasks"].get(task_id) or {}
@@ -205,7 +210,7 @@ async def complete_task(
     result: str = Form(""),
     secret: str = Form("")
 ):
-    if secret != API_SECRET: return {"error": "auth failed"}
+    if _auth_failed(secret): return {"error": "auth failed"}
     task = STATUS["tasks"].get(task_id)
     if not task: return {"error": "task not found"}
     
@@ -414,7 +419,7 @@ async def queue_task_for_download(bot: Bot, event: MessageEvent, state_info: dic
         await bot.send(event, "⏳ 正在从 QQ 服务器下载音频（大文件可能需要时间）...")
         try:
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.1 Safari/537.36",
                 "Accept": "*/*"
             }
             async with aiohttp.ClientSession() as session:

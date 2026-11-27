@@ -191,8 +191,10 @@ def bump(qq: str, kind: str, value: float = 1.0, *,
                   else (1.2 - 0.4 * float(_tr.get("forgiveness") or 0.5)))
     except Exception:
         pass
-    if sign < 0:
-        d *= _neg_weight(affinity_of(qq))
+    # 2026-11-26（审计 E6）：**不要**把 affinity 的宽容度乘到 trust/respect 上。
+    # 四个量单位不同、各改各的：好感可以「越喜欢越宽容」，
+    # 但信任被骗就是被骗，不该因为她喜欢这个人就罚得轻。
+    # 宽容只作用于 affinity（v1 在 mood_judge 里单独乘 neg_weight）。
     now = time.time()
     st = _load()
     rec = _decay_rec(st.get(qq) or _new(qq, now), now)

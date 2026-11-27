@@ -182,13 +182,16 @@ def check_unread_params():
 
     `tuning.UNWIRED` 里的是**已登记**的设计先行键（口径定了、实现还没接），
     不算硬伤；它们由 `check_tuning.py` 反向盯着（接线后必须从名单删掉）。
-    这里只报「名单外」的空转，避免新加的键悄悄不生效。
+    `tuning.LEGACY` 是**已退休**的键（合并/改名后刻意不再读，比如
+    `MAX_BUBBLES` → `OUT_BUBBLES_MAX`），它们本来就该 0 读点 ——
+    2026-11-27 之前没排除，导致 `MAX_BUBBLES` 一直被报「空转」把接线闸门卡红。
+    这里只报「两份名单之外」的空转，避免新加的键悄悄不生效。
     """
-    from core.tuning import DEFAULTS, UNWIRED
+    from core.tuning import DEFAULTS, LEGACY, UNWIRED
     all_text = "\n".join(read(f) for f in py_files("plugins", "services", "core"))
     unused = []
     for k in DEFAULTS:
-        if k in UNWIRED:
+        if k in UNWIRED or k in LEGACY:
             continue
         if re.search(r'tuning\.(?:f|i|raw|get)\(\s*"%s"' % re.escape(k), all_text):
             continue

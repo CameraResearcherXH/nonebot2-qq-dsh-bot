@@ -236,6 +236,66 @@ docker logs --since 2h qq-grok-bot 2>&1 \
 输出 `PASS / FAIL / SKIP` 三态；**SKIP 表示这段日志没覆盖到该场景，不是失败**。
 重启/部署后建议只取部署之后的窗口（`--since 10m`），避免把旧版本的慢样本算进来。
 
+### 5.2b 一键体检 + 每日体检（2026-11-26）
+
+**部署机（宿主）一键体检** —— 容器状态、代码版本、bot/napcat 日志关键行与报错计数、
+数值体检、回滚备忘，一次全出：
+
+```bash
+cd /home/admin/qq-grok-bot
+bash scripts/check_live.sh          # 默认最近 6h
+bash scripts/check_live.sh 24       # 最近 24h
+```
+
+> `.env` 是 root 所有，所以脚本内部用 `sudo -n docker`；如果你的账号在 docker 组且能读
+> `.env`，用 `SUDO="" bash scripts/check_live.sh`。
+
+**每日体检（容器内）** —— 心情 / 好感 / 判读链路 / 今日事件分布 / 成本，
+最后一张「期望 vs 实测」表把设计意图和线上数字对起来：
+
+```bash
+docker compose exec -T bot python scripts/daily_report.py --top 10
+```
+
+输出同时落到 `data/reports/daily/YYYY-MM-DD.txt`（`--no-save` 可关）。
+有 ⚠️ 时退出码 1，可以挂 watchdog。
+
+每天自动跑一次（二选一）：
+
+```bash
+# ① 宿主机 crontab（推荐：容器重启不影响）
+0 9 * * * cd /home/admin/qq-grok-bot && sudo -n docker compose exec -T bot \
+  python scripts/daily_report.py >> data/reports/daily.log 2>&1
+
+# ② 容器 crontab（如果镜像里有 cron）
+0 9 * * * cd /app && python scripts/daily_report.py >> data/reports/daily.log 2>&1
+```
+
+**它会检查什么**（`--json` 可机读）：
+
+| 类别 | 期望 |
+|---|---|
+| 档位 | full 下 4 段全 on；eco 下 audit/library/proactive/expression 全 off（脚本会**两个档位都模拟一遍**） |
+| 好感 | `AFF_V1_CAP ≤ 日上限`、CAP 不是死护栏、`|a| ≤ AFF_MAX`、今日净变化 ≤ 0.15 |
+| 心情 | `v ∈ [-1,1]`、标签与数值一致、`P` 有值 |
+| 判读 | `anchor_level` 命中率 ≥ 90%（必填字段真填了）、`desirability` 命中率 ≥ 95% |
+| 事件 | 今日有 `mood_events`、`|dv|` 均值 0.01~0.20、日常/显著/尾部三段各有几条 |
+| 数据 | 没有 `*.corrupt-*.json`（mood.json 损坏备份） |
+
+> ⚠️ **单文件挂载的坑（2026-11-26 踩了两次）**
+>
+> compose 里这几个是**单文件** bind mount：`bot.py`、`.env`、`docker-compose.yml`、
+> `deploy_manifest.txt`。**用 `install` / `mv` / `rsync` 覆盖会换 inode**，
+> 容器里挂的还是旧 inode → 改了不生效，而且 `verify_deploy` 会报旧 md5，
+> 看起来像「文件没传」。单文件必须**原地覆盖**：
+>
+> ```bash
+> sudo cp new_file 目标文件        # 保留 inode，容器立刻看到
+> # 已经用 install/mv 换过 inode 的：docker restart qq-grok-bot 重新解析挂载
+> ```
+>
+> `core/ services/ plugins/ scripts/ docs/` 是**目录**挂载，随便 rsync。
+
 ### 5.3 升级一版代码的标准动作
 
 ```bash

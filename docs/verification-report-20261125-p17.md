@@ -2,7 +2,7 @@
 
 > 范围：检索二期（倒 U / τ_kind / MMR）、注意力位置指标、p95 周报、切换
 > `MEMORY_BACKEND=sqlite`。
-> 环境：`qqbot`（127.0.0.1）`/home/admin/qq-grok-bot`，容器 `qq-grok-bot`。
+> 环境：`qqbot`（YOUR_SERVER_IP）`/home/admin/qq-grok-bot`，容器 `qq-grok-bot`。
 > 日志：合并 `/tmp/before_*.log`、`/tmp/bot_*.log`、`/tmp/pre_restart*.log`、
 > `/tmp/post*.log` + 当前 `docker logs`，共 **14,390 行**。
 

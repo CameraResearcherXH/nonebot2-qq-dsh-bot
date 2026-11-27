@@ -66,7 +66,8 @@ rhythm = {off:1.0, subtle:0.9, active:1.0, scattered:1.05, wild:1.1}
 # RHYTHM_*：只做 ±10% 微调；off = 不漂移，不是「不想说话」
 aff_n  = (affinity + 1) / 2                # -1~1 → 0~1（只有 §2.2 的目标式用）
 
-# 目标（未接线；a 档位也还没接线，AROUSAL_* 在 tuning.UNWIRED 里）
+# 目标（未接线；a 档位**已接线**——`AROUSAL_LEVEL_*` 在 mood.update_ad 里用，
+#        tuning.UNWIRED 已清空；但 a 仍**不进 chatty**，见 §1.5 G6）
 chatty = sigmoid(1.0 × v + 1.0 × a − 0.5)
 ```
 

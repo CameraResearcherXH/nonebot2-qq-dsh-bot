@@ -41,6 +41,11 @@ REFLECT_ENDPOINT = os.getenv("AGENT_REFLECT_ENDPOINT", "/api/agent/reflection")
 # /api/agent/smart-query，**没有** /api/agent/recall、/api/agent/reflection。
 # 所以默认按「结构化 → smart-query → query」三级降级，别再打不存在的端点。
 SMART_QUERY_ENDPOINT = os.getenv("AGENT_SMART_QUERY_ENDPOINT", "/api/agent/smart-query")
+# 2026-11-26 实测：`/api/agent/smart-query` 会卡 >70s（LLM 规划层），
+# 但 `POST /api/agent/execute-tool?tool_name=rag_search` 1~9s 就返回、还带来源。
+# 所以它现在是「第一兜底」，smart-query 退到第二。
+RAG_TOOL_ENDPOINT = os.getenv(
+    "AGENT_RAG_TOOL_ENDPOINT", "/api/agent/execute-tool?tool_name=rag_search")
 
 # 知识库里如果根本不是聊天记录（实测是 poet.song.rank.* 宋词数据），
 # 就别每条消息都去问一次（一次 6~13s，纯浪费）。6 小时内不再试。
@@ -51,7 +56,14 @@ _RECALL_ENDPOINT_MISSING = False
 
 # ⚠️ 2026-11-24 实测：给 RAG 加「只列谁说过什么」这类指令，反而让它更容易回「没有」
 # （它把这句当成要检索的内容，检索不到就放弃）。直接送原话，命中最稳、也最快。
-_RECALL_PROMPT = "{q}"
+# 2026-11-26：给 RAG 一点上下文。
+# 以前 `_RECALL_PROMPT = "{q}"` —— 原样把一句话丢过去，RAG 不知道「上周」「他」指谁，
+# 也不知道今天是几号，只能瞎猜（真机里「上周那件事」经常捞到去年的）。
+_RECALL_PROMPT = (
+    "今天是 {date}。{who}在问：{q}\n"
+    "只回答归档里查得到的事实；查不到就说「没有」。"
+    "人称用第三人称（她/他），别照抄原文里的你我他。"
+)
 
 RECALL_TIMEOUT = tuning.f("AGENT_RECALL_TIMEOUT")
 # 图书馆延迟目标 / 候选池条数（retrieval §7）：超目标只告警，不阻断
@@ -60,6 +72,7 @@ WORLD_TOP = max(1, tuning.i("RET_WORLD_TOP"))
 # 图书馆（RAG v3）实测一次 5~14s：2.5s 超时 = 每条消息都白等然后判「不可用」。
 # 2026-11-24 用户实测「小明是如何解决温室效应的」→ 13.4s 才返回弱智吧内容。
 LIB_TIMEOUT = tuning.f("AGENT_LIBRARY_TIMEOUT")
+RAG_TOOL_TIMEOUT = tuning.f("AGENT_RAG_TOOL_TIMEOUT")
 REFLECT_HTTP_TIMEOUT = tuning.f("AGENT_REFLECT_TIMEOUT")
 REFLECT_QUEUE_TIMEOUT = tuning.f("AGENT_REFLECT_QUEUE_TIMEOUT")
 
@@ -186,6 +199,27 @@ _NO_ANSWER_KEYS = (
 )
 
 
+def clean_facts(facts, limit: int = 0) -> list:
+    """RAG 结果后处理：去重 + 丢掉「没有找到」这种空答案行 + 每条截断。
+
+    为什么（2026-11-26）：RAG 经常把同一段归档切成 3~4 条返回，
+    直接进 prompt 会占满世界块；「没有找到相关信息」也会被当成事实念出来。
+    """
+    out, seen = [], set()
+    for f in (facts or []):
+        s = str(f or "").strip().strip("*-· ")
+        if not s or is_no_answer(s):
+            continue
+        k = re.sub(r"\s+", "", s)[:40]
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(s[:160])
+        if limit and len(out) >= limit:
+            break
+    return out
+
+
 def is_no_answer(text: str) -> bool:
     """RAG 的「没检索到」也算空结果：别把「没有」当事实塞进 prompt。"""
     a = str(text or "").strip()
@@ -262,15 +296,81 @@ async def recall(
     _ms = (time.monotonic() - _t0) * 1000.0
     if _ms > LIB_LATENCY_MS:
         logger.warning(f"[AGENT] 图书馆 {_ms:.0f}ms > 目标 {LIB_LATENCY_MS:.0f}ms")
-    # 候选池截断：RAG 偶尔回很多条，只留最靠前的 WORLD_TOP 条进 prompt
+    # 候选池截断：RAG 偶尔回很多条，去重/去空答案后再留 WORLD_TOP 条
     if out and out.get("facts"):
-        out["facts"] = list(out["facts"])[:WORLD_TOP]
+        out["facts"] = clean_facts(out["facts"], WORLD_TOP)
     ttl = _CACHE_TTL_OK if (out or {}).get("facts") else _CACHE_TTL_EMPTY
     _CACHE[ck] = (time.time(), dict(out or empty_recall()), ttl)
     if len(_CACHE) > 300:
         for k in list(_CACHE)[:100]:
             _CACHE.pop(k, None)
     return out
+
+
+def _decode_u(s: str) -> str:
+    """RAG 的 rag_search 会把文档 JSON 里的中文转义成 `\\u5e8a`，先还原再给人看。"""
+    return re.sub(r"\\u([0-9a-fA-F]{4})",
+                  lambda m: chr(int(m.group(1), 16)), str(s or ""))
+
+
+def _rag_tool_parse(data: dict) -> tuple:
+    """把 `execute-tool?tool_name=rag_search` 的 output 拆成短事实。
+
+    返回 (facts, skipped_poet)：
+      · facts        能给她看的片段（≤5，每条 ≤160 字）；
+      · skipped_poet 被「宋词/结构化文档」规则丢掉的段数 —— 用来判断
+                     这库到底是不是聊天语料（全是诗词就该暂停，别再每轮烧 10s）。
+    """
+    if not isinstance(data, dict) or data.get("success") is False:
+        return [], 0
+    out = data.get("output") or data.get("result") or data.get("answer") or ""
+    if isinstance(out, list):
+        out = "\n\n".join(str(x) for x in out)
+    s = _decode_u(str(out or "")).strip()
+    if not s:
+        return [], 0
+    parts = re.split(r"\n\s*\n|(?=\*\*片段\s*\d+\*\*)", s)
+    facts, skipped = [], 0
+    for p in parts:
+        p = re.sub(r"\s+", " ", p).strip(" -*\n\t")
+        if not p or len(p) < 8:
+            continue
+        if p.startswith("找到") and "个相关片段" in p[:24]:
+            continue
+        # 去掉 RAG 自带的片段头：`**片段 1** (来源: /app/documents/x.json)`
+        p = re.sub(r"^\**片段\s*\d+\**\s*(?:\(来源:[^)]*\))?\s*", "", p).strip()
+        if not p or len(p) < 8:
+            continue
+        # 语料里混了宋词/结构化文档：整段是 JSON 的别塞给她（她会当成聊天内容）
+        if "paragraphs" in p and "author" in p:
+            skipped += 1
+            continue
+        facts.append(p[:160])
+        if len(facts) >= 5:
+            break
+    return facts, skipped
+
+
+def _rag_tool_facts(data: dict) -> list:
+    return _rag_tool_parse(data)[0]
+
+
+async def _rag_search(query: str) -> dict | None:
+    """直接调 RAG 的检索工具。
+
+    返回 None = 这次请求失败（可继续降级）；
+    返回 dict  = {"facts": [...], "nonchat": bool}
+                 nonchat=True 表示「通了、也有内容，但全是诗词/结构化文档」。
+    """
+    data = await _post_json(
+        f"{AGENT_BASE_URL}{RAG_TOOL_ENDPOINT}",
+        {"query": str(query or "")[:300], "top_k": max(3, WORLD_TOP)},
+        RAG_TOOL_TIMEOUT,
+    )
+    if data is None:
+        return None
+    facts, skipped = _rag_tool_parse(data)
+    return {"facts": facts, "nonchat": bool(skipped and not facts)}
 
 
 async def _recall_impl(
@@ -325,13 +425,42 @@ async def _recall_impl(
         )
         return out
 
-    # 兜底 1：/api/agent/smart-query（RAG v3 上有，实测 3~14s）
+    # 兜底 1：直接调 rag_search 工具（2026-11-26 实测最稳：1~9s，带来源）
+    # 为什么放在 smart-query 前面：smart-query 的 LLM 规划层会卡 >70s，
+    # 每次白等 14s 还被流水线取消；rag_search 不经过规划，直接查向量库。
+    _rs = await _rag_search(query)
+    if _rs and _rs.get("facts"):
+        _LIBRARY_DEAD_UNTIL = 0.0
+        STATS["ok"] = int(STATS.get("ok") or 0) + 1
+        logger.info(f"[AGENT] 🔎 rag_search 命中 {len(_rs['facts'])} 条")
+        return {"facts": list(_rs["facts"]), "events": [], "emotions": [],
+                "self_state": "", "source": "rag_tool"}
+    if _rs is not None:
+        # 通了、也有内容，但全是诗词/结构化文档 → 和 smart-query 的
+        # `_looks_like_chat` 一样暂停 6 小时，别每轮白烧 10s。
+        if _rs.get("nonchat"):
+            _LIBRARY_DEAD_UNTIL = time.time() + 6 * 3600
+            if not _LIBRARY_WARNED:
+                _LIBRARY_WARNED = True
+                logger.warning(
+                    "[AGENT] ⚠️ rag_search 命中的全是宋词/结构化文档 → "
+                    "图书馆暂停 6 小时；先把 data/dialogue 归档导入 RAG")
+            return empty_recall()
+        # 通了但没命中：不是「图书馆不可用」，别暂停
+        _LIBRARY_DEAD_UNTIL = 0.0
+        STATS["empty"] = int(STATS.get("empty") or 0) + 1
+        logger.info("[AGENT] rag_search 通了但没命中")
+        return empty_recall()
+
+    # 兜底 2：/api/agent/smart-query（RAG v3 上有，实测 3~14s；可能卡住）
     # ⚠️ 2026-11-24 修正：以前写死 2.5s，而 RAG 实测要 5~14s →
     #    每条消息都在 2.5s 超时、然后判「图书馆不可用 10 分钟」，所以永远 0 条。
     #    现在按 AGENT_LIBRARY_TIMEOUT（默认 8.5s）等；流水线那边给 9s。
+    _who = (f"QQ {speaker_qq} " if str(speaker_qq or "").isdigit() else "有人")
     data = await _post_json(
         f"{AGENT_BASE_URL}{SMART_QUERY_ENDPOINT}",
-        {"question": _RECALL_PROMPT.format(q=query)},
+        {"question": _RECALL_PROMPT.format(
+            date=time.strftime("%Y-%m-%d"), who=_who, q=query)},
         max(3.0, LIB_TIMEOUT),
     )
     if data is None:

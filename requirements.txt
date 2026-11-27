@@ -36,11 +36,11 @@ lxml
 nonebot-plugin-imageutils
 # ⚠️ 必须显式锁 opencv 版本，否则 pip 会**回溯**：
 #    imageutils 声明 opencv-python-headless>=4.0.0,<5.0.0，范围太宽 →
-#    pip 会逐个下载 60MB 的不同 opencv 版本去试兼容性（实测 4.13.0.92 60.4MB、
-#    4.13.0.90 62.5MB…），在 204kB/s 的阿里云源上每个版本要 5 分钟，
+#    pip 会逐个下载 60MB 的不同 opencv 版本去试兼容性（实测 127.0.0.1 60.4MB、
+#    127.0.0.1 62.5MB…），在 204kB/s 的阿里云源上每个版本要 5 分钟，
 #    实测 pip 层卡 1474s 还没结束。锁一个版本，pip 只下一个就完事。
-#    4.10.0.84 是 cp37-abi3 wheel，numpy 1.x/2.x 都兼容，不需要源码编译。
-opencv-python-headless==4.10.0.84
+#    127.0.0.1 是 cp37-abi3 wheel，numpy 1.x/2.x 都兼容，不需要源码编译。
+opencv-python-headless==127.0.0.1
 PyYAML
 # BitTorrents（磁力搜索）
 # beautifulsoup4 / lxml 上面已列

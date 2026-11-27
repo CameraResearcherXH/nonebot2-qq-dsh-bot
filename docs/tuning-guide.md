@@ -168,6 +168,8 @@ RET_TOOLS_TOP  默认 6（按描述检索前 6 个工具）
 |---|---|
 | `ENUMS`（`core/design_constants.py`） | `target` 5 值、`route` 4 值是**协议**，改了历史数据全废 |
 | `MOOD_ANCHOR_LEVEL1/LEVEL2` | 必须 `LEVEL1 < LEVEL2` 且都 > 0，否则锚点方向反了 |
+| `MOOD_ANCHOR_WEIGHT` | 必须 `0 < W ≤ 1`；调到 1.0 等于「心情 = 模型说的绝对档位」，相对步进失效。注意它是 `v` 的**主项**，`MOOD_P0/Q/R` 只决定残差步进 |
+| `AFF_V1_CAP` | 必须 ≥ 尾部单次跳变（约 0.12~0.14），且 **≤ `AFFINITY_DAILY_CAP`**。可达上限 = `AFF_V1_DV_K × AFF_W_MAX`（0.30×0.42=0.126）+ 事件项；写成 0.36 就是永不触发的死护栏 |
 | `MOOD_HARD_CAP` | 必须 ≥ `MOOD_STEP_2 × MOOD_SENS_MAX`（0.22×1.4=0.308），否则正常步进就被截断 |
 | `CTX_SOFT_CAP` | 必须 ≥ 最大组合 2580（工具+custom+多目标），否则有档位一出生就被裁 |
 | `MOOD_ANCHOR_COUNT_SKIPPED` | 设成 0 会让「全是噪声的群」永远不锚定，状态冻结 |

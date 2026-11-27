@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""把本地对话归档灌进算力机 RAG（「图书馆」），让它真的能回忆旧聊天。
+"""把**归档/外部语料**灌进算力机 RAG（「图书馆」）——**不是**把记忆搬过去。
+
+⚠️ 2026-11-26 用户定边界（先读这段再用）：
+  · **记忆 = 本地 sqlite**（`services/memdb.py`）：按人/时间/情绪/标签检索，30 天内够用；
+  · **图书馆 = 可选的外部语料**（旧归档、文档、书）：RAG 只是「去档案馆翻旧报纸」；
+  · 不要把 `data/dialogue` 每天同步过去 —— 那是**当前记忆的原文**，会造成
+    ① 同一件事本地/RAG 各查一遍；② 检索把最近闲聊当「旧档案」顶掉真正久远的事；
+    ③ 没搭 RAG 的部署（开源用户）行为不一致。
+  · 确实要放 >30 天的归档：显式 `--allow-memory --min-age-days 30`，
+    并且只放**已经从本地记忆滑出去**的部分。
+
+原始用途：把本地对话归档灌进算力机 RAG（「图书馆」），让它真的能回忆旧聊天。
 
 背景（2026-11-24 实测）：
   算力机 8001 是 Agentic RAG v3，路由是 `/api/agent/query`、`/api/agent/smart-query`，
@@ -13,12 +24,12 @@
   4. **分区标记**：正文头写 `# partition: dialogue|memory|...`，给后续 RAG 分区用。
   上传完可选调 `/api/build` 建索引。
 
-用法：
-    python scripts/library_sync.py --dry-run          # 只看会传什么（0 上传）
-    python scripts/library_sync.py --dir data/dialogue
-    python scripts/library_sync.py --dir /mnt/archive --build
-    python scripts/library_sync.py --force --build     # 强制全量重传
-    python scripts/library_sync.py --partition memory  # 换分区标记
+用法（图书馆 = 外部语料，不是记忆）：
+    python scripts/library_sync.py --dir /path/to/docs --build     # 外部语料
+    python scripts/library_sync.py --dir /mnt/archive --min-age-days 90 --build
+    # 确实要把 >30 天归档也放进去（会明确二次确认）：
+    python scripts/library_sync.py --dir data/dialogue --allow-memory --min-age-days 30 --build
+    python scripts/library_sync.py --dir /path/to/docs --dry-run   # 只看会传什么
 
 注意：
   · 一次别传太多（几百 MB 会把算力机索引拖很久），按天分批；
@@ -130,10 +141,18 @@ def upload(name: str, content: bytes) -> bool:
         return False
 
 
-def build() -> bool:
+def build(documents_path: str = "./documents") -> bool:
+    """建索引。
+
+    2026-11-26 修：以前 `json={}` → 一律 HTTP 422 `missing documents_path`，
+    所以「上传成功但检索不到」永远存在（文件躺在 documents 里，索引没重建）。
+    RAG 侧的 `BuildRequest` 要求 `documents_path`，且**只允许 `./documents` 或 `./uploads`**
+    （超范围会回 `400: 文档路径不在允许范围内`）。
+    """
     try:
         import requests
-        r = requests.post(f"{BASE}/api/build", json={}, timeout=1800)
+        r = requests.post(f"{BASE}/api/build",
+                          json={"documents_path": documents_path}, timeout=1800)
         print(f"  建索引：HTTP {r.status_code} {r.text[:200]}")
         return r.status_code < 400
     except Exception as e:
@@ -141,10 +160,30 @@ def build() -> bool:
         return False
 
 
+def _day_of(path: Path) -> float:
+    """从 `2026-11-26.jsonl` 取日期；取不到就用 mtime。返回当天 0 点的时间戳。"""
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", path.stem)
+    if m:
+        try:
+            return time.mktime((int(m.group(1)), int(m.group(2)),
+                                int(m.group(3)), 0, 0, 0, 0, 0, -1))
+        except Exception:
+            pass
+    try:
+        return path.stat().st_mtime
+    except Exception:
+        return 0.0
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="把对话归档增量灌进算力机 RAG")
-    ap.add_argument("--dir", default="data/dialogue", help="jsonl 所在目录")
-    ap.add_argument("--partition", default="dialogue", help="正文头分区标记")
+    ap = argparse.ArgumentParser(
+        description="把「归档/外部语料」增量灌进算力机 RAG（记忆仍在本地 sqlite）")
+    ap.add_argument("--dir", default="", help="jsonl 所在目录（必须显式指定）")
+    ap.add_argument("--partition", default="archive", help="正文头分区标记（默认 archive）")
+    ap.add_argument("--allow-memory", action="store_true",
+                    help="确认这是归档、不是当前记忆（否则拒绝跑 data/dialogue）")
+    ap.add_argument("--min-age-days", type=int, default=30,
+                    help="只同步至少多少天前的文件（默认 30；0=不限）")
     ap.add_argument("--build", action="store_true", help="上传完自动建索引")
     ap.add_argument("--build-always", action="store_true", help="即使没变化也建索引")
     ap.add_argument("--force", action="store_true", help="忽略 sha256 状态，全量重传")
@@ -152,9 +191,29 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="只统计，不上传")
     args = ap.parse_args()
 
+    if not str(args.dir or "").strip():
+        print("❌ 必须显式指定 --dir。\n"
+              "   图书馆不是记忆库：记忆在本地 sqlite（services/memdb.py）。\n"
+              "   要放 >30 天归档：--dir data/dialogue --allow-memory --min-age-days 30")
+        return 2
+    _dir_l = str(args.dir).replace("\\", "/").lower()
+    if ("dialogue" in _dir_l or "memory" in _dir_l) and not args.allow_memory:
+        print("❌ 拒绝：`data/dialogue` 是当前记忆的原文，不是图书馆语料。\n"
+              "   本地记忆（sqlite）已经能按人/时间/情绪/标签检索，不需要搬到 RAG；\n"
+              "   没搭 RAG 的部署也不该因此行为不一致。\n"
+              "   确实要放 >30 天归档：加 --allow-memory --min-age-days 30")
+        return 2
+
     files = sorted(glob.glob(str(Path(args.dir) / "*.jsonl")))
+    if args.min_age_days > 0:
+        _cut = time.time() - args.min_age_days * 86400
+        _kept = [f for f in files if _day_of(Path(f)) <= _cut]
+        if len(_kept) != len(files):
+            print(f"  只同步 {args.min_age_days} 天前的归档："
+                  f"跳过 {len(files) - len(_kept)} 个较新的文件")
+        files = _kept
     if not files:
-        print(f"{args.dir} 里没有 .jsonl")
+        print(f"{args.dir} 里没有符合条件的 .jsonl")
         return 1
 
     state = _load_state()

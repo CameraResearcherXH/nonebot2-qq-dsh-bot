@@ -55,6 +55,9 @@ def main():
     gates += [
         ("依赖方向", [py, "scripts/check_deps.py", "--strict"]),
         ("调参表", [py, "scripts/check_tuning.py", "--strict"]),
+        # 2026-11-27：设计文档也要进闸门 —— 以前只在 CI 单独跑，
+        # 结果「UNWIRED 已清空」「730 字符」这类叙述腐烂了好几处才被发现。
+        ("设计文档", [py, "scripts/check_design_docs.py", "--strict"]),
         # 重构最容易犯的错：删了模块级常量但函数里还在用（编译能过，一跑就 NameError）
         ("名字检查", [py, "scripts/check_names.py", "--strict"]),
         # 新增顶层包（如 core/）没挂进容器 → 线上 ImportError、容器起不来

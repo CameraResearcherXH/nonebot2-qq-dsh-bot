@@ -17,6 +17,12 @@ import threading
 import time
 from pathlib import Path
 
+try:
+    from nonebot import logger
+except Exception:  # pragma: no cover
+    import logging
+    logger = logging.getLogger(__name__)
+
 DB_PATH = Path(os.getenv("LLM_USAGE_DB", "data/llm_usage.db"))
 KEEP_DAYS = tuning.i("LLM_USAGE_KEEP_DAYS")
 DAILY_BUDGET = tuning.f("LLM_DAILY_BUDGET")  # 0 = 不告警
@@ -24,6 +30,9 @@ DAILY_BUDGET = tuning.f("LLM_DAILY_BUDGET")  # 0 = 不告警
 PURPOSES = (
     "chat", "tool_loop", "audit", "preflight", "judge", "conv_state",
     "expression", "profile_miner", "vision", "link_preview", "sticker",
+    # 2026-11-27：接话前读气氛（services/atmosphere.py）单独归因，
+    # 否则会被并进 other，看不出它到底花了多少。
+    "atmosphere",
     "song", "other",
 )
 
@@ -114,6 +123,13 @@ def record(*, provider: str = "", model: str = "", purpose: str = "other",
                  str(session), str(turn_id), 1 if ok else 0))
             c.commit()
             c.close()
+    except Exception:
+        pass
+    # 2026-11-27：以前 `budget_exceeded()` 写好了却没人调用，
+    # 而 help_menu 里写着「超了会在日志告警」—— 属于文档承诺、代码没做。
+    # 现在每次记账后顺手看一眼（5 分钟内最多查一次，**只告警不拦请求**）。
+    try:
+        _maybe_warn_budget()
     except Exception:
         pass
 
@@ -213,19 +229,46 @@ def report_text(days: int = 1) -> str:
     return "\n".join(lines)
 
 
-def budget_exceeded() -> bool:
-    if DAILY_BUDGET <= 0:
-        return False
+def today_used() -> int:
+    """今天已用 token 总量（prompt+completion）。"""
     try:
         init()
-        today = time.strftime("%Y-%m-%d")
         c = _conn()
         r = c.execute("SELECT sum(prompt+completion) FROM usage WHERE day=?",
-                      (today,)).fetchone()
+                      (time.strftime("%Y-%m-%d"),)).fetchone()
         c.close()
-        return int(r[0] or 0) >= DAILY_BUDGET
+        return int(r[0] or 0)
     except Exception:
+        return 0
+
+
+def budget_exceeded() -> bool:
+    """今天是否已超 `LLM_DAILY_BUDGET`（0 = 不设预算）。"""
+    if DAILY_BUDGET <= 0:
         return False
+    return today_used() >= DAILY_BUDGET
+
+
+_BUDGET_WARN_AT = 0.0
+_BUDGET_WARN_STEP = 300.0      # 同一进程最多每 5 分钟告警一次
+
+
+def _maybe_warn_budget() -> None:
+    """超日预算 → 日志告警（节流；不拦请求，拦请求会让聊天突然不吭声）。"""
+    global _BUDGET_WARN_AT
+    if DAILY_BUDGET <= 0:
+        return
+    now = time.time()
+    if now - _BUDGET_WARN_AT < _BUDGET_WARN_STEP:
+        return
+    _BUDGET_WARN_AT = now
+    if not budget_exceeded():
+        return
+    used = today_used()
+    logger.warning(
+        f"[USAGE] 今日 token 预算已超：{used} / {int(DAILY_BUDGET)}"
+        f"（{used / max(1.0, DAILY_BUDGET) * 100:.0f}%）"
+        f"｜LLM_DAILY_BUDGET 只告警不拦请求")
 
 
 def status_text() -> str:

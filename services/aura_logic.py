@@ -700,7 +700,9 @@ def parse_reply(text: str, quote_text: str = "") -> dict:
 
 # 一条回复最多拆几个气泡。用户 2026-11-12：「很多时候回复连续三句，
 # 我建议改成两句或者一句就好」—— 连发三条在群里很烦，两条是上限。
-MAX_BUBBLES = tuning.i("MAX_BUBBLES")
+# 2026-11-26：统一读 OUT_BUBBLES_MAX（MAX_BUBBLES 已标 LEGACY）。
+# 以前两个键各读一次，靠 test_new_features 断言相等维持同步。
+MAX_BUBBLES = tuning.i("OUT_BUBBLES_MAX")
 
 
 def _cap_bubbles(items: list, max_bubbles: int = MAX_BUBBLES) -> list:
@@ -1022,3 +1024,47 @@ def bubble_delay(next_text: str = "") -> int:
     cap = tuning.i("BUBBLE_DELAY_MAX_MS")
     typing = base + length * per
     return int(min(cap, max(250, typing)) * (0.85 + random.random() * 0.3))
+
+
+# ============================================================
+# 出站文本清洗（2026-11-27）
+# ============================================================
+# 真机事故：模型把「目录标记」当成话交给了 send 工具 →
+#   群里直接出现 `[[TOOLS|画图与搜图]]`（bot log 16:16:34）。
+#   send 的参数以前**没走** parse_reply 的第 ③ 步清洗，所以漏了。
+_BARE_PROTO = re.compile(
+    r"(?m)^\s*\[{0,3}\s*"
+    r"(TOOLS|SEARCH|LIBRARY|MEMORY|PROFILE|ARCHIVE|MOOD|MEMO|CALL|FOCUS|THINK|"
+    r"LUCK|WHO|HISTORY|STICKER|VOICE|LONG|POKE|AT)\s*\|[^\n]{0,100}$")
+
+
+# `<sticker:吃瓜>` / `<voice>…</voice>` / `<reply:123>` / `<at:名字>` / `<poke/>`
+# 这些是**给发送层看的**标签，不是话。2026-11-27 真机（群 100000016 18:03）：
+# 她调 send(text="… |||<sticker:吃瓜>")，群里看到的就是这一整串原文。
+_STICKER_TAG_RE = re.compile(r"<\s*sticker\s*:\s*([^>]{1,20})\s*/?\s*>(?:\s*</\s*sticker\s*>)?",
+                             re.I)
+_VOICE_TAG_RE = re.compile(r"<\s*voice\s*>(.*?)<\s*/\s*voice\s*>", re.S | re.I)
+_MISC_TAG_RE = re.compile(r"<\s*(?:reply|at)\s*:[^>]{0,40}>|<\s*poke\s*/?\s*>", re.I)
+
+
+def extract_stickers(text: str) -> list:
+    """取出文本里的 `<sticker:标签>`（给 send 工具决定要不要真发表情）。"""
+    return [m.strip() for m in _STICKER_TAG_RE.findall(str(text or "")) if m.strip()]
+
+
+def clean_outgoing(text: str) -> str:
+    """把「要发给用户」的文本洗干净：协议标记 + 裸标记 + 动作括号 + 发送标签。
+
+    和 `parse_reply` 里的第 ③ 步同源，但**不解析**（不产生 items），
+    专门给 `send` 工具参数、以及发送前的最后一道兜底用。
+    """
+    s = str(text or "")
+    s = _VOICE_TAG_RE.sub(r"\1", s)        # <voice>说的话</voice> → 说的话
+    s = _STICKER_TAG_RE.sub("", s)         # <sticker:吃瓜> → 空（表情由调用方发）
+    s = _MISC_TAG_RE.sub("", s)            # <reply:123> / <at:某人> / <poke/>
+    s = strip_protocol_residue(s)
+    s = re.sub(r"\[{2,3}[^\]\n]*\]{2,3}", "", s)     # 剩下的 [[X|...]] / [[X]]
+    s = _BARE_PROTO.sub("", s)                        # 裸标记：TOOLS|画图
+    s = strip_actions(s)                              # （笑）（摊手）
+    s = s.replace("|||", "\n")                        # 气泡分隔符不能外发
+    return re.sub(r"\n{3,}", "\n\n", s).strip()

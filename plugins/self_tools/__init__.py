@@ -62,6 +62,14 @@ SELF_TOOL_ECHO = os.getenv("SELF_TOOL_ECHO", "true").lower() == "true"
 _scope_raw = (os.getenv("SELF_TOOL_SCOPE", "private,group") or "private,group").lower()
 SCOPE = tuple(s.strip() for s in _scope_raw.split(",") if s.strip()) or ("private",)
 
+# 2026-11-26（audit 待办 #4）：**写工具 / 跑工具只允许私聊**。
+# 群聊里只留 self_tool_file（看代码 / 看 log / 存数据）。
+# 为什么：`SELF_TOOL_OWNER_ONLY` 只挡「谁」，挡不住「群友诱导主人让她跑代码」，
+# 而群里跑代码的后果（刷屏、卡住、被截图）是不可逆的。
+# 想放开：SELF_TOOL_EXEC_SCOPE=private,group
+_EXEC_SCOPE_RAW = (os.getenv("SELF_TOOL_EXEC_SCOPE", "private") or "private").lower()
+EXEC_SCOPE = tuple(s.strip() for s in _EXEC_SCOPE_RAW.split(",") if s.strip()) or ("private",)
+
 # 工具名规则：小写字母开头，后面只能小写字母/数字/下划线。函数名用 mytool_<name>。
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 
@@ -309,7 +317,8 @@ def _register_dynamic(name: str, description: str, parameters: dict) -> None:
             "parameters": params,
         },
     }
-    llm_mod.register_tool(spec, _make_handler(name), scope=SCOPE)
+    # 自造工具也是「跑代码」→ 跟 self_tool_run 一样只给私聊
+    llm_mod.register_tool(spec, _make_handler(name), scope=EXEC_SCOPE)
     logger.info(f"[SELFTOOL] 已注册自造工具 mytool_{name}")
 
 
@@ -603,7 +612,7 @@ llm_mod.register_tool(
         },
     },
     _tool_write,
-    scope=SCOPE,
+    scope=EXEC_SCOPE,
 )
 
 llm_mod.register_tool(
@@ -633,7 +642,7 @@ llm_mod.register_tool(
         },
     },
     _tool_run,
-    scope=SCOPE,
+    scope=EXEC_SCOPE,
 )
 
 llm_mod.register_tool(

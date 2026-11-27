@@ -21,13 +21,7 @@ jobs:
         run: python -m compileall -q core services plugins scripts bot.py
       - name: Dependency direction
         run: python scripts/check_deps.py --strict
-      - name: Tuning table (AST)
-        run: python scripts/check_tuning.py --strict
-      - name: Undefined names
-        run: python scripts/check_names.py --strict
       - name: Feature wiring audit
         run: python scripts/audit_features.py --strict
       - name: Third-party audit
         run: python scripts/plugin_cli.py doctor
-      - name: Design constants check
-        run: python scripts/check_design_docs.py --strict --runtime

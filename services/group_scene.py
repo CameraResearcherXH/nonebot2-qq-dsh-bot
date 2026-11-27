@@ -46,8 +46,12 @@ except Exception:  # pragma: no cover
 
 # ============================ 保留策略：按条数，不按时间 ============================
 # 用户 2026-11-19：
-#   「A：你们最近发现英伟达股票跌了吗」……10 分钟后……「B：对啊，都是老黄的锅」
+#   「A：昨晚那部新番看了吗」……10 分钟后……「B：对啊，都是原作的锅」
 #   按时间段拉会把这两句拆开，审核 LLM 看到的就是两句莫名其妙的话，必然判不出来。
+#   ⚠️ 这只是**判读的上下文**（让判读知道她在接什么话）；
+#      心情/好感仍只来自她的 [[THINK]]（ADR-038），对话本身不直接改数值。
+#      例：同一句「原作的锅」，她心里可能是「这俩人真会聊」（impact 0），
+#          也可能是「又在我面前聊我看不懂的」（impact −1）——只有 THINK 知道。
 # 所以：**每个群保留最近 KEEP_TOTAL 条消息**，时间只作为标签显示（「12分钟前」），
 # 不参与「要不要保留 / 算不算同一条线」的判断。
 KEEP_TOTAL = 120          # 每个群总共留多少条消息（超出从最旧的线程开始丢）
@@ -98,6 +102,16 @@ def _is_bot_qq(qq, bot_qq: str = "") -> bool:
         return _identity.is_self(q)
     except Exception:
         return False
+
+
+# 昵称清洗/渲染统一在 services/text.py（2026-11-27）：
+#   · clean_name —— 去零宽/格式字符（`下个路口见⁧⁧喵⁧⁧` 这种人看着一样、模型会串）
+#   · render_name —— 含人称代词的昵称加「」（`我的床会长猫` 会被当成一句话）
+# 这里保留同名导出，老调用点不用改。
+from services import text as _text
+
+clean_name = _text.clean_name
+render_name = _text.render_name
 
 
 def _self_id() -> str:
@@ -546,7 +560,7 @@ def observe(gid: str, *, mid: str = "", qq: str = "", name: str = "",
     elif qq and _is_bot_qq(qq, bot_qq):
         is_bot = True
         qq = _identity.canon(qq) or qq
-    name = str(name or qq)
+    name = clean_name(name or qq)
     text = str(text or "").strip()
     # 有些适配器/回显事件没有 message_id；没有 id 审核结果就映射不回来。
     # 生成一个进程内唯一的合成 id（同一条消息只 observe 一次，不会重复）。
@@ -677,7 +691,7 @@ def observe(gid: str, *, mid: str = "", qq: str = "", name: str = "",
     _tmsgs = t.get("msgs") or []
     _tprev = _tmsgs[-1] if _tmsgs else {}
     to_qq = str(inf.get("to_qq") or "")
-    to_name = str(inf.get("to_name") or to_name or "")
+    to_name = clean_name(inf.get("to_name") or to_name or "")
     to_kind = str(inf.get("to_kind") or "group")
     try:
         to_conf = float(inf.get("to_conf") or 0.0)
@@ -779,25 +793,6 @@ def find_by_mid(gid: str, mid: str) -> dict:
             if str(m.get("mid") or "") == mid:
                 return dict(m)
     return {}
-
-
-def qq_of_name(gid: str, name: str) -> str:
-    """名字 / 群名片 → QQ（白月光统计：她 @ 的是谁）。"""
-    name = str(name or "").strip()
-    if not name:
-        return ""
-    _, mp = _NAMES.get(str(gid), (0.0, {}))
-    if not mp:
-        return ""
-    if name in mp:
-        return str(mp[name])
-    # 「老大(9746)」vs「老大」：允许前缀/后缀匹配，取最长的那个
-    best = ""
-    for n, q in mp.items():
-        if n and (n.startswith(name) or name.startswith(n)):
-            if len(n) > len(best):
-                best = n
-    return str(mp.get(best) or "")
 
 
 def replay(gid: str, rows, *, bot_qq: str = "", names=None,
@@ -907,10 +902,10 @@ def snapshot(gid: str, *, bot_qq: str = "", my_names=None,
         # 最新那条线程给足 20 句（她要判的就是这条）；其它线程 4 句够看个上下文
         _take = _n_lines if _ti == 0 else min(4, _n_lines)
         for m in (t.get("msgs") or [])[-_take:]:
-            who = str(m.get("name") or m.get("qq") or "?")
+            who = render_name(m.get("name") or m.get("qq") or "?")
             if m.get("is_bot"):
                 who = "你"
-            to = str(m.get("to_name") or "")
+            to = render_name(m.get("to_name"))
             kind = str(m.get("to_kind") or "")
             try:
                 conf = float(m.get("to_conf") or 0)
@@ -1355,9 +1350,10 @@ def history_lines(gid: str, n: int = 8, *, width: int = 160,
         if (_ex and _mid and _mid in _ex) or (_ex_txt and _key in _ex_txt):
             # 已经在「当前这一段」里了 → 历史里不要再出现一遍
             continue
-        who = str(m.get("name") or m.get("qq") or "?")
+        who = render_name(m.get("name") or m.get("qq") or "?")
         kind = str(m.get("to_kind") or "").strip().lower()
-        nm = re.sub(r"[(（]\s*\d{3,}\s*[)）]$", "", str(m.get("to_name") or "")).strip()
+        nm = re.sub(r"[(（]\s*\d{3,}\s*[)）]$", "",
+                    render_name(m.get("to_name"))).strip()
         try:
             conf = float(m.get("to_conf") or 0.0)
         except Exception:

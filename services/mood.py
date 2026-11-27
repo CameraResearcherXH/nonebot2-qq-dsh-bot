@@ -31,6 +31,13 @@ import threading
 import time
 from pathlib import Path
 
+try:  # 允许脱离 nonebot 单独跑脚本（selftest / 数据修复）
+    from nonebot import logger
+except Exception:  # pragma: no cover
+    import logging
+
+    logger = logging.getLogger(__name__)
+
 try:
     import fcntl
 except Exception:  # pragma: no cover - Windows 本地调试
@@ -114,6 +121,12 @@ _HL_MIN = {
 }
 STEP_1 = tuning.f("MOOD_STEP_1")
 STEP_2 = tuning.f("MOOD_STEP_2")
+STEP_3 = tuning.f("MOOD_STEP_3")
+IMPACT_MAX = tuning.i("MOOD_IMPACT_MAX")
+# 2026-11-27（外部审计）：prompt 写了「±3 一天最多一次」，代码没有计数。
+# 按**会话**按自然日计数；超了降到 ±2（保留「这是件大事」，只是不再顶格）。
+IMPACT3_DAILY_MAX = tuning.i("MOOD_IMPACT3_DAILY_MAX")
+IMPACT3_OVER_TO = tuning.i("MOOD_IMPACT3_OVER_TO")
 SENS_MIN = tuning.f("MOOD_SENS_MIN")
 SENS_MAX = tuning.f("MOOD_SENS_MAX")
 SATURATION = tuning.f("MOOD_SATURATION")
@@ -125,6 +138,9 @@ R_BASE = tuning.f("MOOD_R_BASE")
 R_SLOPE = tuning.f("MOOD_R_SLOPE")
 ANCHOR_EVERY = tuning.i("MOOD_ANCHOR_EVERY")
 ANCHOR_IDLE_MIN = tuning.f("MOOD_ANCHOR_IDLE_MIN")
+# 2026-11-26 用户拍板：anchor_level 必填，且**每窗按权重混入**（占大头）。
+#   ANCHOR_WEIGHT 是每窗的混入权重；ANCHOR_GAIN 只给独立锚点（静默定时器/手动）。
+ANCHOR_WEIGHT = tuning.f("MOOD_ANCHOR_WEIGHT")
 ANCHOR_GAIN = tuning.f("MOOD_ANCHOR_GAIN")
 ANCHOR_DEADBAND = tuning.f("MOOD_ANCHOR_DEADBAND")
 ANCHOR_MAX_MOVE = tuning.f("MOOD_ANCHOR_MAX_MOVE")
@@ -323,6 +339,12 @@ def _p_of(rec: dict) -> float:
 # 留 1/4 的观测噪声当底，稳态 K≈0.2，单次 impact=±1 约走 0.02 —— 与 DESIGN
 # §3.1 写的「稳态 0.02~0.05」一致；锚点仍会把 P 抬回 0.02 做纠偏。
 P_FLOOR = max(1e-4, R_BASE * 0.25)
+# 2026-11-26 用户拍板：「impact≥2 时回补一点 P」。
+# 为什么：稳态 P 长期贴 P_FLOOR，K≈0.04，±3 档 dv 只有 0.012 ——
+# 心情「推不动」，所谓突发事件在数值上不存在。
+# 只在 |impact|≥2 时补，且补完不超过 P_EVENT_CAP（否则连刷会把 K 顶到 1）。
+P_EVENT_BOOST = tuning.f("MOOD_P_EVENT_BOOST")
+P_EVENT_CAP = tuning.f("MOOD_P_EVENT_CAP")
 
 
 def sensitivity(session_key: str = "") -> float:
@@ -349,7 +371,13 @@ def set_sensitivity(value: float, session_key: str = "") -> float:
 
 
 def _step_of(impact: int) -> float:
-    return STEP_2 if abs(impact) >= 2 else STEP_1
+    """档位 → 观测步长。2026-11-26（v2.5）：加 ±3「猛击」档。"""
+    a = abs(int(impact))
+    if a >= 3:
+        return STEP_3
+    if a >= 2:
+        return STEP_2
+    return STEP_1
 
 
 def _anchor_map(level: int) -> float:
@@ -357,20 +385,101 @@ def _anchor_map(level: int) -> float:
             -1: -ANCHOR_LEVEL1, -2: -ANCHOR_LEVEL2}.get(int(level), 0.0)
 
 
-def _anchor_rec(rec: dict, level: int, confidence: float,
-                baseline: float = 0.0) -> float:
-    """在 rec 上做一次绝对锚点，返回实际位移（外口径）。"""
+def event_p_boost(p: float, imp: int) -> float:
+    """|impact|≥2 时回补 P，**只补不降**（2026-11-27 修）。
+
+    旧写法 `p = min(max(P_FLOOR, P_EVENT_CAP), p + BOOST)` 在 P0=0.25 >
+    P_EVENT_CAP=0.20 时，第一条 ±2/±3 会把 P **调低**到 0.20 —— 更大的事件
+    反而更确定。正确语义：p 已经高于 CAP 就保持原值。
+    """
+    try:
+        p = max(P_FLOOR, float(p))
+    except Exception:
+        p = P_FLOOR
+    if abs(int(imp or 0)) >= 2:
+        return max(p, min(P_EVENT_CAP, p + P_EVENT_BOOST))
+    return p
+
+
+def _anchor_diff(rec: dict, level: int, baseline: float = 0.0) -> float:
+    """当前 v 到「绝对档位目标」的差值（外口径）。诊断/死区判定共用。"""
     v = float(rec.get("value") or 0.0) / 100.0
     target = max(-1.0, min(1.0, float(baseline) + _anchor_map(level)))
-    diff = target - v
-    if abs(diff) < ANCHOR_DEADBAND:
+    return target - v
+
+
+@_serialized
+def cap_daily_impact(session_key: str, impact: int) -> int:
+    """±3 档「一天最多 N 次」的代码护栏（2026-11-27，外部审计缺口）。
+
+    为什么放在 mood 而不是 prompt：prompt 只是纪律，活跃群一天能刷好几次 ±3。
+    口径：
+      · **按会话**（心情本来就是会话级）按**自然日**计数；
+      · 超限后把 ±3 降成 `IMPACT3_OVER_TO`（默认 2）——保留「这是件大事」，
+        只是不再顶格；**不丢弃**，避免模型报了大事件却完全不生效；
+      · `MOOD_IMPACT3_DAILY_MAX=0` = 不限（回滚）。
+    返回实际生效的档位（-3..+3）。
+    """
+    try:
+        imp = max(-IMPACT_MAX, min(IMPACT_MAX, int(impact)))
+    except Exception:
+        return 0
+    if abs(imp) < 3 or IMPACT3_DAILY_MAX <= 0:
+        return imp
+    now = time.time()
+    day = time.strftime("%Y-%m-%d", time.localtime(now))
+    key = _scope_key(session_key)
+    st = _load()
+    rec = st["sessions"].get(key) if key else st["global"]
+    rec = _decay(rec, now) if rec else _new_rec(now, _scope_of(key))
+    if str(rec.get("impact3_day") or "") != day:
+        rec["impact3_day"] = day
+        rec["impact3_n"] = 0
+    n = int(rec.get("impact3_n") or 0)
+    if n >= IMPACT3_DAILY_MAX:
+        eff = (1 if imp > 0 else -1) * max(0, min(IMPACT_MAX, IMPACT3_OVER_TO))
+    else:
+        rec["impact3_n"] = n + 1
+        eff = imp
+    if key:
+        st["sessions"][key] = rec
+    else:
+        st["global"] = rec
+    _save(st)
+    return eff
+
+
+def _anchor_rec(rec: dict, level: int, confidence: float,
+                baseline: float = 0.0, *, gain: float = None,
+                p_add: float = None, count: int = 1) -> float:
+    """在 rec 上做一次绝对锚点，返回实际位移（外口径）。
+
+    `gain`  —— 这次向目标靠多少（默认 `ANCHOR_GAIN`；每窗混入时传 `ANCHOR_WEIGHT`）；
+    `p_add` —— P 的回补量（每窗混入时不回补，只有周期/静默锚点才补，
+               否则 P 永远很高、K 永远大，滤波器等于没有）；
+    `count` —— 1 = 这次算一次锚点（写 `anchor_n`）；0 = 只混入不计次。
+    """
+    v = float(rec.get("value") or 0.0) / 100.0
+    diff = _anchor_diff(rec, level, baseline)
+    if abs(diff) < 1e-12:
         return 0.0
-    move = diff * (ANCHOR_GAIN * max(0.0, min(1.0, float(confidence))))
+    _g = ANCHOR_GAIN if gain is None else max(0.0, float(gain))
+    # 2026-11-27（外部审计）：旧写法「|diff| < 0.15 直接 return 0，>0.15 一次拉 45%」
+    # 把 EMA 变成了 bang-bang（稳态锯齿）。现在改成**软死区**：
+    #   |diff| < DEADBAND 时按 smoothstep 衰减权重（0 → 1），边界处与全速连续；
+    #   既保留「小抖动不动」的初衷，又不会在 0.149→0.151 之间突然跳 6 个点。
+    # 位移 <0.01 的窗口本来就不写 mood_history，所以不会把流水刷满。
+    if ANCHOR_DEADBAND > 1e-9:
+        _r = min(1.0, abs(diff) / ANCHOR_DEADBAND)
+        _g *= _r * _r * (3.0 - 2.0 * _r)
+    move = diff * (_g * max(0.0, min(1.0, float(confidence))))
     move = max(-ANCHOR_MAX_MOVE, min(ANCHOR_MAX_MOVE, move))
     rec["value"] = _clamp((v + move) * 100.0)
-    rec["P"] = min(1.0, _p_of(rec) + ANCHOR_P_ADD)
+    if p_add:
+        rec["P"] = min(1.0, _p_of(rec) + float(p_add))
     rec["anchor_at"] = time.time()
-    rec["anchor_n"] = int(rec.get("anchor_n") or 0) + 1
+    if count:
+        rec["anchor_n"] = int(rec.get("anchor_n") or 0) + 1
     return round(move, 4)
 
 
@@ -385,7 +494,7 @@ def observe(session_key: str, impact: int, confidence: float = 0.6, *,
     `anchor_level` 非 None 且到第 ANCHOR_EVERY 个窗口 / 静默够久时做一次锚点。
     """
     try:
-        imp = max(-2, min(2, int(impact)))
+        imp = max(-IMPACT_MAX, min(IMPACT_MAX, int(impact)))
     except Exception:
         imp = 0
     try:
@@ -419,6 +528,10 @@ def observe(session_key: str, impact: int, confidence: float = 0.6, *,
         v = float(rec.get("value") or 0.0) / 100.0
         p = max(P_FLOOR, min(1.0, _p_of(rec)
                              + (Q_BASE + Q_SLOPE * max(0.0, float(reactivity))) * dt_h))
+        # 突发事件回补 P（2026-11-26 用户拍板）。
+        # 只补到 P_EVENT_CAP：连刷 ±3 时 P 不会一路顶到 1，K 最多 ≈0.63，
+        # ±3 的 dv ≈0.176，仍远低于 HARD_CAP(0.35)。
+        p = event_p_boost(p, imp)
         r = R_BASE + R_SLOPE * (1.0 - conf) ** 2
         k = (p / (p + r)) if (p + r) > 0 else 0.0
         d = 0.0 if imp == 0 else (1.0 if imp > 0 else -1.0)
@@ -441,15 +554,21 @@ def observe(session_key: str, impact: int, confidence: float = 0.6, *,
         scope = _scope_of(key)
         rec, dv, z, k, p = _one(st["sessions"].get(key), scope, base=_base_v)
         n = int(rec.get("judge_n") or 0)
-        idle = (now - float(rec.get("anchor_at") or rec.get("updated_at") or now)) \
-            > ANCHOR_IDLE_MIN * 60
-        _do_anchor = (anchor_level is not None
-                      and (n % max(1, ANCHOR_EVERY) == 0 or idle))
-        if _do_anchor:
-            anchored = _anchor_rec(rec, int(anchor_level), conf, _base_v)
-            # 死区跳过的窗口算不算「一次锚点」由 MOOD_ANCHOR_COUNT_SKIPPED 决定：
-            # 0 = 只数真的挪动过的（被跳过就把计数退回去）
-            if anchored == 0 and not ANCHOR_COUNT_SKIPPED:
+        # 2026-11-26（外部审计）：原来这里还有 `or idle`，但 `_anchor_rec` 每窗都会写
+        # `anchor_at=now`，而 `_one` 每窗都写 `updated_at=now` —— 只要模型每窗都给
+        # anchor_level，「静默 30min」在这里**永远不成立**，是死分支。
+        # 静默回补由 `anchor_tick`（定时器）负责，observe 内只按窗口数回补。
+        _cadence = (n % max(1, ANCHOR_EVERY) == 0)
+        if anchor_level is not None:
+            # 软死区里（|diff|<DEADBAND）的窗口算不算「一次锚点」由
+            # MOOD_ANCHOR_COUNT_SKIPPED 决定；0 = 只数真挪动过的。
+            _dead = abs(_anchor_diff(rec, int(anchor_level), _base_v)) < ANCHOR_DEADBAND
+            anchored = _anchor_rec(
+                rec, int(anchor_level), conf, _base_v,
+                gain=ANCHOR_WEIGHT,
+                p_add=(ANCHOR_P_ADD if _cadence else 0.0),
+                count=(1 if _cadence else 0))
+            if _dead and _cadence and not ANCHOR_COUNT_SKIPPED:
                 rec["judge_n"] = max(0, n - 1)
         if abs(_base_v) > 1e-9:
             rec["base_v"] = round(_base_v, 4)
@@ -457,8 +576,15 @@ def observe(session_key: str, impact: int, confidence: float = 0.6, *,
         g, dv_g, _, _, _ = _one(st["global"], "global", GLOBAL_SHARE, base=_base_v)
         # 2026-11-25：全局也要锚（emotion §4.1「锚点同样作用于全局」）。
         # 以前只有会话锚，全局漂了只能靠 6h 衰减，quiet/proactive 会跟着偏。
-        if _do_anchor:
-            anchored_g = _anchor_rec(g, int(anchor_level), conf, _base_v)
+        if anchor_level is not None:
+            # ⚠️ 2026-11-27（外部审计，真问题）：全局**事件**乘了 GLOBAL_SHARE(0.35)，
+            # 但全局**锚点**以前是满权重 0.45×conf → 全局在锚点上比会话还快，
+            # 最吵的群会主导全局。这里统一乘 GLOBAL_SHARE。
+            anchored_g = _anchor_rec(
+                g, int(anchor_level), conf, _base_v,
+                gain=ANCHOR_WEIGHT * GLOBAL_SHARE,
+                p_add=((ANCHOR_P_ADD * GLOBAL_SHARE) if _cadence else 0.0),
+                count=(1 if _cadence else 0))
         if abs(_base_v) > 1e-9:
             g["base_v"] = round(_base_v, 4)
         st["global"] = g
@@ -466,7 +592,14 @@ def observe(session_key: str, impact: int, confidence: float = 0.6, *,
     else:
         g, dv, z, k, p = _one(st["global"], "global", base=_base_v)
         if anchor_level is not None:
-            anchored_g = _anchor_rec(g, int(anchor_level), conf, _base_v)
+            # MOOD_SCOPE=global：没有会话计数，按全局窗口数走同样的「每窗混入 + 周期回补 P」。
+            _gn = int(g.get("judge_n") or 0)
+            _gcad = (_gn % max(1, ANCHOR_EVERY) == 0)
+            anchored_g = _anchor_rec(
+                g, int(anchor_level), conf, _base_v,
+                gain=ANCHOR_WEIGHT * GLOBAL_SHARE,
+                p_add=((ANCHOR_P_ADD * GLOBAL_SHARE) if _gcad else 0.0),
+                count=(1 if _gcad else 0))
         if abs(_base_v) > 1e-9:
             g["base_v"] = round(_base_v, 4)
         st["global"] = g
@@ -478,11 +611,14 @@ def observe(session_key: str, impact: int, confidence: float = 0.6, *,
                       label=(why or ""), reason="observe",
                       session_key=session_key, about_qq=about_qq,
                       src=src, mind=mind, impact=imp)
-        if anchored:
+        # 2026-11-26：锚点现在**每窗都可能挪**（ADR-042）。只有挪得够多才记流水，
+        # 否则 mood_history 会被 0.002 级别的纠偏刷满，`recent_shifts` 的 600 行缓存
+        # 覆盖不到 30 分钟，安静建议反而看不清「真事件」。
+        if abs(anchored) >= 0.01:
             log_shift(anchored * 100.0, emotion="anchor",
                       label="绝对锚点纠偏", reason="anchor",
                       session_key=session_key, about_qq=about_qq)
-        if anchored_g:
+        if abs(anchored_g) >= 0.01:
             log_shift(anchored_g * 100.0, emotion="anchor",
                       label="全局锚点纠偏", reason="anchor",
                       session_key="", about_qq="")
@@ -491,7 +627,12 @@ def observe(session_key: str, impact: int, confidence: float = 0.6, *,
     # P 返回**后验**（更新后的不确定度）：日志/诊断要能看出「越判越确定」，
     # 返回先验 p 会让线上每条都像 P0=0.25（2026-11-25 真机日志踩到）。
     _post = _p_of(st["sessions"][key]) if key else _p_of(st["global"])
+    # `dv` 只含**事件步进**（不含 anchored）——好感/记忆/峰值事件只吃它：
+    #   锚点是「对她此刻水平的重新估计」，不是「这个人造成了这件事」，
+    #   把它算进好感就变成「她今天心情好，顺手记到旁边人头上」（违反唯一原则）。
+    # 想知道「这一窗 v 到底动了多少」看 `dv_total`（诊断用，不进任何模型）。
     return {"v": round(value_now / 100.0, 4), "dv": round(dv, 4),
+            "dv_total": round(dv + anchored, 4),
             "z": round(z, 4), "K": round(k, 4), "P": round(_post, 4),
             "P_prior": round(p, 4), "impact": imp, "anchored": anchored}
 
@@ -737,7 +878,9 @@ def _decay(rec: dict, now: float, baseline: float = None) -> dict:
     if isinstance(rec.get("judge"), dict) and rec["judge"]:
         out["judge"] = dict(rec["judge"])
     # P2 状态机字段：不确定度 P、判读次数、上次锚点、人设敏感度
-    for _k in ("P", "judge_n", "anchor_at", "anchor_n", "sens"):
+    for _k in ("P", "judge_n", "anchor_at", "anchor_n", "sens",
+               # ±3 日计数（2026-11-27）：衰减时不能丢，否则每天第一次 ±3 判不出来
+               "impact3_day", "impact3_n"):
         if rec.get(_k) is not None:
             out[_k] = rec.get(_k)
     return out
@@ -748,7 +891,19 @@ def _load() -> dict:
     if MOOD_FILE.exists():
         try:
             raw = json.loads(MOOD_FILE.read_text(encoding="utf-8")) or {}
-        except Exception:
+        except Exception as e:
+            # 2026-11-26（2026-11-26 审计修复）：以前这里是裸 `except: pass`，
+            # mood.json 一旦损坏就静默返回空状态 —— 全员心情归零，
+            # 而且没有任何告警。现在必须喊出来，并把坏文件备份走。
+            try:
+                _bak = MOOD_FILE.with_suffix(
+                    ".corrupt-%d.json" % int(time.time()))
+                MOOD_FILE.replace(_bak)
+                logger.error(f"[MOOD] mood.json 解析失败（{type(e).__name__}: {e}）"
+                             f"，已备份到 {_bak.name} 并按空状态继续")
+            except Exception:
+                logger.error(f"[MOOD] mood.json 解析失败（{type(e).__name__}: {e}）"
+                             f"，备份失败，按空状态继续")
             raw = {}
     if not isinstance(raw, dict):
         raw = {}
@@ -1028,6 +1183,16 @@ def get_mood(session_key: str = "") -> dict:
     if label and (now - label_at) > MOOD_LABEL_TTL_H * 3600:
         label = ""            # 太久以前写的心情，别再当「现在」
         _dirty = True
+    # 2026-11-26：分档词和当前数值跨过 0.2 的档位边界时，把它更新掉。
+    # 否则状态卡会出现「v=+0.174 却写着『有点高兴』（那是 ≥0.2 的词）」。
+    # 她自己写的原话（不在 MOOD_LABELS 里）不动。
+    if label and any(label == _w for _, _w in MOOD_LABELS):
+        _cur_w = label_for(float(rec.get("value") or 0.0) / 100.0)
+        if _cur_w != label:
+            label = _cur_w
+            rec["label"] = _cur_w
+            rec["label_at"] = now
+            _dirty = True
     if _dirty:
         _save(st)
     return {"value": rec["value"], "label": label, "label_at": label_at,
@@ -1349,14 +1514,6 @@ def reset(session_key: str = "", *, value: float = 0.0) -> float:
     return round(out / 100.0, 4)
 
 
-def state_word(session_key: str = "") -> str:
-    """当前心情的**名词**（按数值分档，每 0.2 一档）。"""
-    try:
-        return label_for(float(get_mood(session_key).get("value") or 0.0) / 100.0)
-    except Exception:
-        return MOOD_LABELS[5][1]
-
-
 def trend(session_key: str = "", *, about_qq: str = "",
           window_sec: float = 1800) -> dict:
     """
@@ -1371,6 +1528,7 @@ def trend(session_key: str = "", *, about_qq: str = "",
     try:
         recs = [r for r in recent_shifts(now - float(window_sec))
                 if str(r.get("session") or "") == key
+                and str(r.get("reason") or "") != "anchor"
                 and (not about_qq
                      or str(r.get("about_qq") or "") == str(about_qq))]
     except Exception:

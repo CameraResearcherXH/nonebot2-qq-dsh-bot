@@ -3,7 +3,7 @@ from core import tuning
 import os
 import re
 import time
-from services import profiles, memory_v2, mood, ctx_budget
+from services import profiles, memory_v2, mood, ctx_budget, long_doc as _ld
 
 # 每个 session 的"上一句"（用于短句兜底）
 _last_query: dict[str, str] = {}
@@ -383,6 +383,10 @@ def build_packet(
     max_age_days: float = 0,
     total_budget: int = 0,
     hits: list | None = None,
+    # 2026-11-27（外部审计）：long_doc 的证据 6000 / 图书馆 3000 以前只放宽了
+    # `total_budget`，单块上限仍是 CTX_EVIDENCE=500 / library=350 → 等于没接线。
+    # 现在显式放开这两个块的上限，并按 DESIGN 的「3 篇 × ≤1900 字」渲染正文。
+    long_doc: bool = False,
     record: bool = True,
     gid: str = "",
     addressed: bool = True,
@@ -463,34 +467,61 @@ def build_packet(
 
     _mem_dir = []
     if hits:
-        for i, h in enumerate(hits, 1):
-            _mem_dir.append(
-                f"{i}. {h.get('emotion_mark') or ''} {h.get('ago')}｜"
-                f"{str(h.get('summary') or '')[:40]}"
-            )
+        if long_doc:
+            # 长答：不是目录，是**正文证据**（DESIGN §3.3：3 篇 × ≤1900 字 + 出处）。
+            for i, h in enumerate(hits[: max(1, int(_ld.PIECES or 3))], 1):
+                _body = str(h.get("text_full") or h.get("text")
+                            or h.get("summary") or "").strip()
+                _body = _body[: max(1, int(_ld.PIECE_CHARS or 1900))]
+                _src = f"{h.get('ago') or ''}"
+                if h.get("about_qq"):
+                    _src += f"｜关于 {h.get('about_qq')}"
+                _mem_dir.append(f"【证据 {i}】{_src}\n{_body}")
+        else:
+            for i, h in enumerate(hits, 1):
+                _mem_dir.append(
+                    f"{i}. {h.get('emotion_mark') or ''} {h.get('ago')}｜"
+                    f"{str(h.get('summary') or '')[:40]}"
+                )
 
     if _idx or _mem_dir:
         _parts = []
         if _idx:
             _parts.append("\n".join(f"· {x}" for x in _idx))
         if _mem_dir:
-            _fb = any(h.get("fallback") for h in hits)
-            _title = ("关于这个人最近的事（关键词没命中，按时间给的）："
-                      if _fb else
-                      f"目录（{len(_mem_dir)} 条，越前越相关）：")
-            _parts.append(_title + "\n" + "\n".join(_mem_dir))
+            if long_doc:
+                _parts.append(
+                    f"长答证据（{len(_mem_dir)} 篇，可直接引用，别编）：\n"
+                    + "\n\n".join(_mem_dir))
+            else:
+                _fb = any(h.get("fallback") for h in hits)
+                _title = ("关于这个人最近的事（关键词没命中，按时间给的）："
+                          if _fb else
+                          f"目录（{len(_mem_dir)} 条，越前越相关）：")
+                _parts.append(_title + "\n" + "\n".join(_mem_dir))
         contents["memory_index"] = (
-            "▍记忆目录（只给线索，内容按需拉）\n"
+            ("▍长答证据（正文，不是线索）\n" if long_doc
+             else "▍记忆目录（只给线索，内容按需拉）\n")
             + "\n".join(_parts)
-            + "\n（想看全文 → `[[MEMORY|关键词]]`；想看某个人 → `[[PROFILE|名字]]`）"
+            + ("\n（引用时标明「哪一篇」；没写在证据里的事不要补。）" if long_doc
+               else "\n（想看全文 → `[[MEMORY|关键词]]`；想看某个人 → `[[PROFILE|名字]]`）")
         )
+        if long_doc:
+            # 让 /测函数 预算 能看到真实的 long_doc 块大小（上限 6000 字符）
+            contents["memory_index"] = ctx_budget.observe(
+                "long_doc_evidence", contents["memory_index"],
+                source=f"prompt:{session_key}")
 
     # ④ 图书馆（算力机 Agent，30 天以前的往事，仅供参考）
     if library_text:
-        contents["library"] = (
+        _lib = (
             "▍图书馆·久远的往事（来自长期归档，**仅供参考，可能记错**）\n"
             + str(library_text).strip()
         )
+        if long_doc:
+            _lib = ctx_budget.observe("long_doc_library", _lib,
+                                      source=f"prompt:{session_key}")
+        contents["library"] = _lib
 
     # ⑤ 昨日总结 —— 短历史每天新开，这一块就是"交接"
     try:
@@ -589,7 +620,14 @@ def build_packet(
             contents["relation"] = _rel
 
     # 预算裁剪
-    alloc = allocate_budget(contents, total=total_budget)
+    # long_doc：只放大「证据 / 图书馆」两个块，其余块上限不变（ADR-039：
+    # 放大 persona/协议会打掉前缀缓存）。CTX_LONG_DOC_* 是**字符**口径。
+    _budget = BLOCK_BUDGET
+    if long_doc:
+        _budget = dict(BLOCK_BUDGET)
+        _budget["memory_index"] = (120, ctx_budget.limit_chars("long_doc_evidence"))
+        _budget["library"] = (0, ctx_budget.limit_chars("long_doc_library"))
+    alloc = allocate_budget(contents, budget=_budget, total=total_budget)
     out = {}
     for k, v in contents.items():
         clipped = _clip(v, alloc.get(k, 0))

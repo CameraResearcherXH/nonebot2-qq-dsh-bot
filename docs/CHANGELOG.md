@@ -1,5 +1,969 @@
 # 更新日志
 
+## 2026-11-27（第四十四轮：输出上限 4000 / 仓库与服务器对账 / 脱敏后首次提交）
+
+**1. 主聊天输出上限 1200 → 4000（用户：「不要 think 占满输出」）**
+
+- `ROLEPLAY_MAX_TOKENS` 默认 4000（`core/tuning.py`），`.env` / `.env.example` 同步写死 4000；
+- 长答模式 `LONG_DOC_MAX_TOKENS` 2000 → 4000（同一个模型、同一个 thinking 问题）；
+- `services/env_guard.py` 启动体检：阈值 2048 → 4000，且不再只看 `GLM_THINKING` ——
+  `model` 里带 `reason/think/flash` 的推理型模型也会提示；
+- 实测容器内 `providers.resolve('roleplay')['max_tokens'] = 4000`，启动日志
+  `[ENV] 启动配置体检通过`（不再告警）。
+
+**2. 仓库 ↔ 服务器对账（`rsync -c` 全量比对）**
+
+48 处差异，逐条看过：
+
+| 类别 | 数量 | 处理 |
+|---|---|---|
+| 只在本机（`comfy_workflows/` `config/` `node_config/` `setup_*.ps1` `subscribe.txt` `.xray_runtime/xray.exe`） | 12 | 属算力机/本地资源，服务器不需要，保持只在本机（`xray.exe` 已 gitignore） |
+| 只差文件末尾空行（`plugins/third/*` 15 个 + `pixivrank_search` 3 个 + `UPSTREAM.md` 7 个） | 35 | 用**仓库版**对齐服务器（纯空白，无行为变化）；`UPSTREAM.md` 仓库版还更准（补了 girls_2d 的上游地址） |
+| 真实差异：`plugins/nonebot_plugin_tavily_search` | 1 | 仓库版多了 `/技能 关 搜索` 的 `skill_switch.gate(...)`，服务器是旧版 → **已补上服务器** |
+
+对账后 `verify_deploy` 125/125、`verify_all --full` 11/11。
+
+**3. 脱敏（首次提交前）**
+
+- 真实服务器 IP（文档 3 处、`node.py`、`scripts/xray_proxy.py` 示例、`patches/all.patch` 3 处）
+  → `YOUR_SERVER_IP` / `127.0.0.1`；
+- `node.py` 的 `SERVER_IP` / `API_SECRET` 不再有硬编码默认值（旧的弱默认密钥已删），
+  缺配置时启动会打印明确提示 → 算力机在 `node.env` 里配；
+- `scripts/make_dist.py` 的 `PRIVATE_HOSTS` 改为 `DIST_PRIVATE_HOSTS` 环境变量；
+- `test.py` 的 `API_SECRET` 改为读环境变量；
+- `.env` / `.env.working` / `data/` / `node.env` 继续 gitignore（只提交 `.env.example`，其中全部为空值）；
+- `.gitignore` 新增根目录噪音清单（`3a_zh.txt` `d3.txt` `e1.txt` `v1.txt` `jy.tex` `help.txt`
+  `t_*_zh.txt` `test.py`）和 `patches/*.tar.gz`。；
+- ⚠️ **发行前扫描发现 `scripts/subscribe.txt`（68KB，base64 里是真实 vmess/ss 节点 + UUID）
+  在上一版发行仓里就已经存在**。本次已从发行仓删除，并加进 `make_dist` 排除清单 +
+  `.gitignore`；**那批节点凭据建议尽快轮换**（历史 commit 里仍能看到）。
+
+## 2026-11-27（第四十三轮：send 工具把 `<sticker:吃瓜>` 当话发出去）
+
+**证据（NapCat + bot 双份日志，不是猜）**
+
+```text
+napcat 18:03:58  大肥鱼 | 发送 -> 群聊 [闲聊的书友群(100000016)]
+                 这群已经变成图片展览馆了 |||<sticker:吃瓜>
+bot    18:03:59  [TOOL] send({'text': '这群已经变成图片展览馆了 |||<sticker:吃瓜>'}) → 发出去了
+```
+
+第四十一轮的 `clean_outgoing()` 只剥了方括号协议（`[[TOOLS|…]]` / 裸标记 / 动作括号），
+**没管 `<sticker:…>` 和 `|||`** —— 这两样只有 `parse_reply`（正文路径）会处理，
+send 工具的 text 参数直接进 `MessageSegment.text()`，于是原样进群。
+
+**修复**
+
+1. `aura_logic.clean_outgoing()` 补三类发送标签：`<sticker:…>`、`<reply:…>`/`<at:…>`/`<poke/>`、
+   `<voice>…</voice>`（保留里面的话），并把 `|||` 换成换行（气泡分隔符不能外发）；
+2. 新增 `aura_logic.extract_stickers()`：send 工具先把 `<sticker:吃瓜>` 摘出来，
+   **真发一张表情**（`send_sticker_by_tag`，精确→近义→静默跳过）；
+3. 只有表情标签（洗完是空）时不再被当成「协议标记」拦掉；表情库没有该 tag 时
+   回模型「库里没有，别跟对方说你发了表情」，避免「说了没做」。
+
+**校验**：`check_runtime_wiring` 新增 4 条（`<sticker:>`/`|||` 不外发、标签能摘出、
+只含表情不被拦、`<voice>` 保留正文）；表情库实测有 9 张「吃瓜」，会真的发出去。
+
+## 2026-11-27（第四十二轮：意图理解层「只加不减」+ 离线评测脚本）
+
+用户拍板「两个同时做，一起测」：把 11-26 的「读气氛」升级成「读气氛 + 判意图」，
+同时把「到底准不准」做成可复现的离线评测 —— 不靠手感开闸门。
+
+**1. 意图层（`services/atmosphere.py`，同一次调用，不增加一次请求）**
+
+- 输出从 5 个字段扩到 `mood/who/feel/others/tip` + `topic/asks/need_reply/why/replied/keywords/queries{memory,library,web}`；
+- **只加不减**：老四行照样在，新四行追加（`ATMO_INTENT=1`；设 0 退回 11-26 的块）；
+- `ATMO_MAX_CHARS` 240 → 400（不截掉最后两行）；
+- `read()` 新增 `text=`（当前这句）和 `replied_mids=`（8 行历史补〔已回〕）；
+  以前只读历史、不含当前这句 → `need_reply` 判的不是她要回的那条；
+- `/测函数 气氛` 兼 `/测函数 意图`，状态里带意图/检索词/闸门开关。
+
+**2. 检索词真的驱动取数（`services/reply_pipeline.py`）**
+
+- `queries.memory` 优先当记忆/档案库检索词；`queries.library` 非空 → 也查图书馆；
+- `queries.web` 只渲染一行「可能要现查：X（要就自己搜，别编）」，不替她发请求；
+- `/测函数 流水线` 多一行「意图：need_reply=…｜在问：…｜检索词 …」；
+- 顺手修掉真机 17:54 抓到的重复标题：`称呼` 块不再出现「▍称呼｜…」+「▍你俩的称呼」两个标题。
+
+**3. 插话闸门（默认关）**
+
+- `ATMO_GATE=0`（tuning 默认）：打开后主动插话时 `need_reply=no` → 这一轮不开口；
+  只挡插话，不影响 @ 她的正常回复；缓存超过 TTL 就不挡。
+- 代码已接（`plugins/chat` 插话循环），但**没有评测达标前不许开** —— 见 DESIGN §8.1。
+
+**4. 离线评测（`scripts/eval_intent.py`）**
+
+- 用 `data/llm_trace` 重放，**和线上同一条 prompt**（`atmosphere.build_prompt`）；
+- 弱标签：正例=她当时回了的那条（优先 ⭐），负例=同窗口里她当时没接的历史行；
+- 输出准确率 / 严格准确率 / 正例召回 / 精确率 / F1 / 混淆矩阵 + 判错样本；
+- `--mock` 不花钱（验证解析/打分）；真跑：`--trace data/llm_trace/2026-11-27.jsonl --limit 204`；
+- 门槛：准确率 ≥85% 且正例召回 ≥85% 才建议开闸门。
+
+**首轮实测（2026-11-27 上午 192 条样本 / 110 正例，真模型）**
+
+```text
+准确率 96.9%｜正例召回 100.0%｜精确率 94.8%｜F1 97.3%（TP=110 FP=6 TN=76 FN=0）
+```
+
+评测过程中修掉两个真 bug（不是调参）：
+
+1. 一段 20 条时 ⭐ 常在第 3~5 条，`text[:800]` 把它截掉 → 新增
+   `atmosphere.compact_segment()`：只留「在叫她的 + 最后 2 条」，段头写「其中 N 条在叫你」；
+2. `"→ 你" in line` 会把昵称「你已被管理员…禁言6小时」误判成「在叫她」→ 改
+   `_ADDR_RE = →\s*你(?=[：:]|$)`（eval 里同一份正则）。
+
+6 条误报里 4 条是弱标签噪音（正文点名「鱼宝/大肥鱼」但那一轮她没回），真错约 2 条。
+**闸门仍保持 0，等用户拍板。**
+
+**校验**：`check_runtime_wiring` 新增 10 条（向后兼容 / 归一化 / queries 过滤 /
+只加不减 / 闸门默认关 / replied_mids 下传 / 评测 1 正 2 负 / 打分）；
+`check_design_docs` 新增第 ⑧ 条叙述断言（`ATMO_GATE` 默认 0 + 文档必须写评测门槛）。
+
+## 2026-11-27（第四十一轮：工具调用降级 —— 不许把调用写法当话发出去）
+
+**根因（有日志，不是猜）**
+
+```
+11-27 16:16:34 [TOOL] send({'text': '[[TOOLS|画图与搜图]]'}) → 发出去了
+（你刚才已经通过工具把这些内容发出去了：[[TOOLS|画图与搜图]]）
+```
+
+模型把「工具目录标记」当成话交给了 `send` 工具。`[[TOOLS|…]]` 只由
+`_fulfill_requests`（处理**正文**）展开，**send 的参数没走这条清洗** → 标记原样进群。
+工具不可用/超时时，模型更容易乱抓一个标记当「解释」发出去。
+
+**四层修复**
+
+1. **出站清洗收口**：新增 `aura_logic.clean_outgoing()` —— 剥协议标记
+   （`[[X|…]]` / `[[X]]`）、**裸标记**（`TOOLS|画图`）、动作括号（`（笑）`）。
+   `send` 的参数和「发送前最后一道」都用它。
+2. **只收到标记就不发**：`_tool_send` 清洗后为空 → 拦下，回模型
+   「这是给你自己看的协议标记，不是要发的话；要说话直接写」。
+3. **调用前预检（降级）**：`llm.set_availability(fn)` 由 chat 注入 ——
+   检查 `/技能` 开关 + 算力机心跳 + `caps`。不可用的工具**不挂**，
+   并在 prompt 里加一句「这些工具现在用不了：X（原因），别调用、别假装做到了」。
+   算力机能力映射：`draw/tts/cover/rvc/split/video_understand`。
+4. **运行期失败**：handler 抛异常 → 回 `【工具失败】…这一轮不要再调它；也不要跟对方说已经做好了`，
+   并记进本回合失败集合，**再调直接拒绝**（避免「越失败越重试」）。
+
+**实测**
+
+- 单测（容器内）：预检过滤 ✅、失败文案 ✅、二次拒绝 ✅、清洗 3 例 ✅
+- 真机 17:32:36：`[TOOLS] 本轮不挂 1 个：video_understand(算力机没上报 video_understand)`
+  → 摘掉后正常回复（11.9s，0 报错）
+- `verify_all --full` **11/11**；清单 **124/124**
+
+**回滚**：服务器上留了 `services/llm.py.bak_1729`、`services/aura_logic.py.bak_1729`、
+`plugins/chat/__init__.py.bak_1729`。
+
+## 2026-11-27（第四十轮：私聊 20 拍板 + 引用串线修复 + 图片文字插件）
+
+**1. 私聊保持 20（用户拍板）**
+
+- 不改 40。文档写清：`PRIVATE_MAX_HANZI` / `OUT_BUBBLE_CHARS` 都是
+  **「超过就发合并转发」的阈值，不是字数上限**（`plugins/chat` 里
+  `>阈值 → _send_long_as_forward`，转发失败才 `limit_hanzi` 砍字）。
+  所以「私聊 20」= 私聊超过 20 加权字就走卡片，话不会被砍短。
+
+**2. 引用串线（真 bug，已修）**
+
+- 现象（用户）：「我说了一句话，之前有个人 @ 她，她接了我的话，
+  却引用了上次 @ 那个人的消息」。
+- 根因：`plugins/chat` 自动引用兜底无条件取「段内最后一条 @ 她的」
+  （`_mens[-1]`），哪怕那之后别人又说了话、她实际回的是后面那句。
+- 修：只有「@ 她的那条**就是段内最后一条**」才自动引用；
+  最后一条是「引用她」→ 落到 `ev.is_tome()` 引最后一条；
+  最后一条是别人普通插话 → **不自动引用**（让模型自己写 `<reply:>`）。
+
+**3. 图片文字：`services/ocr.py` + `plugins/ocr_lite`（新）**
+
+- 服务器只有 OpenCV（无 tesseract/paddleocr），而瓶颈是「小字/低对比度送进视觉模型糊了」。
+  所以做的是：**宽度不足 1400 就放大 → CLAHE + 锐化 → 形态学找文字块 → 逐块裁剪再放大**，
+  再交给现有视觉 provider（主 provider 429/5xx 自动换 `vision_fallback`）。
+- 注册成工具 `ocr_image`（scope=private+group）：不传参数就读**当前消息里的图**，
+  也可以传路径/URL；归到 `skill_switch` 的 `vision` 组（`/技能 关 视觉` 能关）。
+- 实测（容器内，一张 900×420、字号 0.35~0.7、灰字的测试图）：
+  `ok=True blocks=4`，四行全读对（含最低对比度那行 `OCR_TEST_MARKER_42`）。
+- 新 tuning 键：`OCR_MAX_SIDE=2200` / `OCR_UPSCALE_MIN_W=1400` /
+  `OCR_MAX_CROPS=3` / `OCR_TIMEOUT=45`。
+
+**校验**：`verify_all --full` **11/11**（含「设计文档」闸门）；清单 **124/124**；
+`audit_coverage` 开关未覆盖 0。
+
+## 2026-11-27（第三十九轮：第二轮外部审计 12 条复核 —— 全是文档滞后，9 处已改）
+
+完整逐条判定见 [design-audit-response-20261127b.md](design-audit-response-20261127b.md)。
+**结论：7 条真（文档滞后）、3 条部分真、2 条理解问题；没有一条是代码行为错。**
+
+**真问题（已改文档）**
+
+1. §0.1「`tuning.UNWIRED` 已清空」→ 实际还剩 `AFFINITY_GAIN`（设计先行键）；
+2. §8「`mood_judge._step` 是待收口双真相」→ 2026-11-26 就改成 `tuning.f()` 了；
+3. §3.3「15 token + 3 字符」→ 实际 **13 + 5**（`long_doc_*` 11-27 从 ×1.5 改 ×1.0）；
+4. §3.3「风格 ≤730 字符（token 约 487）」→ 单位说反：**730 是 token 值，字符上限 1095**；
+5. §3.2 v1 公式 `×trust_speed` → 代码是 `×T(ts)`，`T=0.6+0.8×ts`；
+6. §3.1 全局锚点少写 `×GLOBAL_SHARE(0.35)`；
+7. §9 红线「单泡 ≤40 字」→ **私聊生成侧仍 `PRIVATE_MAX_HANZI=20`**，已标注「群聊 40 / 私聊 20」。
+
+**自查额外修 2 处**：§3.1 静默锚点「30min」→ 实际 35min（2100s）；§3.3 第 320 行仍写
+「2200 = live 总池」，与同节 261-268 行的警告矛盾 → 改「动态块池」。
+
+**部分真（结论过强，已补说明）**
+
+- 「卡尔曼沦为残差」：`P` 管的是**脱敏**（连续判读 → K↓ → 同样的话影响递减），
+  且 `dv` 喂好感尾部（一见钟情/心碎）—— 复杂度高但每块有读点。已补进 §3.1。
+- 「情绪自指环正反馈」：文档确实只写了「防回声」，没讨论失控风险 → 已进 §8.1 已知债
+  （靠半衰期/P 衰减/锚点被动限速，**没有主动刹车**）。
+- 「预算名存实亡」：261-268 行早写了警告，是 320 行旧措辞自相矛盾（已改）；
+  「默认 CTX_ENFORCE=0」是 tuning 默认，**线上 .env=1**。
+
+**理解问题**
+
+- 「五六条写入口」：`bump_by_emotion` 默认**只写 label 不动数值**、`judge_message_mood`
+  只在回滚模式用、`fast_guard` 线上无调用（文档已注明只被 test 用）→ 默认确实只有一条数值链路。
+- 「v2 默认关却背 30+ 参数」：实际 51 个键，属实，但 DESIGN 55/238 行已写明「默认 v1、实验特性」
+  → 是设计债，已进 §8.1。
+
+**新增 §8.1「已知债」**：v2 参数 / `fast_guard` / 回滚分支 / 预算 enforcement 边界 /
+正反馈风险，每条写清「现在的真实状态 + 还债前提」，避免下次再被当成「文档撒谎」。
+
+**`check_design_docs` 新增「叙述型事实」断言（7 条，默认模式就跑）**：
+
+`tuning.UNWIRED` 的数量/键名、`mood_judge` 是否还有硬编码步长、`ctx_budget` 的
+13 token / 5 字符分类、`style_total` 字符上限 1095、全局锚点 `GLOBAL_SHARE`、
+静默锚点 35min、私聊 `PRIVATE_MAX_HANZI`。
+负向测试：把文档里这 4 处改错 → 直接 4 个 FAIL（以前永远绿）。
+
+**没改业务代码**；`check_design_docs --strict` PASS。
+唯一待产品决定：**#12 私聊 20 字要不要也改成 40**（数据见下）。
+
+> 补充数据（决定 #12 用）：今天 93 个私聊气泡里 **48 个（52%）加权字数 >20**，
+> 而发送侧 `>PRIVATE_MAX_HANZI(20)` 会**走合并转发卡片**（转发失败才砍字）。
+> 也就是说私聊有一半回复是「聊天记录卡片」，不是普通消息。群聊 50% >20 但阈值是 40（p90=35）。
+
+## 2026-11-27（第三十八轮：按上帝视角复盘落 5 项「接歪/人称」修复）
+
+复盘见 [reply-audit-20261127.md](reply-audit-20261127.md)（204 条群回复，人工看 30 条）。
+这一轮把里面「便宜且低风险」的全做了。
+
+**prompt 层（4 句，`services/segments.py` 段头）**
+
+1. `<reply:>` **只能引本段里的消息号**；更早的消息用名字提，别引用
+   （引了会被系统丢掉，还容易答成旧话题 —— 真机 11:02 就是拿窗口外的 mid 答旧问题）。
+2. **没有 ⭐ 就是你在插话**：只接最后 2 条里的话题；最后两条是图片/表情就当话题断了，别翻旧账。
+3. **插话时不要用「你」**，用「他/她/名字」。
+4. `[[PROFILE|我]]`（或名字留空）= 查**说话人自己** —— 群友打「查看档案/我的档案」不会说查谁。
+
+**代码层（3 处）**
+
+5. **插话段裁短**：`segments.format()` 检测到整段没有 ⭐ 时，只给最后
+   `SEG_INSERT_WINDOW=5` 条（新 tuning 键）。以前给 13 条，她容易捡起前面早就翻篇的话题。
+6. **昵称含人称代词 → 加「」**：`services/text.render_name()`。
+   `我的床会长猫`、`请给我很多很多token`、`你已被管理员…禁言6小时` 这类昵称
+   直接写成 `名字 → 大家: …` 会被模型当成句子（人称直接错）。
+   `clean_name` 也一起收口到 `services/text.py`（group_scene 保留同名导出）。
+7. **`[[PROFILE|]]` 不再空转**：`_pname` 为空/「我/自己/本人」时直接取 `TOOL_CTX["speaker_qq"]`，
+   群友说「查看档案」能真的出卡片，而不是只写一句 `[[THINK|又是查档案]]` 然后沉默。
+
+**校验**
+
+`check_runtime_wiring` 新增 4 条断言（插话段裁到 5 条 / 有 ⭐ 不裁 / 昵称加引号 / 普通名字不加），
+共 **34 PASS**；`check_names` / `check_tuning` / `audit_coverage` / `check_design_docs` 全 PASS；
+容器内 `verify_all --full` 10/10。
+
+**没做（等产品决定）**：`查看档案/看档案` 加进 `/档案` 的 aliases ——
+加了这些词就不再进聊天，她就不能拿它们开玩笑了。
+
+## 2026-11-27（第三十七轮：日预算刹车 + 24h 标签审核修两处误导）
+
+**1. 日预算刹车（用户要求：200w token / 天）**
+
+- 新增 `services/budget_guard.py`，四档：
+  `off`（预算 0）→ `ok` → **`soft`（90%，她照常回，但 prompt 加一句「这轮说完就说要休息」）**
+  → **`rest`（100%，主聊天不调模型；每个会话当天第一次回一句固定话术，之后静默）**。
+- 硬停不只拦主聊天：`mood_judge`（占 ~24%）和 `scene_auditor`（~7%）在 `rest` 档也直接跳过，
+  心情/标签停在原地，明天恢复 —— 这样「后续不消耗」是真的，而不是只省掉 55%。
+- 每会话每天只通知一次（`data/budget_notice.json`，跨重启有效），避免刷屏。
+- 生效日期 `LLM_BUDGET_START_DATE=YYYY-MM-DD`：设成明天 = 今天不刹车
+  （避免「当天已经用超了、一上线就闭嘴」）。
+- `/测函数 用量` 多一行：`日预算 x / y（z%）｜档位 soft｜生效日 …`。
+
+**2. 24h 标签审核（`docs/tag-audit-20261127.md`，抽样 475 行）**
+
+- **真 bug（已修）**：`event.is_tome()` 在 NapCat 上不只为「@ 她」为真（引用她也真、实测 @ 别人也出现过），
+  旧代码只要 `is_tome` 就把她插到 @ 名单最前 → 「萌萌香 @冬眠耗子」被记成 **`→ 你`**，
+  她会以为整段都在跟自己说。改成「@ 名单里真有她才排第一；@ 别人就保留别人；没 @ 才兜底」。
+- **零宽字符（已修）**：17% 的行发言者名字带 U+2067 之类不可见字符（`下个路口见⁧⁧喵⁧⁧`），
+  新增 `group_scene.clean_name()` 在**入库 + 渲染**两处清掉，正常中文/emoji 不动。
+- 其余记录在案：同一 QQ 多昵称（18 个）、纯命令词标 `→ 你`（合理）、
+  `→ 你` 里 67% 没有 @（玩梗软命中，观察）。
+- 〔已回〕标记正常（今天 trace 里 278 次），`→ 大概X` / `→ X?` 在样本里 0 次。
+
+**3. 校验**
+
+`check_runtime_wiring` 新增 8 条行为断言（预算 4 档 / 通知每会话一次 / 话术非空 / 昵称清洗），
+共 30 PASS；`check_names` / `check_tuning` / `audit_coverage` / `check_design_docs` 全 PASS。
+
+## 2026-11-27（第三十六轮：清 5 个死函数 + 接 3 个「文档承诺了没实现」）
+
+`audit_wiring.py` 的 9 个零引用公开函数逐个查了「当初为谁写的」，按结论处理，
+不留「写了没人用」也不留「删了才发现有人要」。
+
+**删（5 个，都有更准的替代 / 是冗余包装）**
+
+| 函数 | 当初目的 | 为什么删 |
+|---|---|---|
+| `group_scene.qq_of_name()` | 白月光统计「她 **@** 的是谁」：显示名 → QQ | 后来走 `find_by_mid()`（引用消息号 → 现场记录，不怕改名重名）；取名走反向 `profiles.call_of(qq)` |
+| `memdb.style_samples_of()` | 从 sqlite 影子表取 N 句做 MMR | MMR 真实现在 `style_vault.samples(diverse=True)`（数据源 jsonl），这是**第二份实现** |
+| `memdb._style_sim()` + `STYLE_MMR_*` 在 memdb 的读点 | 上面那个函数的相似度 | 随上面一起删（`STYLE_MMR_*` 仍由 style_vault 读） |
+| `memdb.threads_of()` | 线程镜像 `upsert_thread()` 的读端 | 现场线程一直在内存 `group_scene._THREADS`，重启靠 `seed_from_log()`，没人查 sqlite |
+| `mood.state_word()` | v → 心情名词 | `label_for()` 在 decay/observe 时已把名词写进 `rec["label"]`，`/测函数 心情` 直接读它 |
+| `reply_pipeline.last_text()` | 「给 `/看模板 流水线` 用」 | 那条命令用的是 `dump_text()`（已含全文） |
+
+**接（3 个，都是「文档/注释承诺了、代码没做」）**
+
+1. **`llm_usage.budget_exceeded()` → 真的日预算告警**：以前只有 `report_text()` 里
+   显示「今日预算 x/y」，而 `help_menu/topics.py` 写着「超了会在日志告警」——
+   承诺是空的。现在 `record()` 记完账顺手检查（**每 5 分钟最多一条**，
+   新增 `today_used()` 复用），超了打 `[USAGE] 今日 token 预算已超：…（只告警不拦请求）`。
+   拦请求会让聊天突然不吭声，所以只告警。
+2. **`mood.set_sensitivity()` → `/测函数 心情 敏感度 [1.3]`**：以前 `sensitivity()`
+   有真实调用（`mood_judge`），但**没有任何写入口** → 永远 1.0，旋钮是死的。
+   现在可以看/设（夹在 `SENS_MIN~SENS_MAX`，默认 1.0）。
+3. **`relationship.audit_text()` → `/测函数 关系 [QQ号]`**：docstring 一直写着
+   「给 `/测函数 关系` 用」，但这条命令从来没存在过。现在能看最近 10 条
+   信任/尊重/好感事件流水 + 当前四量。
+
+**保留 1 个**：`memdb.profile_of()` —— 检索二期读 sqlite 档案镜像时用，写端
+（`upsert_profile`，2 个调用点）已经在跑。
+
+**验证**：`check_names` / `check_tuning` / `audit_coverage --strict` /
+`check_design_docs --strict` 全 PASS；`audit_wiring` 纯死代码 9 → 1（只剩
+`profile_of`）；真机 `verify_all --full` 10/10。
+
+## 2026-11-27（第三十五轮：把第三十四轮剩下的设计缺口全部落到代码）
+
+第三十四轮把 3 条设计缺口「只写清、不改行为」，这一轮全部接线，并用
+**直接 import 运行时的行为断言**兜底（不再只比「文档 ↔ 常量」）。
+
+**1. long_doc 证据 6000 / 图书馆 3000 真正接线**
+
+- 新增 `services/long_doc.py`：`ENABLED / MAX_TOKENS / EVIDENCE / PIECES=3 /
+  PIECE_CHARS=1900 / query_of() / is_long_doc()`。判定逻辑从 `llm.py` 抽出，
+  `llm.py` 保留同名别名，`reply_pipeline`（线上真正的取数入口）读同一份，
+  不再有第二份真相。
+- `prompt_builder.build_packet(long_doc=True)`：`memory_index` 上限从
+  `CTX_EVIDENCE=500` 放开到 `CTX_LONG_DOC_EVIDENCE=6000`，`library` 放到
+  `CTX_LONG_DOC_LIBRARY=3000`（都是**字符**口径，`ctx_budget` 倍率 1.5→1.0），
+  并按 3 篇 × ≤1900 渲染**正文**，不再只给 40 字目录。
+- `reply_pipeline` 的记忆 / 图书馆两个阶段同样按 `long_doc` 取预算。
+- 新参数 `LONG_DOC_PIECES` / `LONG_DOC_PIECE_CHARS` 进 `core/tuning.py`。
+
+**2. `±3 一天最多一次` 从 prompt 纪律变成代码计数**
+
+- `mood.cap_daily_impact(session_key, impact)`：按**会话 × 自然日**计数，
+  超 `MOOD_IMPACT3_DAILY_MAX=1` 后降到 `MOOD_IMPACT3_OVER_TO=2`（**降档，不丢弃**）。
+- `mood_judge` 调用它，trace 里同时留 `impact_raw`（原判）与 `impact`（实际用），
+  日计数 `impact3_day / impact3_n` 随衰减保留。
+- 设为 0 可回滚成「不限」。
+
+**3. 锚点硬死区 → 软死区（smoothstep）**
+
+- `mood._anchor_rec` 用 `r²(3−2r)` 平滑权重：`|diff|→0` 权重→0、`→0.15` 权重→1，
+  边界处与全速连续；不再是「差一点点就完全不动」的 bang-bang。
+- 新增 `_anchor_diff()` 供诊断（`/测函数 心情` 与单测用），DESIGN 注明
+  「仍是每窗 EMA，不是一次性对齐」。
+
+**4. 新增 `scripts/check_runtime_wiring.py`（22 项行为断言）**
+
+直接 `import` 运行时模块断言行为，补上「文档↔常量自证」的盲区：
+
+- long_doc 两个预算 = 6000/3000 字符、`3×1900 ≤ 6000`、记忆块 **>500 且 ≤6000**、
+  块里真有正文；常态块仍是 ≤500 的目录；
+- `±3` 第一次生效、同日第二次降 `±2`（正负都测）、计数按会话隔离、`±2` 不受日限；
+- 锚点软死区内仍会挪、0.149/0.151 两侧连续（差 <0.005）、小抖动位移 <0.002；
+- `P` 回补只补不降、能从地板抬起；
+- `mood.observe` 有真实调用点、且不被 `_skip_update` 整条挡住；
+- 整份 prompt 有 `prompt_total` 记账、超 `soft_cap` 会记超限。
+
+**5. 文档对齐**
+
+- DESIGN §0 的 long_doc 从【半接线】改【已接线】，写明 `services/long_doc.py`
+  与字符口径；§3.3 与 ADR-039 同步。
+
+**6. 上线时 `verify_all` 抓到的两处红（已修）**
+
+- **`llm.py` 引用了未定义的 `_prompt_chars`**：外层 `except` 把它吞成
+  `[WIRE] 接线快照写入失败`（debug 级），结果 `data/pipeline_last.json`
+  **从加上 `prompt_chars` 那天起就没写成功过**，`/测函数 链路` 一直是旧数据。
+  现在按「所有 message + 工具 schema」真实计算，并顺手接上
+  `ctx_budget.observe_prompt_total()`（之前只有单测在调它）；
+  `/测函数 链路` 也补上这一行（`整份 prompt N 字（软上限 2700，超了只告警不裁）`），
+  以前只落了盘、没人显示，等于还是看不见。
+- **`audit_wiring` 把 `dep_trace` 误报成孤儿模块**：它唯一调用点在 `bot.py`，
+  而脚本不扫 `bot.py` → 补上扫描。同时校准口径：**孤儿模块/工具链断 = 阻塞；
+  零引用公开函数 = 提示不阻塞**（死代码≠接线断裂，删或接线是产品决定），
+  但仍在输出里逐个列出，不许当「已接线」自证。
+- **`audit_coverage` 把 LEGACY 键当「参数空转」**：`MAX_BUBBLES` 11-26 已合并进
+  `OUT_BUBBLES_MAX` 并进 `tuning.LEGACY`，本来就该 0 读点，但闸门只排除了
+  `UNWIRED` → 接线闸门一直红。现在 `LEGACY` 也排除（`UNWIRED`=未接线的设计键、
+  `LEGACY`=已退休的键，两者都不该有读点）。
+
+**仍记录在案**：9 个零引用公开函数 —— 已在同一天的**第三十六轮**逐个处理
+（删 5 / 接 3 / 留 1），见上面那一节。
+
+## 2026-11-27（第三十四轮：外部审计 16 条复核，12 真 8 修）
+
+完整逐条判定见 [design-audit-response-20261127.md](design-audit-response-20261127.md)。
+
+**真 bug（已修）**
+
+1. `P_EVENT_CAP(0.20) < P0(0.25)`：旧写法 `min(max(floor,cap), p+boost)` 会把 P
+   **调低**；改成 `mood.event_p_boost()`「只补不降」，加 2 条单测。
+2. `relation_relevance < 0.25` 以前**连心情都不步进**，而 prompt 教模型 world/self 填 0 →
+   她自己的情绪永远写不进 v。现在只挡好感/记忆/群心情，**心情与锚点照常步进**。
+3. 全局锚点没乘 `GLOBAL_SHARE`（事件乘了、锚点没乘）→ 统一乘 0.35。
+4. 静默锚点 `THINK_AGE=1800s` 与 `IDLE_MIN=30min` 完全相等 + tick 5min → 几乎死分支；
+   改成 **2100s**。
+5. `/测函数 心情` 读 `t["value"]` 但 trace 存的是 `v` → 永远 +0.00；已改。
+
+**文档/常量错（已修）**
+
+6. `ctx_total()=4620` 是 **token 值之和**，不是字符；新增 `ctx_total_chars()`
+   （6540 / 7170），`check_design_docs` 用 `ctx_budget.limit_chars` 反算交叉校验。
+7. long_doc 证据 6000 / 图书馆 3000 **没接线**（`observe` 返回值被丢、块上限 500、staged 4 条）
+   → §0.1 改【半接线】，§3.3 注明「设计口径，未接线」。
+8. `PROMPT_BUDGET=2200` 只约束动态块；persona/protocol 等 `CTX_ENFORCE=0` 不裁
+   → §3.3 加显式警告。
+9. §3.1 首条/稳态数字改成实测：conf=0.9 → 0.0906、conf=0.6 → 0.0683、稳态 0.0148。
+10. 候选池「8000→400」实际是 **48**（`max(48, min(400, limit×8))`）→ 文档改。
+11. §0「好感只吃 dv」与 §3.2「吃 Δ+dv」矛盾；§3.2 ±0.10 → **±0.15（AFF_V1_CAP）**。
+12. `MOOD_HARD_CAP`「不触发」、`MOOD_MAX_DELTA` 假 LEGACY、`AFFINITY_GAIN` 只有赋值
+    → 描述修正；`MOOD_MAX_DELTA` 移出 LEGACY；`AFFINITY_GAIN` 进 `UNWIRED`。
+
+**设计缺口（先写清，不改行为）**
+
+- `±3 一天最多一次`只靠 prompt 纪律，代码无计数 → DESIGN 标「已知缺口」；
+- 锚点死区 0.15 让 EMA 变分段混入（稳态锯齿）→ 文档补说明，不改参数。
+
+> 这 3 条缺口已在同一天的**第三十五轮**全部接线（`long_doc` 证据 6000/图书馆 3000、
+> `±3` 日计数、锚点软死区），并加 `scripts/check_runtime_wiring.py` 做行为断言。
+
+**理解问题（1 条）**
+
+- 「锚点不是绝对测量」：判读看不到当前 v 是**反回声**的故意设计（ADR-029），
+  不是 bug；改的是文档措辞。
+
+## 2026-11-27（第三十三轮：输出 token 修复 + 识图切 qwen + 校验脚本按新设计校准）
+
+**1. 主聊天输出 token 被写死 800（严重逻辑问题，已修）**
+
+- 根因：`services/llm.py` 主循环 `"max_tokens": 800`、`_fulfill_requests` 重新生成也写死 800
+  —— 改 `.env` 的 `GLM_MAX_TOKENS` / 任何输出配置都不生效；GLM 当主模型时 thinking 吃光 token，
+  正文为空、无法回复。
+- 修：输出上限进 `providers.resolve(role)`：
+  - 优先级 `<ROLE>_MAX_TOKENS` > `LLM_MAX_TOKENS` > `GLM_MAX_TOKENS(provider=glm)` > 默认
+    （主聊天 `ROLEPLAY_MAX_TOKENS=1200`，其它 `LLM_DEFAULT_MAX_TOKENS=800`）；
+  - 按 provider 上限 clamp（GLM 4096 / DeepSeek 8192 / Qwen 8192 / OpenAI 16384）；
+  - OpenAI 推理模型（o1/o3/o4/gpt-5）自动用 `max_completion_tokens`；
+  - `config.ROLEPLAY_MAX_TOKENS/_FIELD` 暴露给 `llm.py`，主循环 / 补资料 / 写歌都用它；
+  - `env_guard` 启动时提醒「GLM + thinking 但上限 <2048」和「超过 provider 上限会被 clamp」；
+  - 辅助角色（判读/审核/会话状态/表达/档案挖掘/气氛）也改走
+    `providers.call_tokens(role, wanted)`：GLM 开 thinking 时自动抬到 `GLM_MAX_TOKENS`，
+    OpenAI 推理模型自动换字段，避免「返回空 JSON」。
+
+**2. 识图暂时切到 qwen**
+
+- 线上 `.env`：`VISION_PROVIDER=qwen`、`VISION_MODEL=qwen3-vl-plus`（GLM 余额仍不足）。
+- ⚠️ `.env` 改动必须 `docker compose up -d --force-recreate bot`；`docker restart` **不会**重读
+  `env_file`（第一次就是这么没生效的）。
+
+**3. `verify_napcat_log.py` 按新设计校准（5 个 FAIL → 口径修正）**
+
+- P4：窗口大小读 `MOOD_JUDGE_CTX`，并排除「预算只够 N 窗」的截断（P4b 已覆盖）；
+- O5：允许 `OUT_BUBBLES_MAX + 1`（DESIGN §9.1 表情/语音例外）；
+- S4b：50ms 是目标不是红线 → 改为性能观测项，不判 FAIL；
+- M1h：过滤 `mood_history` 里旧格式（-100~100）行，避免量纲混算误报反向；
+- M10h：`|impact|≥2` 回补 P 会让步长回升（用户拍板），跳过这类对比；
+- 默认报告名改 `docs/napcat-log-check-YYYYMMDD.md`，不再覆盖手写 `verification-report-*.md`。
+
+**验证**：`test_new_features` 本地 256/1（BILI 依赖）；容器内待跑；
+`check_tuning` PASS；`verify_deploy` 119/119。
+
+## 2026-11-26（第三十二轮：接话前读气氛 + 引用互刷修复 + 识图自动降级）
+
+**1. 接话前「读气氛」**（用户：群友气氛很压抑、有人在哭，她忽然进来哈哈哈）
+
+- 新增 `services/atmosphere.py`：读最近 **8 句标签语**（`group_scene.history_lines`，带 `谁 → 谁` / ⭐），
+  由标签 LLM（`providers.resolve("audit")`，temperature=0）输出
+  `mood / who / feel / others / tip`（整体氛围 / 谁在难过 / 其他人状态 / 接话注意）；
+- `reply_pipeline` 新增第 **⓪ 步「气氛」**（与 ①②③ 并行，块放最前），`/测函数 气氛 [刷新]` 可看；
+- **只作提示，不改心情/好感**；有人哭/说难受/告别时 prompt 强制 `mood` 落低落类；
+- 缓存 `ATMO_TTL=90s`、超时 `ATMO_TIMEOUT=5s`、失败 60s 内不重试；5 个 `ATMO_*` 键进 `tuning`。
+
+**2. 两个 AI 互相引用回复（17:08:49~17:09:13 月下橘引用她 4 次）**
+
+- 根因：NapCat 的 `event.reply.sender` 经常是空的，`_quote_me()` 只读它 →
+  引用她永远判 False → `_at_me()` 退回 `is_tome()`（它同时含「引用」）→ 引用被当成 @ 必回；
+- 修：`_quote_me()` 改成三级判定（get_msg 记下的被引用者 QQ → `reply.sender` →
+  被引用 mid 在群现场里 `is_bot`）；`_reply_quote` 顺手把 `_quote_qq` 记在 event 上；
+- 护栏加强：同一对 120s 内引用 ≥3 次 → **冷却 5 分钟**（`[LOOP]` 日志带剩余秒数），
+  冷却期内「引用她」一律不接（真 @ 仍必回）。
+- **2026-11-27 真机复查补刀（更隐蔽的根因）**：`_at_me()` 第一行
+  `if event.to_me: return True` 提前返回，而 `to_me` **同样包含引用她** →
+  `_quote_me` 永远走不到。16h 日志：64 次引用她、软通道 0 次、`[LOOP]` 0 次。
+  已改成「① 先看消息里有没有真 `at` 段指向她 → ② 再判 `_quote_me` → ③ 最后 `to_me` 兜底」；
+  假事件验证：引用她 `_at_me=False`、真 @ `_at_me=True`。
+
+**3. 识图「老是说看不到」**
+
+- 根因：GLM 返回 `HTTP 429 / 1113 余额不足或无可用资源包`；旧代码遇到 429 直接 `return ""`，
+  **备用模型和备用 provider 一次都没试过**；
+- 修：429/5xx 改为「换下一个模型」，额度用尽/key 无权限把整家 provider 拉黑；
+  新增 `vision_fallback` 角色（默认 qwen / `DASHSCOPE_API_KEY`，可用 `VISION_FALLBACK_*` 覆盖）；
+- 去重修复：旧代码在**识别前**就写 `_seen`，失败后同一张图 24h 都判「已处理过，但没有缓存描述」
+  → 现在**成功才写**，失败只清 pending（2 分钟内不重复触发），同一张图失败后可重试。
+- **2026-11-27 真机复查补刀**：上次成功的 `qwen3-vl-plus` 被 `insert(0)` 进**主 provider**
+  列表 → 拿 GLM 的 endpoint 去打 qwen 模型名（404）→ 再吃 GLM 429，每张图白烧 2 次。
+  现在「cached 属于备用 provider 时，备用整体排前」；并去掉本账号 403 的
+  `qwen2.5-vl-72b-instruct`（失败时白等 40s）。
+
+**4. 图书馆（RAG）客户端：加 `rag_search` 第一兜底**
+
+- 实测：重建索引后 `/api/agent/smart-query` 卡 **>70s**（LLM 规划层），
+  而 `POST /api/agent/execute-tool?tool_name=rag_search` 1~9s 就返回、还带来源；
+- `agent_client._recall_impl` 顺序改为：`recall`（404 跳过）→ **`rag_search`** → `smart-query`；
+- `_rag_tool_facts()` 会把 RAG 转义的中文 `\\uXXXX` 还原、按「片段」切分、
+  过滤掉整段是宋词/结构化文档的 JSON（`paragraphs + author`），每条截 160 字；
+- 「通了但没命中」不再判「图书馆不可用 10 分钟」；只有两个端点都失败才暂停。
+- 新键 `AGENT_RAG_TOOL_TIMEOUT=12s`。
+
+**5. 图书馆边界：不把记忆搬进 RAG（用户 2026-11-26 纠正）**
+
+- 记忆 = 本地 sqlite（`memdb`，按人/时间/情绪/标签）；图书馆 = **可选**外部语料/久远归档。
+  两者不是一套库，也不该每天把 `data/dialogue` 同步过去（会重复、会顶掉真正久远的事、
+  没搭 RAG 的部署行为不一致）。
+- `scripts/library_sync.py` 加闸门：`--dir` 必须显式给；`data/dialogue`/`memory`
+  默认**拒绝**，要放 >30 天归档必须 `--allow-memory --min-age-days 30`；
+  分区默认从 `dialogue` 改成 `archive`。
+- `docs/retrieval-design.md §10` 写清「RAG 可选、记忆不搬」；没 RAG 时 `agent_client`
+  返回空并暂停 10 分钟，聊天/记忆/心情不受影响。
+
+**6. C 方案：个人档案库（本地，独立于 RAG）**
+
+- 新增 `services/archive.py` + `data/archive.db`（sqlite + FTS5）：
+  只存 `ARCHIVE_MIN_AGE_DAYS=30` 天以前的旧对话/旧记忆，毫秒级，**不依赖 RAG**；
+- 迁移 `scripts/archive_migrate.py`（幂等，按 `hash(gid|qq|ts|text)` 去重，不删源文件/源表）；
+  `/测函数 档案库 [迁移]` 可看/手动搬；
+- `reply_pipeline` 新增「档案库」块（和「记忆」并行，块里写明“只你自己能查”）；
+- 新增 `[[ARCHIVE|关键词]]` 标记：查 30 天以前的旧事；`[[LIBRARY|词]]` 只查外部图书馆；
+- 新键 `ARCHIVE_ENABLED/MIN_AGE_DAYS/TOP/MAX_CHARS`；
+- 这样没有 RAG 的部署也有「近期记忆 + 个人档案库」，只是没有外部图书馆。
+
+**未做**：算力机 `node.py` 本轮未改（用户手动拷贝合入验证）；RAG 索引构建仍在算力机后台跑。
+
+## 2026-11-26（第三十一轮：文档一致性 + 图书馆客户端增强 + 工具收权限）
+
+完整清单见 [design-consistency-audit-20261126.md](design-consistency-audit-20261126.md)。
+
+**文档冲突（6 处，全修）**
+
+| # | 冲突 | 处置 |
+|---|---|---|
+| 1 | `proactive-design` 说「`AROUSAL_*` 在 `UNWIRED` 里」 | `UNWIRED` 早空、`AROUSAL_LEVEL_*` 已接线 → 改成「已接线，但不进 `chatty`」 |
+| 2 | `affect-and-response` 图里 `impact -2~+2` | 改 7 档 `-3~+3` |
+| 3 | `affinity §2.12`「只有 5 档、尾部永不触发」 | 加注「那是 11-25 的现状；现在 7 档 + 回补 P 能到 0.135」 |
+| 4 | `emotion-annotation-spec`「五档锚点」vs 线上 7 档 | 加警示：**人工标注集仍 5 档**（已标完别改），线上 7 档 |
+| 5/6 | 锚点「每 20 轮」、`FTS5 + BM25` | 上一轮已修，本轮复核一致 |
+
+**图书馆（RAG）客户端 3 处增强**（RAG 本体在算力机，没动）
+
+1. `_RECALL_PROMPT` 从 `"{q}"` 改成注入**日期 + 说话人**（RAG 才知道「上周」「他」指谁）；
+2. 新增 `clean_facts()`：**去重 + 丢掉「没有找到」行 + 每条截 160 字**；
+3. 触发词补**明确时间回溯词**（上周/上个月/去年/前天/大前天/昨天/那次/当年/小时候）。
+
+**`self_tool_run` 群聊只读（audit 待办 #4）**
+
+`self_tool_write` / `self_tool_run` / 自造工具 `mytool_*` 全部改成 `scope=EXEC_SCOPE`（默认只私聊）；
+`self_tool_file` 仍群聊可用。想放开：`SELF_TOOL_EXEC_SCOPE=private,group`。
+
+**仍未做（已写清原因）**：工具收敛（36→20）、`proactive`×`stay_silent` 互斥、
+语义标注跑完 200 条、图书馆评测补到 50 题。
+
+---
+
+## 2026-11-26（第三十轮：三个检索拍板落地 + 突发事件回补 P + 引用回复交给模型）
+
+**三个拍板（按建议方案做）**
+
+| # | 做法 |
+|---|---|
+| T1 时间窗 | `salience>=0.5` → **0.8**（只有极强刻痕才可能绕过），且绕过的候选打分 **×`MEM_OLD_FACTOR`(0.5)**。普通情绪记忆不再无视 30 天窗 |
+| K2 关键词 | 查询侧**只用 bigram**（有 bigram 就丢掉单字），单字只在整条查询没有 bigram 时兜底。索引侧暂留单字（重建 FTS 要停写，留维护窗口） |
+| K3 BM25 | 键名 `RET_W_BM25` 保留（改键名会让线上 `.env` 失效），DOCS + `retrieval-design` 正名为「token 覆盖率，没有 idf」 |
+
+**突发事件回补 P（用户拍板，带刹车）**
+
+稳态 `P` 长期贴 `P_floor≈0.005` → `K≈0.04` → `±3` 只挪 **0.012**，等于「突发事件不存在」。
+现在 `|impact|≥2` 时 `P⁻ = min(0.20, P⁻+0.05)`：
+
+| 稳态下 | 改之前 | 改之后 |
+|---|---|---|
+| `±1` | 0.007 | **0.007（不变）** |
+| `±2` | ≈0.012 | **0.074** |
+| `±3` | ≈0.012 | **0.135** |
+
+封顶 0.20 是刹车：连刷 `±3` 时 `K≤0.63`、`±3` 最多 0.176，不会吃满 `HARD_CAP`。
+
+**引用回复从硬逻辑交给模型（用户拍板）**
+
+真机：两个角色扮演 AI 互相引用 → 无限对轰。根因是 nonebot 的 `event.is_tome()`
+**同时包含「@她」和「引用回复她」**，而所有「必回」判定都用它。
+
+- 拆成 `_at_me()`（纯 @，仍然必回）和 `_quote_me()`（引用她，**软信号**）；
+- 引用她不再绕过冷却 / 纯问候 / 收尾语 / `GROUP_NEED_AT`，改为**进队列让她自己决定**
+  （她有 `send` / `stay_silent`）；
+- 新增结构化反循环护栏：同一对人在 120s 内互相引用 ≥3 次 → `[LOOP]` 不再硬接；
+- `send` 工具加 `quote` 参数 —— 引用回复成了她自己的 function call；
+- 协议 `▍02 接话` 加一句：「引用回复你 → 通常回一句；发现对方也是 AI 在互刷就停」。
+
+**文档待办清理**：`mood-judge-audit-20261125.md` 的 6 条待办逐条核过状态
+（2 条已做 / 1 条半做 / 3 条未做），`retrieval-memory-audit-20261126.md` 的
+T1/K2/K3 标 ✅、C2 标「已知限制并说明为什么故意不改」。
+
+---
+
+## 2026-11-26（第二十九轮：记忆/检索全链路审计 + 清过期测试）
+
+完整报告见 [retrieval-memory-audit-20261126.md](retrieval-memory-audit-20261126.md)。
+
+**修掉的真 bug（4 个）**
+
+| # | 问题 | 影响 |
+|---|---|---|
+| 1 | `recall_planned` 的 FTS 查询词 `sorted(qset)[:24]` 按**码点**截断 | 单字（的/了/我）挤掉 bigram → 中文关键词检索退化成「最近 N 条」 |
+| 2 | `impression` 不在 `TAU_KIND` | 「印象最深的一件事」落到 `TAU_DEFAULT=30`，和一次性事件同寿命（补 `MEM_TAU_IMPRESSION=180`） |
+| 3 | 目录 `total` 用全库 count | 看某个群/某个人的目录时「共 N 条」和 `has_more` 全错 |
+| 4 | `dynamic=True` 时协议超预算从尾部裁 | `▍12 引用回复` 这类每轮规矩被静默裁掉 |
+
+**顺手补的日志缺口**：`log_mood_event` 没传 `impact` → 库里全是 0，
+「按档位分布」永远看不到 ±1/±2/±3。
+
+**清掉的过期测试（6 条）**
+
+- `t_memory` 3 条：memory 后端早已默认 sqlite，测试还在读 `index.json`
+  → 现在显式 `MV.BACKEND="json"` 测**回滚路径**（sqlite 由 `check_memory_dual` 覆盖）；
+- `t_protocol` 2 条：协议小节早已从「▍00~▍11 全都要有」改成「编号+名字，02b/02c/02d/07 已删」
+  → 改成断言「必须有的 9 节 + 群聊 04 + 不含 07/12/13」；
+- `selftest_all` 2 条：7 档扩档后 `|value|=0.4567` 落到 ±3（旧断言写 -2）、
+  `AFF_V1_CAP` 从 0.10 提到 0.15。
+
+**与 dsh 的对比**（详见报告 §5）：两者目标不同（我们解决跨月跨群「记不记得住谁」，
+dsh 解决单次会话上下文过长），只抄了它的 `digest-guard` 与 `checkup` 两个点；
+它的排序公式我没有源码，报告里已标明哪些是推断。
+
+**验证**：`selftest_all` **1797/0/4 跳过**；`test_regressions` **99/0**；
+`check_tuning` / `check_design_docs` / `check_names` PASS；容器内 `verify_deploy` 115/115。
+
+---
+
+## 2026-11-26（第二十八轮：上线 + 节流不再丢 THINK + 体检脚本）
+
+**上线（15:29-15:40）**：`core / services / plugins / scripts / docs / deploy_manifest` 全量上传，
+`docker compose up -d --no-deps bot` 重建 + 重启；容器内 `verify_deploy` **115/115 一致**；
+启动无 Traceback；QQ 已连上。线上现在是 `AFF_MODEL=v1` + `AFF_V1_CAP=0.15` + `MOOD_ANCHOR_WEIGHT=0.45`。
+
+**上线前发现的两件事**
+
+| # | 发现 | 处置 |
+|---|---|---|
+| 1 | 容器里跑的是 11-25 22:03 的旧代码（今天两轮 ADR 都没上线） | 全量上传后 115/115 |
+| 2 | `deploy_manifest.txt` **不在挂载里**，容器读的是镜像里那份 52 条的旧清单 → `verify_deploy` 一直报「52 文件 / 一致 0」，误导排查两次 | compose 增加 `./deploy_manifest.txt:/app/deploy_manifest.txt:ro`；`docs/deployment.md §5.3` 加「单文件挂载必须 `cp` 不能 `install`」的坑 |
+
+**节流不再丢 THINK（用户实测：她每句都写，是 cd 隔离了）**
+
+线上 6h：`无 THINK → 跳过判读` 94 次、`她没写 THINK` 54 次、真正写好感 14 次。
+根因不是她不写，而是**链路把 THINK 丢了**：
+
+- ① `MIN_INTERVAL=60s` 内又来一条 → 直接 return，THINK 丢；下一窗没新话 → 整窗不判；
+- ② 判读预算触顶 → 同上；
+- ③ 有的调用路径只落盘、没把 `think=` 传进来。
+
+修法（**不动 8 句一窗、不动 60s 节流**，避免 cd 变长）：
+- 节流/预算用完时把 THINK 推进 `_PENDING_THINK`（上限 8 条，>10min 丢弃）；
+- 下次真判读合并进 `think`（`"；".join(队列 + 本次)`），判完清空；
+- `wrote` 为假时兜底用 `mood_think.json` 里 `at > 上次判读时间` 的新 THINK（≤3 条，不含 auto）；
+- `/测函数 心情` 显示「攒着的 THINK：N 条」。
+
+**体检脚本（用户要求「每天打印一次」）**
+
+- `scripts/daily_report.py`（容器内，只读）：心情/好感/判读链路/今日事件/成本 +
+  13 条「期望 vs 实测」；会**模拟 full 与 eco 两个档位**看 4 个段开关；`--json`/`--no-save`；
+  有 ⚠️ 退出码 1；落 `data/reports/daily/YYYY-MM-DD.txt`。
+- `scripts/check_live.sh`（部署机宿主）：容器状态 / verify_deploy / bot 日志关键行 + 报错计数 /
+  napcat 日志 / 数值体检 / 回滚备忘。用法见 `docs/deployment.md §5.2b`。
+
+**验证**：`check_tuning` / `check_design_docs` / `check_names` PASS；`test_new_features` 新增 4 条
+（节流不丢 THINK、下次合并判、已判过不重复、落盘兜底）。
+
+---
+
+## 2026-11-26（第二十七轮：外部审计 —— 2 个真 bug + 1 个死护栏）
+
+> 触发：外部评审指出「ADR-042 与 ADR-043 在算术上不成立，AFF_V1_CAP=0.36 永远不可达，
+> 两个校验脚本依然全绿」。逐条核验：**4 条真、2 条半真、3 条评审看错了版本**。
+
+**真问题（已修）**
+
+| # | 问题 | 修法 |
+|---|---|---|
+| 1 | `AFF_V1_CAP=0.36` **不可达**：dv 项天花板 `0.30×AFF_W_MAX(0.42)=0.126`，事件项 ≈0.010 → 实测最大 **0.136**。这是 ADR-028 刚批评过的「恒不触发的死护栏」，而且被 ADR-043 当证据用 | `AFF_V1_CAP` 改 **0.15**（= 日上限）；ADR-043 补「数值验算」段；测试改成断言「尾部 ≈ `DV_K×AFF_W_MAX`」+「CAP ≤ 可达值×1.3」 |
+| 2 | **日上限在当天第一件事上失效**：`if _used * d > 0`，`_used==0` 时 `0*d==0` 不成立 → 第一件事完全不受限，可一次写满单次上限；之后 `_room` 变负数，当天同向全部 `return`。真实语义变成「当天第一句话决定全天额度」 | 改 `if _used * d >= 0`，`_room = max(0.0, CAP-abs(_used))`。新增 2 条回归 |
+| 3 | `observe` 里的「静默 30min 回补 P」是**死分支**：`_anchor_rec` 每窗写 `anchor_at=now`，`_one` 每窗写 `updated_at=now` → 只要模型每窗都给 `anchor_level`，条件恒 False | 删掉 `or idle`；静默回补只由 `anchor_tick` 负责。§3.1/§1.6 写明 |
+| 4 | 文档把事件项写成 `0.25×\|Δ\|`，**漏了 `gain`(≈0.10)**，把事件项夸大约 12 倍——而这正是用来论证「日常变慢」的量 | ADR-043 / §0 / §2.4b 补全 `×gain(≈0.10)`，并给出 `\|Δ\|=0.22 → 0.0044` |
+
+**取向问题（采纳，已改）**
+
+- **回声**：`anchor_level` 成主项后，prompt 仍写「当前心情 +0.35」→ 模型最省力就是照抄（ADR-029 明确警告过）。已**删掉当前数值**，只留上一轮的词。
+- **prompt 自相矛盾**：`±3 要大胆` vs `anchor 宁可填 0`。改成「照心理活动填真实档位，只有真看不出才填 0；别一律填 0（会每窗往基线拽）」。
+- **主项绕过滤波器**：§3.1 加一条「谁在管事」的说明——`v` 的主项是 `W×conf×(z_abs−v)`，`P/Q/R/K` 只决定残差（稳态 `K≈0.15~0.2`，±3 只挪 0.04~0.05）。避免读者以为卡尔曼在主导。
+
+**评审看错了版本（不改，留证据）**
+
+- `_skip_update` **不是** `not wrote and …`：2026-11-26 已改成 `_relevance < mood.RELEVANCE_GATE`（`mood_judge.py:1215`）。
+- `_step` **没有**硬编码 0.40/0.22/0.10：已读 `tuning.MOOD_STEP_*`（`mood_judge.py:854`）。
+- 「`dv` 不含 `anchored` → 两个 ADR 断开 → 必须把 anchored 加进 dv」：**事实对、结论错**。
+  `dv` 只含事件步进是**有意**的：锚点是「对她水平的重新估计」，不是这个人造成的事件；
+  加进好感就变成「她今天心情好，顺手记到旁边人头上」，违反唯一原则。
+  已补 `dv_total`（诊断字段）+ 在 §0/§2.4b/§1.6 写明边界。
+  另外评审自己的表里 `dv=0.35` 已经 ≥0.30，尾部本来就可达——「跳不起来」不成立。
+
+**小账（已修）**：§5 术语表删「400→50 预过滤」；§3.5 `bot` 行注明「仅当 cause=speaker」；
+§0.1「8 条 / 5min」改成「8 条，5min 不可达」；ADR-041「位置排在最后」改成「排在 040 之后」。
+
+**验证**：`check_tuning` / `check_design_docs` / `check_names` / `verify_deploy` PASS；
+`test_new_features` 该段新增 4 条（尾部≈天花板、CAP 非死护栏、日上限管第一件事、额度用完不再涨）。
+
+---
+
+## 2026-11-26（第二十六轮：v1 双吃 Δ+dv；anchor_level 必填且占大头）
+
+> 用户拍板两句：
+> ① 「v1 可以吃个 `_delta` 和 `dv` 的系数，不就都吃上，好感也不会那么快了，也能拟合上；
+>    当然还有一见钟情那几种突变性事件。」
+> ② 「锚点要不要强制模型填 `anchor_level`；可以做个权重，`anchor_level` 也占一大部分。」
+
+**ADR-043：v1 同时吃 `Δ` 和 `dv`**
+
+- `profiles.affinity_v1_step(delta, dv, a, …)`：
+  `Δaff = clamp(0.25×|Δ|×gain×trust_speed×novelty×k_eff×(1−|a|) + 0.30×三段式(dv), ±0.36)`。
+- 旧 v1 只吃名义步长 `Δ`（等效系数 1.0），事件一重就按满格走 → 好感比心情实际位移快得多。
+  现在 `Δ` 项压到 0.25（日常变慢），`dv` 项走三段式，`|dv|≥0.30` 的**尾部（一见钟情/心碎）
+  仍能一次跳 ±0.11~0.13**（旧 `±0.10` 单次夹会把它削平）。⚠️ 这里当时写 `AFF_V1_CAP=0.36` 是错的：
+  `0.30×AFF_W_MAX(0.42)=0.126`，0.36 永远不可达，已在第二十七轮改成 0.15。
+- `bump_affinity` 的单次夹从 `±0.10` 改为 `±AFF_V1_CAP`。
+- `mood_judge` v1 分支改调 `affinity_v1_step`，日志 `好感v1 …（Δ…/dv…/cause/target）`。
+
+**ADR-042：`anchor_level` 必填 + 每窗按权重混入**
+
+- prompt：`anchor_level` 从「有把握才填、每 20 轮一次」改为**必填**，并明确
+  「它占最终心情的大头，不是这件事的影响（那是 desirability）」。
+- `mood.observe`：每窗把 `v` 向 `clamp(baseline + map(level))` 拉 `MOOD_ANCHOR_WEIGHT(0.45)×conf`，
+  单次仍 `≤ MOOD_ANCHOR_MAX_MOVE(0.20)`；`P` 只在「每 20 窗 / 静默 30min」回补
+  （每窗都补会让 `P` 永不降、滤波器失效）。
+- `MOOD_ANCHOR_GAIN(0.25)` 现在只给**独立锚点**（静默定时器 / 手动）。
+- 合规可见：新增 `ANCHOR_STAT` + `anchor_stat_text()`，`/测函数 心情` 能看到
+  「anchor_level 命中 N/M（必填）」；缺失时 INFO 提示且本窗不锚。
+
+**验证**：`check_tuning` / `check_design_docs` / `check_names` PASS；
+`test_new_features` 新增 7 条（v1 双吃 5 条 + 锚点权重 2 条 + prompt 必填 1 条）。
+`profiles.py` 补 `from __future__ import annotations`，本地 3.8 也能 import 验证。
+
+---
+
+## 2026-11-26（第二十五轮：外部审计修复 —— 假绿 + 5 个真 bug）
+
+> 触发：外部评审指出「文档宣称唯一准，但模型中午已被代码替换；check_design_docs
+> 依然 ✅ PASS，因为它校验的是文档↔design_constants，而 impact_max 硬编码 2」。
+> 逐条核实后：**假绿属实，5 个真 bug 属实**。
+
+**假绿（已修，最关键）**
+
+- `core/design_constants.py`：`impact_max` 从硬编码 2 改为读 `MOOD_IMPACT_MAX`；
+  `step_3` / `impact_max` 进 `KEYS["MOOD"]`（120 → 122 键）。
+- `scripts/check_design_docs.py`：`check_mood` 新增「观测档位 -3/+3」和 `step_3` 校验。
+  以后文档写回 ±2 会红。
+- `docs/DESIGN.md §3.1/§3.2`：5 档 → 7 档、`±3 → 0.40`、`0.35 会被触发`；
+  §3.2 加 v2 段落（痕迹求和/三段式/门槛），注明 ±0.10 / 7 天半衰只描述 v1。
+
+**真 bug（已修）**
+
+| # | 问题 | 修法 |
+|---|---|---|
+| 1 | `_ctx_of` 只要群里有历史就返回「最后 8 条」，把 `split_windows` 的窗口丢掉 → 5 窗判同一份输入 | `ctx_lines` 非空必须用它，现场只兜底 |
+| 2 | `_post_rules` 用 `GROUP_MAX_HANZI=20`，覆盖生成侧的 `OUT_BUBBLE_CHARS=40` | 改用 `OUT_BUBBLE_CHARS`，与发送层一致 |
+| 3 | passive 窗 `await judge_and_store(passive=True)`：一次 LLM + 一次预算，最后 `if passive: return` 全丢 → 40 条段 5 次调用 4 次白烧 | passive 窗只 `note_window` 记账，不调模型（省 ~80% 判读调用） |
+| 4 | `anchor_tick` 只扫 `group_`，私聊永不静默锚 | 加 `private_` |
+| 5 | `anchor_tick` 的 `recent_think` 不判时效，拿几个月前的心里话永远锚 | 新增 `MOOD_ANCHOR_THINK_AGE_SEC=1800`，只认 30 分钟内的 THINK |
+| 6 | `anchor_tick` 直接调 `judge()`，绕过 `_calls_left`，§3.3 预算对它无效 | 调前查预算并记 `_CALLS` |
+| 7 | `mood._load` 裸 `except: pass`，mood.json 损坏 → 全员心情静默归零 | `logger.error` + 备份成 `.corrupt-<ts>.json` |
+
+**验证**：`check_tuning` / `check_design_docs` PASS；`test_new_features` 203 PASS / 5 FAIL
+（5 个均为裸镜像缺 httpx，与本次无关）。
+
+**文档治理（G1~G10 + D/E 组，本轮全改）**
+
+| # | 问题 | 修法 |
+|---|---|---|
+| G1 | 两个 ADR-038 重号 | 证据选法那条改 **ADR-041**，注明原编号 |
+| G2 | §3.6 G7 仍写「✅ 护栏 v=min(v,−0.45)」 | 改「⚠️ 已删除（ADR-038）」 |
+| G3 | §7.1 「步进 + 快速通道（先不含锚点）」是化石 | 改「步进 + 锚点」，注明两句以前写反 |
+| G4 | §1 图注「写回下一轮（ADR-013）」 | 改 ADR-038，注明快速通道已删 |
+| G5 | §0.1 「15 个块级 CTX_*」 | 改 **18 个**（15 token + 3 字符） |
+| G6 | §6 层→代码漏 8 个模块 | 补 relationship/persona_traits/ctx_budget/style_vault/white_moon/mmr/proactive/reply_pipeline |
+| G7 | §2 地图缺 4 篇 | 补 mood-judge-audit / affinity-quantification / verification-runbook / tuning |
+| G8 | §8.1「数字只在 tuning」但 mood_judge 硬编码 0.40/0.22/0.10 | 标注为**已知双真相**，待收口 |
+| G9 | §9.10「不许 except: pass」但多处裸奔 | 标注现状：`mood._load` 已修，其余待收口 |
+| G10 | ADR-008 只覆盖 mood | 注明 `relationship._save` 无 flock 的已知缺口 |
+| D | §3.3 三层预算混用（2120/2200/4620/5290） | 加三层对照表；persona 400 注明运行时上限；风格 450→**730 字符** |
+| E | §3.4 检索 4 组矛盾 | 候选配额 4/3/2 注明「不是最终条数」；补 8000→400→50→5 换算；选法顺序固定 ①~⑤；`RET_MAX_PER_PERSON` 注明独立键；图书馆 14s 注明降级 |
+| 3.5 | `resolve_target` 低置信默认说话人 | 文档改为「低置信退回 speaker（安全默认）」，与代码一致 |
+
+**第二轮（同日，剩余 3 项也改完）**
+
+| 项 | 改法 |
+|---|---|
+| 4620 vs 5290 | `ctx_total(all_blocks=True)` 新增全量口径：常态 **4620** / 全量 **5770**（含 tools/multitarget/style_total；long_doc 是替代不叠加）。文档 §3.3 写明「都不是 live 总池，总池是 2200」 |
+| `neg_weight` 跨量污染 | `relationship.bump` **删掉**对 trust/respect 负向乘 `neg_weight(affinity)`：宽容只作用于好感，信任被骗就是被骗 |
+| `REL_DAILY_CAP` 一键两义 | DOCS 改「信任+尊重每日净变化上限（不是好感）」；`AFFINITY_DAILY_CAP` 从 `LEGACY` 移出（它仍在 `profiles.bump_affinity` 跑，是 v1 好感的日上限） |
+
+验证：`check_design_docs` / `check_tuning` / `check_names` PASS；`test_new_features` 203/5（同前，5 个缺 httpx）。
+
+**第三轮（自审：又挖出 3 个自己埋的 bug + 4 个结构问题）**
+
+| # | 问题 | 证据 | 修法 |
+|---|---|---|---|
+| 1 | **迁移腰斩** | `_aff_ensure` 用 `affinity_at` 当痕迹时间：0.90（30 天前）→ **0.45**；0.60（90 天前）→ **0.19** | 痕迹时间改 `now`；实测 0.90/0.60/0.30 不变 |
+| 2 | **陪伴绕过门槛** | `add_affinity_comp` 无 tier cap，新号每天 6 条闲聊一年到 **0.66** | 补 cap；实测卡 **0.12** |
+| 3 | **conf 重复乘** | `_aff_w_from_dv` 又乘 `confidence`，但 `dv` 已含 K（K 含 conf）——文档写「不能乘」，代码又乘 | 删掉；参数保留只为兼容 |
+| 4 | 旧高好感用户切 v2「冻住」 | 迁移后 `aff_peaks=0`，门槛按 peaks 算 → 30 天老用户 cap 0.32 | 迁移时按 `|a|×10` 反推 peaks/hurts/warm_days |
+| 5 | `_COVERAGE` 还是「看到过」 | passive 窗不判，但 coverage 记了全部窗的 msg_id | 只记最后一窗（判过的） |
+| 6 | `MAX_BUBBLES` / `OUT_BUBBLES_MAX` 两键同义 | aura_logic + llm 各读一个，靠测试断言同步 | 两处都改读 `OUT_BUBBLES_MAX`；`MAX_BUBBLES` 进 LEGACY |
+| 7 | `AFF_W_MAX=0.42` 像死护栏 | `dv≤0.35` → 实际最大 0.362 | **保留 0.42**（降 0.36 会让心碎 −0.41→−0.36、0.9→0.54），文档注明「为 ±4/放宽预留，不是死护栏」 |
+| 8 | `tuning.md` 缺 37 个新键 | 调参文档里 AFF_*/MOOD_STEP_3 一个都没有 | `dump_tuning.py --write` 重新生成（455 params） |
+
+**新增自动化验收（9 条，`test_new_features.py`）**：迁移不跳变 ×3、一见钟情 w≈0.362、心碎 w≈−0.410、
+新号门槛 0.12、陪伴不绕门槛、a=0.90 心碎 Δ≈−0.41、dv=0 不写。
+`test_new_features` 从 203 涨到 **212 PASS / 5 FAIL**（仍是缺 httpx）。
+
+**术语统一（同日，用户要求）**：股市名词全部换成心情语言——
+
+| 原 | 新 |
+|---|---|
+| 黑天鹅 | **心碎**（负向剧变：被背叛/被羞辱） |
+| 涨停 / 跌停 | **骤暖 / 骤冷**（显著事件） |
+| 起飞 | **心动**（正向剧变） |
+| 跌停板 | **单次上限**（`AFF_W_MAX`） |
+| 股票式走势 | **起伏式走势** |
+
+「涨跌幅」这个概念保留（只取涨跌、不取当前值），但不再出现金融名词。
+涉及 `affinity-quantification-design.md` / `DESIGN.md` / `tuning.py` / `simulate_affinity.py` /
+`test_new_features.py` / 本文件；`tuning.md` 已重新生成。
+
+**示例去金融化（同日，用户提醒）**
+
+`group_scene` / `scene_auditor` / `chat` / `audit_pipeline` / `selftest_all` 里曾用
+「A：英伟达跌了吗 → 10 分钟后 B：都是老黄的锅」做「**跨 10 分钟话题承接**」的示例。
+它只是示例（说明窗口要按条数不按时间），**不是事件→心情的映射**，但容易被误读。
+已全部换成中性「新番」示例（`新番看了吗 → 都是原作的锅`），断言同步。
+
+同时核实全链路：**心情/好感的唯一输入是她的 `[[THINK]]` → `impact` → `dv`**；
+`judge_message_mood` 的关键词只用于两处——① 记忆显著性 `strong_emotion`；
+② `MOOD_FROM_JUDGE=false` 的回滚模式。默认（`true`）**不改心情、不改好感**。
+
+**示例改成「心理活动起点」（同日，用户指出）**
+
+判定类示例以前写的是「A 说了一句话 → 好感 +0.1」——**这是反例**，
+等于用对方的话猜她的心情。已改：
+
+- `affinity-quantification-design.md §2.11`：正例改成
+  `【群聊】→【她的 THINK】→【判读】→【心情 dv】→【好感】` 五段；
+  并新增**反例**：直接按「这句话是安慰 → 好感 +0.1」是错的。
+  理由写清楚：同一个 A 说同一句话，她心里可能是「鼻子有点酸」（+0.18），
+  也可能是「又来这套」（−0.06）——**只有 THINK 知道是哪一个**。
+- `group_scene` / `scene_auditor` / `chat` / `selftest_all` 的对话示例**保留**
+  （它们测的是「上下文窗口」，不是判定），但各加一行：
+  「这只是判读的上下文；心情/好感仍只来自她的 `[[THINK]]`，对话本身不直接改数值」。
+
+**因果链定死（同日，用户强调「不要乱捞值」）**
+
+`DESIGN.md` 新增三条硬约束，并在 §1 图里画出来：
+
+```
+收发件人（外部信息，只帮她理解「谁对谁说」）
+    ↓
+她的 [[THINK]]（她理解后的第一人称心理活动）  ← 心情的唯一来源
+    ↓
+判读 → impact → mood.observe → dv
+    ↓
+好感（只吃 dv，不读对话 / 关键词 / 事件类型）
+```
+
+- §0 新增第 0 条（原来三句话变四句话）；
+- §1 图重画：`IN（外部）→ G（生成）→ THINK → JUDGE（只读 THINK）→ KAL（impact→dv）→ ST / REL`；
+- §3.1 加「输入只有 `[[THINK]]`」行；§3.2 加「好感只吃 dv，不读对话」。
+
+**代码全检结论**：心情写入口只有 `mood.observe`（判读）、`bump_by_emotion`（被
+`MOOD_FROM_JUDGE=true` 挡住）、`bump_mood`（关键词，仅回滚模式）；
+好感写入口只有 `add_affinity_event(dv)` / `bump_affinity(delta)`，都在 `mood_judge`。
+`plugins/chat` 只读 affinity，`group_mood` 不写个人好感，`profile_update` 不能写 affinity/mood。
+**没有旁路。**
+
+**判读 prompt 的判分依据改成心理活动（同日）**
+
+`mood_judge` 的 `desirability` 档位表原来用事件举例（「被夸、被逗笑」「被冒犯、被无视」），
+容易被读成「看到'被夸'就 +1」。已改成**她心里会怎么写**：
+
+| 档位 | 原来（事件） | 现在（心理活动） |
+|---|---|---|
+| +2 | 被认真夸、被记住细节、被哄好 | 心里写「被戳到了」「鼻子有点酸」 |
+| +1 | 被接话、被逗笑、被轻轻调侃 | 心里写「嘴上不认，其实挺受用」 |
+| −1 | 被忽略一句、被轻慢 | 心里写「算了」「有点膈应」 |
+| −2 | 被冒犯、被当众下不来台、被敷衍 | 心里写「下不来台」「这人怎么这样」 |
+
+并加了一句总纲：
+
+> ⚠️ **判分依据只有她的【心理活动】**：同一件事，她心里写「受用」就是 +，
+> 写「烦」就是 −。**不要按「这件事通常算好事/坏事」直接给分**——她理解错了也按她的理解评。
+
+**第四轮（同日，修「论证层」：文档迁就代码/迁就结论的 6 处）**
+
+| # | 问题 | 改法 |
+|---|---|---|
+| 1 | §0 宪法写「好感只吃 dv」，但默认 v1 吃 `_delta` | §0/§3.2 改成「v2 吃 dv；**v1（默认）吃档位名义步长**」，并写明「切 v2 前本条后半句不成立」 |
+| 2 | §3.1 用 v2 的 0.362 为 0.35 上限辩护 | 改成「v1 下 ±3 只比 ±2 多约 1.8 倍，**没有尾部通道**；±3 被削平 31% 且无补偿，是已知取舍」 |
+| 3 | §3.4 说 `RET_MAX_PER_PERSON` 是独立键 | 改成代码真实公式 `cap = max(1, min(MAX_PER_PERSON, round(limit×RATIO)))`——**联合约束** |
+| 4 | §3.4 反向保底「插到第 1 位」 | 改成「**替换 `picked[-1]` 末位**」；代码里没有插位逻辑 |
+| 5 | §3.3 全量 5770 = 聚合量重复相加 | `ctx_total(all_blocks=True)` 不再加 `style_total`（已含分项）→ **5040**；文档同步 |
+| 6 | §3.4「预过滤 50」是幽灵阶段 | 删掉；全库只有 `RET_PLAN_CAND=400` |
+| 7 | §3.5 `group → world` 与代码不符 | 改成「实际是 `speaker`」；`resolve_target` 只认 `to_kind=="person"` |
+| 8 | ADR-041 插在 038/039 之间 | 移到 ADR-040 之后 |
+| 9 | 注释里「评价者 B/C/F/G9」无出处 | 改成「（2026-11-26 审计修复）」 |
+| 10 | `_step = 0.40/0.22/0.10` 硬编码 | 改读 `tuning.MOOD_STEP_3/2/1`——`MOOD_STEP_2` 现在同时管心情/好感/刻痕 |
+| 11 | `_skip_update` 恒 False（`not wrote` 已提前 return） | 改成 `_relevance < RELEVANCE_GATE`——闸门真正生效 |
+
+**顺带把「文档比代码乐观」的 5 处数字改成真实值**
+
+| 位置 | 旧 | 新 |
+|---|---|---|
+| ADR-007 | 全局是「独立慢变量」 ✅ | ⚠️ 半实现：全局 = 会话位移 ×35% 累加，最吵的群主导 |
+| 判读窗口 | 「8 条或 5min」 | 段 ≤30s，「5min」永远到不了 |
+| 首条位移 | ≈0.085 | conf=0.9 时 0.085；**conf=0.6 时只有 0.004** |
+| 单窗 token | ≤1.2k | **实际 ≈2k**（规则段 ~1.1k 字 + 8×160） |
+| §3.3 单位 | 同一节 token/字符混用 | 明确 `CTX_*` 是 token ×1.5，profile/evidence/summary 是字符 ×1.0 |
+
+验证：check_design_docs / check_tuning / check_names PASS；test_new_features **212/5**。
+
 ## 2026-11-26（好感量化 v2 设计稿：先出公式和数字，不动线上）
 
 - 现状实测：好朋友一个月不聊天，好感 **−0.37**；挚友 **−0.44**；三个月 **−0.78**。
@@ -19,6 +983,55 @@
   天生解决「幂律不能增量叠加」；给出**事件映射表**（impact ±1/±2 在 a=−0.8~0.9 各推多少）、
   **道歉破冰通道**（−0.60 连续 3 次道歉 → −0.17）、**陪伴抵消系数**
   （稳住 0.3 约 1.2 句/天，稳住 0.5 约 3.7 句/天，光靠陪伴天花板 0.63~0.75）。
+- **v2.2 追加**（参数拍板：`AFF_TRACE_T=10`、`AFF_COMP_CAP=0.80`、`AFF_REPAIR_BASE=0.16`）：
+  解决「0.8 之后怎么继续涨到 0.9 / 0.99」——
+  **巩固**（`κ` 从 a=0.75 的 0% 线性升到 a=0.95 的 60%，正向事件的一部分直接沉淀进
+  不衰减的 `bond`）、**深层投入**（`I_deep`，把 `bond_max` 从 0.60 抬到 0.90）、
+  **分层门槛**（只封上涨不回溯）。硬上限 `AFF_MAX=0.99`。
+- **v2.3 修正（最重要的一条）**：**好感 = 寄存在每个人那里的心情涨落历史**。
+  - 痕迹权重从 `impact` 档位换成 `mood.observe` 的实际位移 **`dv`**：
+    `w = 0.60·|dv|·(1-|a|)^0.70`（正向）/ `×1.6·(1-|a|)^0.35`（负向），单次夹 ±0.20；
+  - **删掉所有名词判读**（不再有 `milestone=help/together/vulnerable/repair`）：
+    `peaks`（`|dv|≥0.15`）、`repairs`（负 peak 后 7 天暖回来）、`warm_days` 全部从 dv 序列自动统计；
+  - 巩固的 `κ` 加了 **`warmth7` 闸门**（最近 7 天正向 dv 之和）：光好感高、最近没暖过 → 不沉淀；
+  - 门槛改成 `peaks≥3`（挚友）/ `peaks≥8 且 repairs≥1`（知己）；
+  - 模拟：一年都到 0.92 的两条路，**停聊一年后巩固的剩 0.78、没巩固的只剩 0.69**；
+    `repairs=0` 时哪怕 bond 0.90 也卡在 0.92（进不了知己）。
+- **v2.4 追加（起伏化）**：好感取的是**涨跌幅**不是当前值，且像心情起伏一样有骤暖/骤冷/心碎。
+  三段式 `w_from_dv`：
+  - 日常 `|dv|<0.15`：`0.60·|dv|·(1-|a|)^0.70`（线性 + 强饱和，高好感推不动）；
+  - 显著 `0.15~0.30`：`1.6·|dv|^1.5·(1-|a|)^0.35`（凸性放大，骤暖/骤冷）；
+  - 尾部 `|dv|≥0.30`：`(0.06+2.0·|dv|^1.8)·(1-|a|)^0.15`（心碎/一见钟情，几乎不饱和）；
+  - 单次夹 ±0.42（单次上限）；`a<0` 时正向跳变 ×0.70（有防备）。
+  - 关键数字：a=0.90 时 `dv=+0.35` → **+0.256**（一次到 0.99），`dv=−0.35` → **−0.410**
+    （一次到 0.49）；`dv` 从 0.22→0.30 只多 36%，w 却多 75%（凸性）。
+  - 模拟 24 个月：单月跳变 +0.39 / −0.39，其余月份缓慢爬——不再是平滑曲线。
+- **v2.5 追加（回到原设计：判读档位 + 刻度重标定）**：
+  - 原设计 `emotion-dynamics-design.md` §1 是「LLM 给位移档位 → 查表」，方向对；
+    但只有 5 档（−2~+2），`dv` 最大 ~0.16，**触发不了好感尾部 0.30**——
+    「一见钟情」在数学上不存在。改成 **7 档 −3~+3**（`MOOD_STEP_3=0.40`），
+    ±3 = 「她今天只会想这一件」（一见钟情 / 被背叛），一天最多一次。
+  - 落地原审计 §4 的**两段式**：判读给 `desirability(-3~+3) × cared(0/1/2) × about`，
+    代码合成 `impact`——`cared=0`（看戏）显式不扣分。
+    下游群心情/刻痕用 `min(|impact|,2)`，行为不变。
+  - **好感刻度重标定**（用户提的）：0.60~0.75 = 很好/喜欢（旧 0.85~0.9），
+    **0.75~0.85 = 暧昧（旧 0.90）**，0.85+ = 爱，0.95+ = 唯一的爱；
+    负值：−0.60~−0.75 反感/记恨（旧 −0.8）、−0.75~−0.90 仇视（旧 −1.0）、
+    −0.90~−1.0 决裂。门槛表同步改成 眼熟0.15/熟人0.30/朋友0.45/很好0.60/
+    暧昧0.75(peaks3)/爱0.85(peaks5)/唯一的爱0.95(peaks8+repairs1)。
+  - 新模拟：只陪伴 1 年 0.62（很好）；每周被夸 0.70；每 30 天心动 0.87（爱）；
+    **只有「吵过又暖回来」才到 0.99**（repairs≥1）。
+- **v2.5 已接线（2026-11-26，默认 AFF_MODEL=v1 可回滚）**：
+  - `core/tuning.py`：新增 `MOOD_STEP_3=0.40`、`MOOD_IMPACT_MAX=3`、35 个 `AFF_*` 键；
+  - `services/mood.py`：`observe()` 接受 ±3，`_step_of` 三档；
+  - `services/mood_judge.py`：prompt 改 7 档 + `cared` 两段式；
+    好感写入分 v1/v2，v2 吃 `_dv_actual`（不再乘 K/gain/tsf 重复因子），
+    删掉 `_cause=="speaker"` 限制（只看 target）；
+  - `services/profiles.py`：新增 `affinity_now()` / `add_affinity_event(dv)` /
+    `add_affinity_comp()`，痕迹求和 + 三段式 + 巩固 + 门槛 + 旧档案迁移；
+  - 容器 3.11 验证：a=0.90 时 dv=−0.35 → **−0.410**（0.90→0.49）；
+    新号连刷被门槛卡 0.12；巩固只在 dv>0 且 warmth7 够时沉淀。
+  - 切 v2：`.env` 写 `AFF_MODEL=v2` 重启；观察 `[AFFv2]` / `[MOOD-JUDGE] 好感v2`。
 
 ## 2026-11-26（第二十三轮：@ 后续被冷却吞 / 亲近突降 / B站短链 / 部署侧三类问题）
 

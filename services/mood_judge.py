@@ -35,7 +35,8 @@ except Exception:  # pragma: no cover
 
 ENABLED = os.getenv("MOOD_JUDGE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 # 2026-11-24：判读用哪个模型由 providers 决定（JUDGE_PROVIDER / JUDGE_MODEL）。
-from .providers import resolve as _resolve_provider  # noqa: E402
+from .providers import (resolve as _resolve_provider,
+                        call_tokens as _call_tokens)  # noqa: E402
 
 _JUDGE_P = _resolve_provider("judge")
 MODEL = _JUDGE_P["model"]
@@ -62,9 +63,8 @@ def _calls_left(key: str, now: float) -> int:
     ts = [t for t in _CALLS.get(key, []) if now - float(t) < 3600]
     _CALLS[key] = ts
     return max(0, JUDGE_MAX_PER_HOUR - len(ts))
-# 心情变化 → 好感增幅的系数（2026-11-20 定稿：好感由 Δmood 推导，不再单独判读）
-# 0.05 意味着「Δmood=1.0 的大事件」一次只涨 +0.05，从 0 到 +1.0 需要约 20 次。
-AFFINITY_GAIN = tuning.f("AFFINITY_GAIN")
+# ⚠️ 2026-11-27（外部审计）：AFFINITY_GAIN 以前只有这一句赋值、没有任何使用，
+# 靠「有读点」混过 check_tuning。现在已从代码移除，键进 `tuning.UNWIRED`（LEGACY）。
 # 她没主动写心情时，多久用群聊重新判一次（秒）。0 = 只在她说的时候判
 REFRESH = tuning.f("MOOD_JUDGE_REFRESH")
 # 判读结果在「记忆写回」里有效多久（秒）：超过就退回用 MEMO 自报的情绪
@@ -91,6 +91,39 @@ _LAST: dict = {}          # session_key -> 最近一次结果（给 /测函数 �
 # 「我没有从测心情的 log 里看到有效信息」。以前失败只打 debug，真机上等于没有。
 _TRACE: dict = {}         # session_key -> {"at", "ok", "word"/"err", ...}
 _SKIP_AT: dict = {}       # session_key -> (原因, 上次打日志时间)，同一个原因 60s 内只打一次
+
+# ---- 攒着的心理活动（2026-11-26 用户实测发现的问题）----
+# 用户：「我发现她其实每一句都有写心理活动的，所以并不是心理活动素材没有，
+#       而是 cd 给隔离了。」
+# 实测：`MIN_INTERVAL=60s` 节流时，这一轮带回来的 `think` 直接 return 丢掉；
+# 下一窗如果她没再说新的话，`wrote` 就是 False → 判成「她没写 THINK」→ 整窗不判。
+# 于是「每条都写了 THINK」在链路上表现成「大部分窗口没有 THINK」。
+# 现在节流/预算用完时把 THINK 攒进队列，下一次真判读时合并进来一起判
+# （不增加判读次数，只是不丢素材）。上限 8 条，超过丢最老的。
+_PENDING_THINK: dict = {}   # session_key -> [[at, text], ...]
+PENDING_THINK_MAX = 8
+
+
+def _push_pending_think(key: str, text: str) -> int:
+    t = str(text or "").strip()
+    if not t:
+        return len(_PENDING_THINK.get(key) or [])
+    q = _PENDING_THINK.setdefault(key, [])
+    q.append([time.time(), t[:200]])
+    if len(q) > PENDING_THINK_MAX:
+        del q[:len(q) - PENDING_THINK_MAX]
+    return len(q)
+
+
+def _pop_pending_think(key: str, *, max_age: float = 600.0) -> list:
+    """取出攒着的 THINK（太老的丢掉：10 分钟前的心情不能算「这一窗」）。"""
+    q = _PENDING_THINK.pop(key, None) or []
+    now = time.time()
+    return [str(t) for at, t in q if now - float(at or 0) <= max_age]
+
+
+def pending_think_count(key: str) -> int:
+    return len(_PENDING_THINK.get(str(key or "")) or [])
 
 # 她的「心理活动」（MEMO 里的 think:）—— 用户 2026-11-19：
 # 「我看这些内容没有心里话啊，只有回复。」
@@ -139,6 +172,25 @@ def think_stat_text() -> str:
                 "（重启会归零；上面的逐条记录是落盘的，不受影响）")
     return (f"· 心里话命中：{h}/{h + m} 条回复带了 THINK"
             f"（缺 {m} 条；本次启动后统计，重启归零）")
+
+
+# anchor_level 从 2026-11-26 起是**必填**（用户拍板：它占心情的大头）。
+# 但 prompt 写「必填」≠ 模型一定填 —— 换模型/降级时可能静默失效，
+# 所以要能量化命中率，而不是等状态卡看起来「不纠偏」才发现。
+ANCHOR_STAT = {"hit": 0, "miss": 0}
+_ANCHOR_MISS_AT: dict = {}
+
+
+def note_anchor_stat(has: bool) -> None:
+    ANCHOR_STAT["hit" if has else "miss"] += 1
+
+
+def anchor_stat_text() -> str:
+    h, m = ANCHOR_STAT["hit"], ANCHOR_STAT["miss"]
+    if not (h or m):
+        return "· anchor_level 命中：本次启动后还没判读"
+    return (f"· anchor_level 命中：{h}/{h + m}（必填，缺 {m} 条）"
+            "（本次启动后统计，重启归零）")
 
 
 def _think_load() -> dict:
@@ -265,7 +317,7 @@ async def summarize(text: str, session_key: str = "", ctx_lines=None,
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.2,
-        "max_tokens": 90,
+        **_call_tokens("judge", 90),
     }
     try:
         import httpx
@@ -434,7 +486,11 @@ def _build_prompt(words: str, think: str, ctx: list, prev_word: str = "",
     if archive:
         lines.append(f"【她对正在说话这个人的档案】{archive[:220]}")
     if prev_word or prev_value:
-        lines.append(f"【上一轮】{prev_word or '?'}（当前心情 {prev_value:+.2f}）"
+        # 2026-11-26（外部审计）：**不给当前数值**。
+        # anchor_level 现在是每窗的主项（ADR-042），prompt 里再写「当前心情 +0.35」，
+        # 最省力的答案就是 anchor_level≈+1 —— 那是 ADR-029 明确警告的「回声」。
+        # 只给上一轮那个词（她自己的说法），不给数字，模型就没得照抄。
+        lines.append(f"【上一轮】{prev_word or '?'}"
                      "—— 只作参考，情绪可以变，别硬往回拉")
     if ctx:
         lines.append("")
@@ -445,7 +501,7 @@ def _build_prompt(words: str, think: str, ctx: list, prev_word: str = "",
         lines.extend(f"{i}. {x}" for i, x in enumerate(ctx, 1))
     lines += [
         "",
-        "判断规则（mind / word / delta / cause / why 五个字段都要有，"
+        "判断规则（mind / word / desirability / cared / anchor_level / cause / why 都要有，"
         "档案够详细时再加 bond_word）：",
         "· mind：**第一人称**的一句心里话，20 字内，像她在心里嘀咕。",
         "  不是事件复述，也不是说给别人听的客套话。例：「他夸我，我嘴上不认」「这数字看得我眼晕」。",
@@ -453,17 +509,31 @@ def _build_prompt(words: str, think: str, ctx: list, prev_word: str = "",
         "· word：一个**具体**的中文词/短语，4~10 字。不要用「开心/难过/生气/平静」这种泛词；",
         "  要具体到她此刻的状态：「被夸得有点飘」「憋着一口气」「懒得解释」「心里空了一下」；",
         "  真的没什么起伏就写「没什么起伏」。",
-        "· impact：**整数，只能填 -2 / -1 / 0 / +1 / +2**。这是「这件事让她心情往哪动了多少」，",
-        "  **不是她现在的心情值**（当前值由系统按步进累计，不用你给）。",
-        "  + = 变好（被夸、被逗笑、被哄）｜- = 变差（被冒犯、被无视、被恶心）。",
-        "· **档位纪律（先判断「这事跟她有没有关系」）**：",
-        "  0 = 跟她没关系 / 旁观 / 看不出：别人之间的对话（→ 某人 / → 大家）、刷图刷屏、",
-        "      冷梗、别人吵架、她只是看到没说话；「懒得掺和」「看戏」也是 0，**不是负分**。",
-        "  ±1 = 冲她来但不大：被接话、被轻轻调侃、被忽略一句、明确被夸/被冒犯。",
-        "  ±2 = 真正的伤害 / 大喜：极少见（一天最多一两次）。",
-        "  同一件小事不要反复给；方向要平衡，别把「没什么事」都写成负分。",
-        "· anchor_level：**整数 -2/-1/0/+1/+2**，只在你对「她此刻绝对心情」有把握时填：",
-        "  -2 很糟 / -1 偏低 / 0 平稳 / +1 不错 / +2 很好。每 20 轮才用一次，用来纠偏。",
+        "· **desirability + cared（两段式，优先填这两个，不要直接猜 impact）**：",
+        "  ⚠️ **判分依据只有她的【心理活动】**：同一件事，她心里写「受用」就是 +，",
+        "     写「烦」就是 −。**不要按「这件事通常算好事/坏事」直接给分**——",
+        "     她理解错了也按她的理解评（那是她的感受）。",
+        "  desirability = 整数 **-3 ~ +3**，这事**在她心里**合不合意：",
+        "    +3 = 整个人被击中 —— 心里写「咯噔一下」「这句话我记住了」（一见钟情级）；",
+        "    +2 = 明显暖到 —— 心里写「被戳到了」「鼻子有点酸」；",
+        "    +1 = 有点受用 —— 心里写「嘴上不认，其实挺受用」「被逗得没绷住」；",
+        "     0 = 无所谓 / 看戏 / 看不出；",
+        "    -1 = 有点不爽 —— 心里写「算了」「有点膈应」；",
+        "    -2 = 心里堵 —— 心里写「下不来台」「这人怎么这样」；",
+        "    -3 = 整个人凉了 —— 心里写「原来是这样」「整个人空了」（被背叛级）。",
+        "  cared = 0 / 1 / 2，她在不在意：",
+        "    0 = 纯看戏 / 跟她无关（**代码会给 0 分，不是负分**：别人吵架、刷屏、冷梗都填这个）；",
+        "    1 = 有点在意；2 = 很在意。",
+        "  纪律：**±3 一天最多一次**；同一件小事不要反复给；方向要平衡。",
+        "· （兼容）impact：只想给一个数时可直接填 -3~+3，语义同 desirability，cared 按 2 算。",
+        "· anchor_level：**必填**，整数 **-2/-1/0/+1/+2** = 她**此刻整体心情**的绝对档位",
+        "  （相对她平时的基线），**不是**这件事对她的影响（那是 desirability）：",
+        "    -2 很糟（心里写「整个人空了」）/ -1 偏低（「有点提不起劲」）/ 0 平稳（「就这样吧」）/",
+        "    +1 不错（「今天还行」）/ +2 很好（「心里是亮的」）。",
+        "  ⚠️ 这一项**占最终心情的大头**（每窗都按权重混进去），所以**照她的心理活动填真实档位**：",
+        "     她心里亮就 +1/+2，闷就 -1/-2；只有**真的看不出**才填 0。",
+        "     （别为了好看往 ±2 抬，也别一律填 0 —— 一律填 0 会把她每窗往基线拽。）",
+        "     判据同样只有她的【心理活动】。缺这一项会让这窗的绝对纠偏失效。",
         "· bond_word（可选）：参考【她的档案】，给一个 **4~10 字**的描述性说法，",
         "  说明「她现在怎么看他」，例：「又爱又嫌的老熟人」「不想搭理的陌生人」「可以损两句的熟人」。",
         "  档案没提到这个人、或这次没什么变化，就省略这个字段。",
@@ -505,7 +575,8 @@ def _build_prompt(words: str, think: str, ctx: list, prev_word: str = "",
         "",
         "只输出 JSON，不要 markdown、不要解释：",
         '{"mind":"嘴上不认，其实挺受用","word":"被夸得有点飘",'
-        '"impact":1,"anchor_level":1,"arousal":"mid","dominance":"high","confidence":0.8,'
+        '"desirability":1,"cared":2,"impact":1,"anchor_level":1,'
+        '"arousal":"mid","dominance":"high","confidence":0.8,'
         '"cause":"speaker","why":"他夸了她，她装没事",'
         '"relation":{"trust":0,"respect":1},"relation_relevance":0.8,'
         '"bond_word":"嘴硬但吃这套的熟人"}',
@@ -604,13 +675,19 @@ def _clean_word(raw: str) -> str:
 
 
 def _ctx_of(session_key: str, ctx_lines=None) -> list:
-    """判读上下文：优先按条数从现场/日志拉 20 条，拉不到才用调用方给的。"""
-    rows = scene_lines(session_key)
-    if rows:
-        return rows[-CTX_LINES:]
+    """判读上下文：**优先用调用方给的窗口**，现场只做兜底。
+
+    2026-11-26（2026-11-26 审计修复）：以前反过来——只要群里有历史就返回「最后 8 条」，
+    把 `split_windows` 切好的窗口丢掉。于是 40 条的段切成 5 窗，
+    5 次判读拿到的是同一份输入，`_COVERAGE` 只证明 msg_id 被记账、
+    不证明被读过。现在 `ctx_lines` 非空就必须用它。
+    """
     out = [re.sub(r"\s+", " ", str(x or "")).strip()[:160]
            for x in (ctx_lines or []) if str(x or "").strip()]
-    return out[-CTX_LINES:]
+    if out:
+        return out[-CTX_LINES:]
+    rows = scene_lines(session_key)
+    return rows[-CTX_LINES:] if rows else []
 
 
 async def _mind_only(words: str, think: str, ctx: list, word: str) -> str:
@@ -643,7 +720,7 @@ async def _mind_only(words: str, think: str, ctx: list, word: str) -> str:
             {"role": "user", "content": "\n".join(lines)},
         ],
         "temperature": 0.4,
-        "max_tokens": 60,
+        **_call_tokens("judge", 60),
     }
     try:
         import httpx
@@ -740,7 +817,7 @@ async def judge(words: str, ctx_lines=None, *, think: str = "",
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.2,
-        "max_tokens": 200,
+        **_call_tokens("judge", 200),
     }
     try:
         import httpx
@@ -771,9 +848,24 @@ async def judge(words: str, ctx_lines=None, *, think: str = "",
     _impact_raw = d.get("impact", d.get("档位"))
     _delta_raw = d.get("delta", d.get("Δ"))
     impact = None
-    if _impact_raw is not None:
+    # 2026-11-26（v2.5）：优先两段式 desirability × cared（原审计 §4 的建议）。
+    # 看戏（cared=0）有显式出口 → impact=0，不靠模型自觉。
+    _des = d.get("desirability")
+    if _des is not None:
         try:
-            impact = max(-2, min(2, int(round(float(_impact_raw)))))
+            _dv_des = max(-3, min(3, int(round(float(_des)))))
+            _cared = d.get("cared")
+            _cv = 2 if _cared is None else max(0, min(2, int(round(float(_cared)))))
+            if _cv == 0 or _dv_des == 0:
+                impact = 0
+            else:
+                _mag = max(1, int(round(abs(_dv_des) * _cv / 2.0)))
+                impact = _mag if _dv_des > 0 else -_mag
+        except Exception:
+            impact = None
+    if impact is None and _impact_raw is not None:
+        try:
+            impact = max(-3, min(3, int(round(float(_impact_raw)))))
         except Exception:
             impact = None
     if impact is None:
@@ -793,11 +885,29 @@ async def judge(words: str, ctx_lines=None, *, think: str = "",
             return {"ok": False,
                     "err": f"impact 不是数字：{content[:120]}",
                     "raw": content[:400]}
-        impact = 0 if abs(_d) < 0.03 else (1 if abs(_d) < 0.15 else 2)
+        _a = abs(_d)
+        impact = 0 if _a < 0.03 else (1 if _a < 0.15 else (2 if _a < 0.30 else 3))
         if _d < 0:
             impact = -impact
-    # delta 只留给「记忆刻痕 / 好感 / 群心情」当强度用，不再是状态更新量
-    _step = 0.22 if abs(impact) >= 2 else 0.10
+    # 2026-11-27（外部审计）：`±3 一天最多一次`以前只写在 prompt 纪律里，
+    # 代码没有计数 → 活跃群一天能刷好几次。现在按会话按自然日计数，
+    # 超了把 ±3 降成 ±2（保留「这是件大事」，只是不再顶格）。
+    _impact_before_cap = impact
+    try:
+        from . import mood as _mood_cap
+        _eff_imp = _mood_cap.cap_daily_impact(session_key, impact)
+        if _eff_imp != impact:
+            logger.info(f"[MOOD-JUDGE] {session_key or '?'} ±3 当日额度已用完"
+                        f" → {impact:+d} 降为 {_eff_imp:+d}")
+            impact = _eff_imp
+    except Exception as e:
+        logger.debug(f"[MOOD-JUDGE] ±3 日计数失败: {type(e).__name__}: {e}")
+    # delta 只留给「记忆刻痕 / 好感 / 群心情」当强度用，不再是状态更新量。
+    # 2026-11-26：步长从 tuning 读，不再硬编码 0.40/0.22/0.10——
+    # 否则 MOOD_STEP_2 只管心情、不管好感和刻痕（第二份真相）。
+    _step = (tuning.f("MOOD_STEP_3") if abs(impact) >= 3
+             else (tuning.f("MOOD_STEP_2") if abs(impact) >= 2
+                   else tuning.f("MOOD_STEP_1")))
     delta = round(_step * (0 if impact == 0 else (1 if impact > 0 else -1)), 2)
     if not word:
         return {"ok": False, "err": "word 为空", "raw": content[:400]}
@@ -827,11 +937,21 @@ async def judge(words: str, ctx_lines=None, *, think: str = "",
         _conf = max(0.0, min(1.0, float(d.get("confidence", 0.6))))
     except Exception:
         _conf = 0.6
-    # 锚点档位：只有模型明确给了才用（缺省 None = 这次不做锚点）
+    # 锚点档位：**必填**（2026-11-26 用户拍板：它占最终心情的大头）。
+    # 模型没给就说明这条绝对链路断了 —— 记一次 miss + 打 INFO（同一会话 60s 一次），
+    # 本窗不做锚点（宁可不动，也不要拿 desirability 猜她的绝对档位）。
     try:
         _anchor = max(-2, min(2, int(round(float(d.get("anchor_level"))))))
     except Exception:
         _anchor = None
+    note_anchor_stat(_anchor is not None)
+    if _anchor is None:
+        _now = time.time()
+        _prev_miss = float(_ANCHOR_MISS_AT.get(session_key) or 0)
+        if _now - _prev_miss > 60:
+            _ANCHOR_MISS_AT[session_key] = _now
+            logger.info(f"[MOOD-JUDGE] {session_key or '?'} 判读没填 anchor_level"
+                        f"（必填）→ 本窗不做绝对锚点")
     # 关系事件：只认 trust / respect 两个 -1|0|1
     _rel = d.get("relation") if isinstance(d.get("relation"), dict) else {}
 
@@ -850,6 +970,8 @@ async def judge(words: str, ctx_lines=None, *, think: str = "",
         _target = {"speaker": "speaker", "other": "other", "self": "self",
                    "environment": "world"}.get(cause, "world")
     return {"ok": True, "word": word, "delta": delta, "impact": impact,
+            # 被日额度降档时留原值，`/测函数 心情` 能看出「模型报的是 ±3」
+            "impact_raw": _impact_before_cap,
             "anchor_level": _anchor,
             "relation_trust": _tri("trust"), "relation_respect": _tri("respect"),
             "relation_relevance": _relevance, "target": _target,
@@ -897,7 +1019,7 @@ def trace_text(session_key: str, judge: dict = None) -> str:
         ts = time.strftime("%m-%d %H:%M:%S", time.localtime(float(t.get("at") or 0)))
         if t.get("ok"):
             lines.append(f"· 上次尝试：{ts} 成功 → {t.get('word')}"
-                         f"（心情值 {float(t.get('value') or 0):+.2f}"
+                         f"（心情值 {float(t.get('v') or 0):+.2f}"
                          f"｜impact {int(t.get('impact') or 0):+d}"
                          f"｜P {float(t.get('P') or 0):.2f}）")
         else:
@@ -921,6 +1043,13 @@ def trace_text(session_key: str, judge: dict = None) -> str:
     try:
         lines.append(f"· 判读预算：本小时还剩 {_calls_left(key, now)} 次"
                      f"（≤{JUDGE_MAX_PER_HOUR}）")
+    except Exception:
+        pass
+    lines.append(anchor_stat_text())
+    try:
+        _pn = pending_think_count(key)
+        if _pn:
+            lines.append(f"· 攒着的 THINK：{_pn} 条（节流期间没丢，下次一起判）")
     except Exception:
         pass
     try:
@@ -966,12 +1095,29 @@ async def judge_and_store(session_key: str, words: str, ctx_lines=None, *,
     key = str(session_key or "")
     if not ENABLED:
         return _skip(key, "总开关关着（MOOD_JUDGE_ENABLED=false）")
+    # 2026-11-27 日预算刹车：判读占全天 token 的 ~24%，
+    # 额度用完就整条不调（心情停在原地，明天恢复）。
+    try:
+        from . import budget_guard as _bg
+        if _bg.state() == "rest":
+            return _skip(key, "今日额度用完（LLM_DAILY_BUDGET）→ 不判")
+    except Exception:
+        pass
     now = time.time()
+    # 这一轮带回来的心理活动（节流时也要留住，见 _PENDING_THINK 的注释）
+    _think_in = str(think or "").strip()
     if not force and now - float(_LAST_AT.get(key) or 0) < MIN_INTERVAL:
         left = MIN_INTERVAL - (now - float(_LAST_AT.get(key) or 0))
+        if _think_in:
+            _n = _push_pending_think(key, _think_in)
+            logger.info(f"[MOOD-JUDGE] {key} 节流 {left:.0f}s，THINK 先攒着"
+                        f"（{_n} 条），下次一起判")
         return _skip(key, f"节流：还要 {left:.0f}s（MIN_INTERVAL={MIN_INTERVAL:.0f}s）")
 
     if _calls_left(key, now) <= 0:
+        if _think_in:
+            _n = _push_pending_think(key, _think_in)
+            logger.info(f"[MOOD-JUDGE] {key} 判读预算用完，THINK 先攒着（{_n} 条）")
         return _skip(key, f"判读预算用完（≤{JUDGE_MAX_PER_HOUR} 次/小时）")
 
     # 段 → 窗口（emotion §5.1）：段是投递单位（≤40 条 / ≤30s），窗口是判读单位（8 条 / 5min）。
@@ -984,21 +1130,25 @@ async def judge_and_store(session_key: str, words: str, ctx_lines=None, *,
             logger.info(f"[MOOD-JUDGE] {key} 段 {len(_wins)} 窗，预算只够 {_left} 窗，"
                         f"丢掉最早的 {len(_wins) - _left} 窗")
             _wins = _wins[-_left:]
-        _COVERAGE[key] = [str(r.get("mid") or "") for _w in _wins
-                          for r in _w if r.get("mid")]
+        # 2026-11-26：只记**真正判过的窗**（最后一窗）。passive 窗不调模型，
+        # 把它们的 msg_id 也记进来会让 coverage 变成「看到过」而不是「判过」。
+        _COVERAGE[key] = [str(r.get("mid") or "") for r in _wins[-1]
+                          if r.get("mid")]
         if len(_wins) > 1:
+            # 2026-11-26（2026-11-26 审计修复）：passive 窗不写任何状态，就没必要调模型。
+            # 以前每窗都 await judge_and_store(passive=True)：一次 LLM 调用 +
+            # 一次预算，最后在 `if passive: return` 全部丢掉 —— 40 条的段
+            # 5 次调用里 4 次纯烧钱。现在只记窗口计数（ADR-037），
+            # 判读预算全部留给最后一窗。
             for _w in _wins[:-1]:
-                _lines = _fmt_window(_w)
-                if not _lines:
-                    continue
                 try:
-                    await judge_and_store(key, "", _lines, force=True,
-                                          passive=True)
-                except Exception as e:
-                    logger.debug(f"[MOOD-JUDGE] 补判窗口失败: {type(e).__name__}: {e}")
+                    from . import mood as _mood_w
+                    _mood_w.note_window(key)
+                except Exception:
+                    pass
             ctx_lines = _fmt_window(_wins[-1])
             logger.info(f"[MOOD-JUDGE] {key} 段 {len(records)} 条 → "
-                        f"{len(_wins)} 窗（补判 {len(_wins) - 1} 窗）")
+                        f"{len(_wins)} 窗（前 {len(_wins) - 1} 窗只记账不判）")
 
     prev = {}
     try:
@@ -1009,7 +1159,25 @@ async def judge_and_store(session_key: str, words: str, ctx_lines=None, *,
 
     ctx = _ctx_of(key, ctx_lines)
     # 本次她刚写的心理活动（决定「算不算她主动写了」）
-    _incoming = str(think or "").strip()
+    # 2026-11-26：把节流期间攒下的 THINK 一起并进来 —— 否则「她每条都写了 THINK」
+    # 在链路上会表现成「这一窗没写」，整窗白丢（用户实测发现的）。
+    _pend = _pop_pending_think(key)
+    if _pend:
+        logger.info(f"[MOOD-JUDGE] {key} 并入攒下的 {len(_pend)} 条 THINK")
+    _incoming = "；".join(_pend + ([_think_in] if _think_in else []))
+    # 兜底（2026-11-26）：她每条回复都写 THINK，但有的调用路径只落盘、没把 think 传进来。
+    # 本次没有 incoming 时，就看「上次判读之后」有没有新落盘的 THINK，有就拿来用。
+    # 只取 `at > 上次判读时间` 的，避免同一条 THINK 被判两次。
+    if not _incoming:
+        try:
+            _since = float(prev.get("at") or 0) if prev else 0.0
+            _new = [x["text"] for x in recent_think_items(key, 6)
+                    if float(x.get("at") or 0) > _since and not x.get("auto")]
+            if _new:
+                _incoming = "；".join(_new[-3:])
+                logger.info(f"[MOOD-JUDGE] {key} 用落盘的新 THINK {len(_new)} 条（调用方没传 think）")
+        except Exception:
+            pass
     wrote = bool(str(words or "").strip() or _incoming)
     # 判读时把最近几条心理活动也带上：重判/事后诊断时没有「当场」的 think，
     # 但落盘的历史心里话同样能说明她当时是怎么想的。
@@ -1135,7 +1303,11 @@ async def judge_and_store(session_key: str, words: str, ctx_lines=None, *,
                 _relevance = float(res.get("relation_relevance") or 0.5)
             except Exception:
                 _relevance = 0.5
-            _skip_update = (not wrote and _relevance < mood.RELEVANCE_GATE)
+            # 2026-11-26（审计）：以前是 `not wrote and ...`，但 `not wrote` 的窗口
+            # 已经在上面 `if passive: return` 提前返回了 —— 所以这个条件恒 False，
+            # MOOD_RELEVANCE_GATE 成了「有读点、有文档、永不执行」的死护栏。
+            # 现在只看 relevance：她写了 THINK、但判读说这事跟她无关（<0.25）→ 只衰减。
+            _skip_update = (_relevance < mood.RELEVANCE_GATE)
             # salience 按设计 §13.3：min(1, |Δ|/0.5) → 0.10/0.25/0.50 三档刻痕
             _sal = min(1.0, abs(_delta) / 0.5)
             _val = 1.0 if _delta > 0 else (-1.0 if _delta < 0 else 0.0)
@@ -1179,43 +1351,37 @@ async def judge_and_store(session_key: str, words: str, ctx_lines=None, *,
             _obs = {}
             try:
                 if getattr(mood, "MOOD_UPDATE", "v2") == "v2":
+                    # ⚠️ 2026-11-27（外部审计，真问题）：以前 relevance < 0.25 会
+                    # **整条 mood.observe 都不调**。而 prompt 教模型「world/self
+                    # 引起的 relation_relevance 填 0」——于是她自己的情绪
+                    # （想起以前、困了）永远写不进 v，anchor 也一起丢，
+                    # 和 ADR-038「心情只来自 THINK」、ADR-042「锚点占大头」冲突。
+                    # 现在：relevance 只挡好感/记忆/群心情（下面那些 `_skip_update`），
+                    # **心情与锚点照常步进**。
                     if _skip_update:
-                        _new_v = float(mood.get_mood(key).get("value") or 0.0) / 100.0
-                        # 没步进也要把当前状态写进 res：否则日志里 P 显示 0.000，
-                        # 看起来像「不确定度归零」，其实是这次没观测（2026-11-25 真机）。
-                        _st_now = mood.state_of(key)
-                        res["v_after"] = _st_now["v"]
-                        res["P"] = _st_now["P"]
-                        res["K"] = 0.0
-                        logger.info(f"[MOOD-JUDGE] {key} relevance {_relevance:.2f}"
-                                    f" < {mood.RELEVANCE_GATE} → 只衰减不步进"
-                                    f"（v {_st_now['v']:+.3f} P {_st_now['P']:.3f}）")
-                        # ADR-037：被跳过的窗口也要计入锚点计数，否则噪声群
-                        # judge_n 永远 0、锚点永不触发（状态冻结）。
-                        try:
-                            mood.note_window(key)
-                        except Exception:
-                            pass
-                    else:
-                        _imp = int(res.get("impact") or 0)
-                        if passive:
-                            _imp = max(-1, min(1, _imp))
-                        _obs = mood.observe(
-                            key, _imp, float(res.get("confidence") or 0.6),
-                            sensitivity=(mood.sensitivity(key)
-                                         * float(_tr.get("sensitivity") or 1.0)),
-                            reactivity=float(_tr.get("reactivity") or 0.5),
-                            anchor_level=res.get("anchor_level"),
-                            word=res["word"], why=res.get("why") or "",
-                            src=res.get("src") or "", about_qq=_tgt_qq,
-                            mind=res.get("mind") or "")
-                        _new_v = float(_obs.get("v") or 0.0)
-                        res["v_before"] = _prev_v
-                        res["v_after"] = _new_v
-                        res["P"] = _obs.get("P")
-                        res["K"] = _obs.get("K")
-                        if _obs.get("anchored"):
-                            res["anchored"] = _obs["anchored"]
+                        logger.info(
+                            f"[MOOD-JUDGE] {key} relevance {_relevance:.2f}"
+                            f" < {mood.RELEVANCE_GATE} → 心情照常步进，"
+                            f"好感/记忆/群心情不写")
+                    _imp = int(res.get("impact") or 0)
+                    if passive:
+                        _imp = max(-1, min(1, _imp))
+                    _obs = mood.observe(
+                        key, _imp, float(res.get("confidence") or 0.6),
+                        sensitivity=(mood.sensitivity(key)
+                                     * float(_tr.get("sensitivity") or 1.0)),
+                        reactivity=float(_tr.get("reactivity") or 0.5),
+                        anchor_level=res.get("anchor_level"),
+                        word=res["word"], why=res.get("why") or "",
+                        src=res.get("src") or "", about_qq=_tgt_qq,
+                        mind=res.get("mind") or "")
+                    _new_v = float(_obs.get("v") or 0.0)
+                    res["v_before"] = _prev_v
+                    res["v_after"] = _new_v
+                    res["P"] = _obs.get("P")
+                    res["K"] = _obs.get("K")
+                    if _obs.get("anchored"):
+                        res["anchored"] = _obs["anchored"]
                 elif abs(_delta) < 1e-9:
                     # Δ=0：只记名词/心里话，不动数值（这才是「旁观不背锅」）
                     _new_v = float(mood.get_mood(key).get("value") or 0.0) / 100.0
@@ -1239,11 +1405,19 @@ async def judge_and_store(session_key: str, words: str, ctx_lines=None, *,
 
             # 2026-11-25（P0-8）：把「事件强度」和「实际位移」分开：
             #   _delta     —— 档位换算的名义步长（±0.10/0.22），代表**这件事有多重**
-            #   _dv_actual —— mood.observe 真正走出来的位移（K/饱和之后），代表**她实际动了多少**
+            #   _dv_actual —— mood.observe 走出来的**事件步进**（K/饱和之后），代表**这件事让她动了多少**
             # 审计类字段（mood_events / 日志）用实际位移；好感/记忆/群心情用事件强度
             # （它们衡量的是事件本身，且阈值是按 ±0.10/0.22 校准的）。
+            #
+            # ⚠️ 2026-11-26（外部审计）：`dv` **不含**锚点位移（`anchored`）。
+            #   这是故意的，不是漏了：锚点是「对她此刻整体水平的重新估计」，
+            #   不是「这个人造成了这件事」。把它算进好感 = 「她今天心情好，
+            #   顺手记到旁边人头上」，违反唯一原则（好感是寄存在每个人那里的**涨落历史**）。
+            #   想看这一窗 v 总共动了多少，用 `dv_total`（只做诊断，不进任何模型）。
             _dv_actual = float((_obs or {}).get("dv") or 0.0) if _obs else 0.0
             res["dv_actual"] = round(_dv_actual, 4)
+            res["dv_total"] = round(float((_obs or {}).get("dv_total") or 0.0), 4) \
+                if _obs else 0.0
 
             # ② 判读记录：word = 这件事的**反应词**；value = 累加后的新水平；
             #    delta = 这一次的涨幅（记忆/好感/档案都读它）
@@ -1266,11 +1440,13 @@ async def judge_and_store(session_key: str, words: str, ctx_lines=None, *,
             if not _skip_update:
                 try:
                     from . import memdb as _mdb
+                    # 2026-11-26：以前没传 `impact` → 库里全是 0，
+                    # 「今日事件按档位分布」这种分析永远看不到 ±1/±2/±3。
                     _mdb.log_mood_event(
                         session=key,
                         about_qq=(_tgt_qq if _target in ("speaker", "recipient", "other")
                                   else ""),
-                        target=_target, dv=_dv_actual,
+                        target=_target, impact=res.get("impact"), dv=_dv_actual,
                         confidence=float(res.get("confidence") or 0.6),
                         relevance=_relevance, reason=res.get("why") or "")
                 except Exception as e:
@@ -1296,19 +1472,16 @@ async def judge_and_store(session_key: str, words: str, ctx_lines=None, *,
             #    —— 现在改成对称 ±0.10，并按设计文档补齐 novelty / saturation。
             _aff = 0.0
             _aff_qq = _tgt_qq if _target in ("speaker", "recipient", "other") else ""
-            if (not _skip_update and _aff_qq and _cause == "speaker"
-                    and abs(_delta) >= 0.005):
+            _pf = None
+            _is_v2 = False
+            try:
                 from . import profiles as _pf
-                _cur_aff = float(_pf.get_affinity(_aff_qq))
-                _gain = 0.04 + 0.12 * float(_tr.get("warmth") or 0.5)
-                _tsf = 0.6 + 0.8 * float(_tr.get("trust_speed") or 0.5)
-                # 置信度加权（P0-8）：判读没把握时，好感不该按满格步长走。
-                # 用观测的 K（已含 confidence 与 P），没有观测就按 1.0。
-                # 用 0.5+0.5K 而不是 K：K 全乘会把常态步长压到 0.005 以下，
-                # 好感几乎不动（2026-11-25 单测踩到）。这样置信低时仍有半速。
-                _k_obs = float((_obs or {}).get("K") or 0.0) if _obs else 1.0
-                _k_eff = max(0.05, min(1.0, 0.5 + 0.5 * max(0.0, min(1.0, _k_obs))))
-                # novelty：同一个人 30min 内第 n 次（防「连着夸 / 连着骂」刷分）
+                _is_v2 = (getattr(_pf, "AFF_MODEL", "v1") == "v2")
+            except Exception:
+                _pf = None
+            # novelty：同一个人 30min 内第 n 次（防「连着夸 / 连着骂」刷分），v1/v2 共用
+            _nov = 1.0
+            if _aff_qq and _pf is not None:
                 try:
                     _n30 = sum(
                         1 for x in (_pf.get_profile(_aff_qq).get("affinity_log") or [])
@@ -1316,39 +1489,67 @@ async def judge_and_store(session_key: str, words: str, ctx_lines=None, *,
                 except Exception:
                     _n30 = 0
                 _nov = 1.0 / (1.0 + 0.6 * _n30)
-                # saturation：越靠近 ±1 越难走
-                _sat = max(0.05, 1.0 - abs(_cur_aff))
-                _raw = abs(_delta) * _k_eff * _gain * _tsf * _nov * _sat
-                if _delta < 0:
+
+            if _is_v2 and _pf is not None:
+                # v2（2026-11-26）：只看 target（不再要求 cause==speaker），
+                # 吃 mood.observe 的实际位移 dv，由 profiles 做痕迹求和/三段式/巩固。
+                if (not _skip_update and _aff_qq
+                        and abs(_dv_actual) >= 0.005):
                     try:
-                        from . import relationship as _rel
-                        _raw *= _rel.neg_weight(_cur_aff)
-                    except Exception:
-                        pass
-                    _aff = -_raw
-                else:
-                    _aff = _raw
-                if repair and _aff < 0:
-                    # 道歉是修复（§3.6 grudge×0.5）：把这次伤害减半，不强行变成加分
-                    _aff *= 0.5
-                _aff = max(-0.10, min(0.10, _aff))
-            if _aff_qq and abs(_aff) >= 0.005:
+                        _new_aff = _pf.add_affinity_event(
+                            _aff_qq, _dv_actual,
+                            reason=res.get("word") or "",
+                            conf=float(res.get("confidence") or 0.6),
+                            novelty=_nov)
+                        logger.info(
+                            f"[MOOD-JUDGE] {_aff_qq} 好感v2 dv={_dv_actual:+.3f}"
+                            f"（impact {int(res.get('impact') or 0):+d}"
+                            f"/{_cause}/target={_target}）→ {_new_aff:+.2f}")
+                    except Exception as e:
+                        logger.debug(f"[MOOD-JUDGE] 写好感v2失败: {type(e).__name__}: {e}")
+            else:
+                # v1（默认，2026-11-26 用户拍板）：**同时吃 `_delta` 和 `dv`**。
+                #   · `_delta` 项 = 这件事有多重（档位 → 名义步长），系数 AFF_V1_DELTA_K=0.25；
+                #   · `dv` 项    = 她真的动了多少（`observe` 走出来的实际位移），
+                #                  走三段式，`|dv|≥0.30` 的尾部 = 一见钟情 / 心碎，能一次跳 0.36。
+                #   两项相加后乘人设/新鲜度/饱和 → 日常更慢，但突变性事件不会消失。
+                if (not _skip_update and _aff_qq and _cause == "speaker"
+                        and (abs(_delta) >= 0.005 or abs(_dv_actual) >= 0.005)
+                        and _pf is not None):
+                    _cur_aff = float(_pf.get_affinity(_aff_qq))
+                    _gain = 0.04 + 0.12 * float(_tr.get("warmth") or 0.5)
+                    _tsf = 0.6 + 0.8 * float(_tr.get("trust_speed") or 0.5)
+                    # 置信度加权（P0-8）：判读没把握时，事件项不该按满格走。
+                    # 用观测的 K（已含 confidence 与 P），没有观测就按 1.0。
+                    _k_obs = float((_obs or {}).get("K") or 0.0) if _obs else 1.0
+                    _k_eff = max(0.05, min(1.0, 0.5 + 0.5 * max(0.0, min(1.0, _k_obs))))
+                    _aff = _pf.affinity_v1_step(
+                        _delta, _dv_actual, _cur_aff,
+                        gain=_gain, trust_speed=_tsf, k_eff=_k_eff, novelty=_nov)
+                    if repair and _aff < 0:
+                        # 道歉是修复（§3.6 grudge×0.5）：把这次伤害减半，不强行变成加分
+                        _aff *= 0.5
+                # 2026-11-26：门槛从 0.005 降到 0.001。
+                # ADR-043 把事件项压到 0.25 倍后，一次 ±2 只有 ≈0.004，
+                # 还按 0.005 卡就会「什么都没发生」——测试里 `好感能降/能涨` 两条就是这么红的。
+                if _aff_qq and abs(_aff) >= 0.001 and _pf is not None:
+                    try:
+                        _new_aff = _pf.bump_affinity(
+                            _aff_qq, _aff, reason=res.get("word") or "")
+                        logger.info(f"[MOOD-JUDGE] {_aff_qq} 好感v1 {_aff:+.3f}"
+                                    f"（Δ{_delta:+.2f}/dv{_dv_actual:+.3f}"
+                                    f"/{_cause}/target={_target}）"
+                                    f" → {_new_aff:+.2f}")
+                    except Exception as e:
+                        logger.debug(f"[MOOD-JUDGE] 写好感失败: {type(e).__name__}: {e}")
+            # ⑤ 好感名词：让模型参考档案给一个描述性说法（v1/v2 共用）
+            if _aff_qq and not _skip_update and _pf is not None:
                 try:
-                    from . import profiles
-                    _new_aff = profiles.bump_affinity(
-                        _aff_qq, _aff, reason=res.get("word") or "")
-                    logger.info(f"[MOOD-JUDGE] {_aff_qq} 好感 {_aff:+.3f}"
-                                f"（Δ{_delta:+.2f}/{_cause}/target={_target}）"
-                                f" → {_new_aff:+.2f}")
-                    # ⑤ 好感名词：让模型参考档案给一个描述性说法
-                    try:
-                        _bw = str(res.get("bond_word") or "").strip()[:16]
-                        if _bw:
-                            profiles.set_bond_word(_aff_qq, _bw)
-                    except Exception:
-                        pass
-                except Exception as e:
-                    logger.debug(f"[MOOD-JUDGE] 写好感失败: {type(e).__name__}: {e}")
+                    _bw = str(res.get("bond_word") or "").strip()[:16]
+                    if _bw:
+                        _pf.set_bond_word(_aff_qq, _bw)
+                except Exception:
+                    pass
 
             # ④b trust / respect（P3）：只由「关系事件」改，普通闲聊不动。
             # 2026-11-25（P0-6）：记到 **target 那个人**头上，不是永远记说话人
@@ -1416,9 +1617,13 @@ async def anchor_tick() -> int:
         return 0
     now = time.time()
     idle_sec = float(mood.ANCHOR_IDLE_MIN) * 60
+    _think_age = float(tuning.i("MOOD_ANCHOR_THINK_AGE_SEC"))
     done = 0
     for key, rec in list((st.get("sessions") or {}).items()):
-        if not str(key).startswith("group_"):
+        # 2026-11-26（2026-11-26 审计修复）：私聊也要锚。以前只扫 group_，
+        # 私聊会话的锚点永远不触发。
+        if not (str(key).startswith("group_")
+                or str(key).startswith("private_")):
             continue
         try:
             last_at = float(rec.get("anchor_at") or rec.get("updated_at") or 0)
@@ -1428,10 +1633,23 @@ async def anchor_tick() -> int:
             continue
         if now - float(_ANCHOR_LAST.get(key) or 0) < idle_sec:
             continue
-        # ADR-038：没有她的心理活动就不锚（不能拿群聊猜）
-        think = "；".join(recent_think(key, 2))
+        # ADR-038：没有她的心理活动就不锚（不能拿群聊猜）。
+        # 2026-11-26：还要判**时效**——以前 recent_think 不判时间，
+        # 只要群里历史上写过一条 THINK，之后每 30 分钟都拿这条陈旧
+        # 心里话锚一次，永远。
+        _items = recent_think_items(key, 2)
+        think = "；".join(
+            str(x.get("text") or "")
+            for x in _items
+            if now - float(x.get("at") or 0) <= _think_age
+            and str(x.get("text") or "").strip())
         if not think:
             continue
+        # 2026-11-26：后台车道也要吃判读预算（以前直接调 judge，
+        # 绕过 _calls_left，§3.3 的「≤30 次/小时」对它完全无效）。
+        if _calls_left(key, now) <= 0:
+            continue
+        _CALLS.setdefault(key, []).append(now)
         try:
             res = await judge(
                 "", scene_lines(key, 4), think=think,

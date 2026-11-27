@@ -58,7 +58,8 @@ EVERY = tuning.i("EXPRESSION_EVERY")
 MIN_INTERVAL = tuning.f("EXPRESSION_MIN_INTERVAL")
 MAX_PER_SCOPE = tuning.i("EXPRESSION_MAX_PER_SCOPE")
 # 2026-11-24：由 providers 决定（EXPRESSION_PROVIDER / EXPRESSION_MODEL）
-from .providers import resolve as _resolve_provider  # noqa: E402
+from .providers import (resolve as _resolve_provider,
+                        call_tokens as _call_tokens)  # noqa: E402
 
 _EX_P = _resolve_provider("expression")
 MODEL = _EX_P["model"]
@@ -212,7 +213,7 @@ async def mine(gid: str, rows, force: bool = False) -> int:
             {"role": "user", "content": _build_prompt(rows)},
         ],
         "temperature": 0.3,
-        "max_tokens": 600,
+        **_call_tokens("expression", 600),
         "response_format": {"type": "json_object"},
     }
     headers = {"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"}

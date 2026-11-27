@@ -281,6 +281,29 @@ _image_seen: dict = {}          # session_key -> {图片文件名: 首次处理�
 # 结果她说「看不到这张」——其实几分钟前刚看过。
 _image_cache: dict = {}         # session_key -> {文件名: {"desc","url","at"}}
 _last_image: dict = {}          # session_key -> {"desc","url","at"}（给 vision_source 工具用）
+_image_pending: dict = {}       # session_key -> {文件名: 开始识别时间}（在途/刚失败，防重复触发）
+
+
+def _mark_image_result(session_key: str, event, ok: bool) -> None:
+    """识别成功才记「这张图处理过」；失败只清 pending，允许过一会儿重试。
+
+    2026-11-26 真机：GLM 额度用尽 → 识别失败，但旧代码在**识别前**就写了 `_seen`，
+    同一张图 24h 内都被判「已处理过，但没有缓存描述可用」，永远看不到。
+    """
+    try:
+        files = [str(x.data.get("file") or "") for x in event.get_message()
+                 if x.type == "image"]
+        pend = _image_pending.get(session_key) or {}
+        seen = _image_seen.setdefault(session_key, {})
+        for f in files:
+            if not f:
+                continue
+            pend.pop(f, None)
+            if ok:
+                seen[f] = time.time()
+        _image_pending[session_key] = pend
+    except Exception:
+        pass
 
 
 def last_image(session_key: str) -> dict:
@@ -339,7 +362,9 @@ STICKER_VISION_PROMPT = (
 # 各 provider 的视觉兜底模型（2026-11-24 实测本账号可用性）
 _VISION_FALLBACKS = {
     "glm": ["glm-4v-plus", "glm-4v-flash"],
-    "qwen": ["qwen3-vl-plus", "qwen2.5-vl-72b-instruct"],
+    # 2026-11-27：qwen2.5-vl-72b 本账号 403（Access denied），去掉；
+    # 只留实测可用的 qwen3-vl-plus，避免失败时白等 40s。
+    "qwen": ["qwen3-vl-plus"],
     "deepseek": ["deepseek-flash"],
     "xai": [],
     "openai": [],
@@ -375,9 +400,47 @@ def _vision_targets() -> list:
         if m and m not in models:
             models.append(m)
     cached = _load_working_model()
-    if cached and cached not in models:
+    # ⚠️ 2026-11-27：以前只要 cached 不在 models 就 insert(0) —— 但 cached 可能是
+    # **备用 provider** 的模型（qwen3-vl-plus），插进来会拿 GLM 的 endpoint 去打
+    # qwen 模型名 → 404，再退回 GLM → 429，每张图白烧 2 次。
+    # 现在只把「属于本 provider 的」cached 提到最前；备用 provider 的下面单独处理。
+    if cached and cached in models:
+        models.remove(cached)
         models.insert(0, cached)
-    return [(ep, key, m) for m in models]
+    targets = [(ep, key, m) for m in models]
+    fb_targets: list = []
+
+    # 👇 2026-11-26：主 provider 额度用尽（GLM 1113「余额不足」）时自动换备用 provider。
+    #    用户实测：glm-4v-plus 全 429，她一直说「看不到图」；qwen3-vl-plus 仍可用。
+    #    备用 provider 由 `VISION_FALLBACK_*` 决定（默认 qwen / DASHSCOPE_API_KEY），
+    #    不配 key 就自动跳过，不影响原有行为。
+    try:
+        from services import providers as _pv
+        fb = _pv.resolve("vision_fallback")
+        fb_name = str(fb.get("provider") or "").lower()
+        fb_base = str(fb.get("base_url") or "").rstrip("/")
+        fb_key = str(fb.get("api_key") or "")
+        fb_model = str(fb.get("model") or "")
+        if fb_key and fb_base and fb_model and (fb_base != base or fb_key != key):
+            fb_ep = (fb_base if fb_base.endswith("/chat/completions")
+                     else fb_base + "/chat/completions")
+            fb_models = [str(fb_model or "").strip()] + [
+                str(x or "").strip() for x in _VISION_FALLBACKS.get(fb_name, [])]
+            # 上次成功的模型如果在备用 provider 里，把它排到备用第一位
+            if cached and cached in fb_models:
+                fb_models.remove(cached)
+                fb_models.insert(0, cached)
+            for m in fb_models:
+                if m and (fb_ep, fb_key, m) not in targets:
+                    fb_targets.append((fb_ep, fb_key, m))
+    except Exception as e:
+        logger.debug(f"[VISION] 备用 provider 解析失败（忽略）: {type(e).__name__}: {e}")
+
+    # 上次成功的模型如果属于备用 provider（例如 GLM 欠费后一直用 qwen3-vl-plus），
+    # 就把备用 provider 整体排到前面 —— 否则每张图都要先吃一次 GLM 429。
+    if cached and any(m == cached for _e, _k, m in fb_targets):
+        return fb_targets + targets
+    return targets + fb_targets
 
 
 async def _vl_describe(image_bytes: bytes, prompt: str = DEFAULT_VISION_PROMPT,
@@ -424,9 +487,12 @@ async def _vl_describe(image_bytes: bytes, prompt: str = DEFAULT_VISION_PROMPT,
     # ---- 逐个组合尝试（有次数上限，避免一路试到天荒地老）----
     attempts = 0
     last_err = ""
+    dead_endpoints: set = set()      # 额度用尽 / key 无权限的 provider，后面别再试
     for endpoint, api_key, model in targets:
+        if endpoint in dead_endpoints:
+            continue
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        bad_key = False
+        provider_dead = False
         model_missing = False
         for kind, item, label in payloads:
             if attempts >= VISION_MAX_ATTEMPTS:
@@ -470,12 +536,31 @@ async def _vl_describe(image_bytes: bytes, prompt: str = DEFAULT_VISION_PROMPT,
                     f"（{cost:.1f}s）: {body[:120]}"
                 )
 
+                # 👇 2026-11-26 真机：GLM 返回 429 + 1113「余额不足或无可用资源包」。
+                #    旧代码在这里直接 `return ""` → 备用模型/备用 provider 一次都没试过，
+                #    她只能一直说「看不到图」。现在 429/5xx 一律换下一个模型，
+                #    额度用尽再把整家 provider 拉黑，继续试 VISION_FALLBACK。
+                if r.status_code == 429 or r.status_code >= 500:
+                    _quota = ("1113" in body or "余额" in body
+                              or "insufficient" in low or "quota" in low
+                              or "balance" in low)
+                    if _quota:
+                        provider_dead = True
+                        logger.warning(
+                            f"[VISION] {model} 额度用尽 → 换下一家 provider")
+                    else:
+                        logger.warning(
+                            f"[VISION] {model} 限流/服务端错误（HTTP {r.status_code}）"
+                            f"→ 换下一个模型")
+                    model_missing = True
+                    break
                 if r.status_code == 404 or "model_not_found" in low or "model not exist" in low:
                     model_missing = True
                     break
                 if r.status_code in (401, 403):
-                    logger.error(f"❌ [VISION] {model} key 无权限（HTTP {r.status_code}）")
-                    bad_key = True
+                    logger.error(f"❌ [VISION] {model} key 无权限（HTTP {r.status_code}）"
+                                 f"→ 换下一家 provider")
+                    provider_dead = True
                     break
                 if r.status_code in (400, 413, 422) and kind == "url":
                     logger.info(f"[VISION] {label} 不可用（图片链接拉不到？），改用 base64 重试")
@@ -484,8 +569,11 @@ async def _vl_describe(image_bytes: bytes, prompt: str = DEFAULT_VISION_PROMPT,
                 if r.status_code == 400 and ("1210" in body or "content.type" in low):
                     model_missing = True
                     break
-                logger.error(f"❌ [VISION] 放弃：HTTP {r.status_code}（model={model}）")
-                return ""
+                # 其它 4xx（图片格式/参数）：换下一个组合，不要直接放弃全部
+                logger.warning(
+                    f"[VISION] {model} 请求被拒（HTTP {r.status_code}）→ 换下一个组合")
+                model_missing = True
+                break
             except Exception as e:
                 last_err = f"{type(e).__name__}: {e}"
                 logger.warning(
@@ -496,10 +584,8 @@ async def _vl_describe(image_bytes: bytes, prompt: str = DEFAULT_VISION_PROMPT,
                     continue
                 model_missing = True
                 break
-        if bad_key:
-            break
-        if model_missing:
-            continue
+        if provider_dead:
+            dead_endpoints.add(endpoint)
         if attempts >= VISION_MAX_ATTEMPTS:
             break
 
@@ -575,6 +661,7 @@ async def process_image(bot: Bot, event: MessageEvent, img_url: str = "",
     image_data = await _fetch_image_bytes(bot, event, seg)
     if not image_data:
         logger.error("❌ [VISION] 图片取不到（url / get_image / 本地文件都失败）")
+        _mark_image_result(session_key, event, False)
         return
 
     mime = _sniff_mime(image_data)
@@ -643,8 +730,11 @@ async def process_image(bot: Bot, event: MessageEvent, img_url: str = "",
         desc = await _vl_describe(_vl_data, url="" if _is_gif else img_url)
     if not desc:
         logger.error("❌ [VISION] 识别失败，本次不回复（详见上面的尝试日志）")
+        # 不写 _seen：下次同一张图还会重试（否则 24h 内永远「已处理过但没有描述」）
+        _mark_image_result(session_key, event, False)
         return
     logger.info(f"✅ [VISION] 识别成功: {desc[:60]}")
+    _mark_image_result(session_key, event, True)
 
     # 缓存描述（同图复用 + 给 vision_source 工具用）
     try:
@@ -869,12 +959,28 @@ async def check_passive_image(event: MessageEvent) -> bool:
     _seen = _image_seen.setdefault(session_key, {})
     for _k in [_k for _k, _t in _seen.items() if now - _t > IMAGE_DEDUP_HOURS * 3600]:
         _seen.pop(_k, None)
+    _pend = _image_pending.setdefault(session_key, {})
+    for _k in [_k for _k, _t in _pend.items() if now - _t > 600]:
+        _pend.pop(_k, None)
+
     if _files and all(f in _seen for f in _files):
         _reused = _replay_cached(event, session_key, _files)
+        if _reused:
+            logger.info(
+                f"[VISION] 同一张图 {IMAGE_DEDUP_HOURS:.0f}h 内已处理过"
+                f"（{_files[0][:28]}）→ 不重复识别，已复用上次的描述写回上下文")
+            return False
+        # 标记过但没有描述 = 上次其实没识别成功（GLM 额度用尽之类）
+        # → 清掉标记，允许重新识别（2026-11-26 真机「永远看不到」根因）。
+        for _f in _files:
+            _seen.pop(_f, None)
         logger.info(
-            f"[VISION] 同一张图 {IMAGE_DEDUP_HOURS:.0f}h 内已处理过"
-            f"（{_files[0][:28]}）→ 不重复识别"
-            + ("，已复用上次的描述写回上下文" if _reused else "，但没有缓存描述可用"))
+            f"[VISION] 同一张图标记过但没有描述缓存（上次失败）"
+            f"（{_files[0][:28]}）→ 重新识别")
+
+    # 在途/刚失败：同一张图 2 分钟内不重复触发（避免刷图时并发打爆视觉模型）
+    if _files and any(now - float(_pend.get(_f) or 0) < 120 for _f in _files):
+        logger.debug("[VISION] 同一张图正在识别/刚失败 → 先跳过")
         return False
 
     if now - _last_vision_time[session_key] < VISION_COOLDOWN:
@@ -882,7 +988,7 @@ async def check_passive_image(event: MessageEvent) -> bool:
 
     _last_vision_time[session_key] = now
     for _f in _files:
-        _seen[_f] = now
+        _pend[_f] = now
     return True
 
 passive_vision = on_message(rule=Rule(check_passive_image), priority=5, block=True)

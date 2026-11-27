@@ -38,7 +38,8 @@ except Exception:  # pragma: no cover
 
 ENABLED = os.getenv("PROFILE_MINE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 # 2026-11-24：由 providers 决定（PROFILE_PROVIDER / PROFILE_MODEL）
-from .providers import resolve as _resolve_provider  # noqa: E402
+from .providers import (resolve as _resolve_provider,
+                        call_tokens as _call_tokens)  # noqa: E402
 
 _PROFILE_P = _resolve_provider("profile")
 MODEL = _PROFILE_P["model"]
@@ -204,7 +205,7 @@ async def mine(qq: str, gid: str, *, force: bool = False) -> dict:
             {"role": "user", "content": _build_prompt(name, qq, samples)},
         ],
         "temperature": 0.3,
-        "max_tokens": 500,
+        **_call_tokens("profile", 500),
     }
     try:
         import httpx

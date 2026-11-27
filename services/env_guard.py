@@ -77,6 +77,29 @@ def check() -> list:
             and _env("NODE_COMPUTE", "1") in ("0", "false", "off"):
         warns.append("USE_LOCAL_TTS=1 但 NODE_COMPUTE=0 → 语音会先白等本地 TTS 再降级")
 
+    # 输出 token（2026-11-27 用户真机）：GLM 当主聊天模型时，800 会被 thinking 吃光，
+    # 正文为空；改 .env 以前根本不生效（代码写死 800）。现在读配置，但要在启动时提醒。
+    try:
+        from . import providers
+        p = providers.resolve("roleplay")
+        mt = int(p.get("max_tokens") or 0)
+        cap = int(providers.MAX_OUTPUT_TOKENS.get(p.get("provider"), 0) or 0)
+        _model = str(p.get("model") or "").lower()
+        _reasoning = ("reason" in _model or "think" in _model or "flash" in _model)
+        if ((str(p.get("provider")) == "glm"
+             and _env("GLM_THINKING", "").lower() in ("1", "true", "yes", "on"))
+                or _reasoning) and mt < 4000:
+            warns.append(
+                f"主聊天模型 {p.get('model')} 是推理型/开了 thinking，但输出上限只有 {mt} → "
+                f"thinking 会吃掉正文（用户 2026-11-27 拍板 4000）；"
+                f"设 ROLEPLAY_MAX_TOKENS=4000")
+        if cap and mt >= cap:
+            warns.append(
+                f"ROLEPLAY_MAX_TOKENS={mt} 已到 {p.get('provider')} 上限 {cap}"
+                f"（再大会被 clamp，不会报错）")
+    except Exception:
+        pass
+
     for w in warns:
         logger.warning(f"[ENV] ⚠️ {w}")
     if not warns:

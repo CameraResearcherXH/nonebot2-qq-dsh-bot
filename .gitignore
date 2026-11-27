@@ -59,6 +59,7 @@ scripts/.xray_runtime/
 .idea/
 .vscode/
 .workbuddy/
+/.workbuddy
 .codebuddy/
 
 # ============================================================
@@ -66,3 +67,21 @@ scripts/.xray_runtime/
 # ============================================================
 _deploy/
 _deploy_server/
+
+# ============================================================
+# 根目录调参/笔记噪音（AI 会误读；发行版 make_dist 也排除）
+# ============================================================
+/3a_zh.txt
+/d3.txt
+/e1.txt
+/v1.txt
+/jy.tex
+/help.txt
+/t_*_zh.txt
+/test.py
+
+# 补丁里的二进制快照（源码 diff 在 all.patch / MANIFEST.md）
+patches/*.tar.gz
+
+# 机场订阅（真实 vmess/ss 节点 + UUID，属于凭据）
+/scripts/subscribe.txt

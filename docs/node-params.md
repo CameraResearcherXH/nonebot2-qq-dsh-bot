@@ -91,7 +91,7 @@
 
 | 键 | node.py 默认 | 变量 | 行 |
 |---|---|---|---|
-| `SERVER_IP` | `127.0.0.1` | `SERVER_IP` | 128 |
+| `SERVER_IP` | `YOUR_SERVER_IP` | `SERVER_IP` | 128 |
 | `SERVER_PORT` | `8080` | `SERVER_PORT` | 129 |
 | `TEMP_DIR` | `./local_temp` | `TEMP_DIR` | 133 |
 | `NODE_PROXY` | `—` | `_NODE_PROXY` | 216 |
@@ -164,7 +164,7 @@
 
 | 键 | 默认 | 行 | 归属 |
 |---|---|---|---|
-| `API_SECRET` | my_super_secret_key_123 | 130 | node.env |
+| `API_SECRET` | （必填，和服务器 .env 一致；无默认值） | 130 | node.env |
 | `COVER_KEY_CHECK` | true | 352 | 仅代码默认 |
 | `COVER_PITCH_EXACT` | false | 364 | node.env |
 | `COVER_PITCH_MODE` | rvc | 348 | node.env |
@@ -224,7 +224,7 @@
 | `SD_TIMEOUT` | 600 | 3859 | node.env |
 | `SD_UPSCALER` | 4x-UltraSharp.pth | 3889 | node.env |
 | `SD_WIDTH` | 1024 | 3877 | node.env |
-| `SERVER_IP` | 127.0.0.1 | 128 | 仅代码默认 |
+| `SERVER_IP` | YOUR_SERVER_IP | 128 | 仅代码默认 |
 | `SERVER_PORT` | 8080 | 129 | 仅代码默认 |
 | `TEMP_DIR` | ./local_temp | 133 | 仅代码默认 |
 | `TTS_CMD` | — | 263 | 仅代码默认 |

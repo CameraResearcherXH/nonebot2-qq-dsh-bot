@@ -125,9 +125,21 @@ os.environ['NO_PROXY'] = '*'
 os.environ['HTTP_PROXY'] = ''
 os.environ['HTTPS_PROXY'] = ''
 
-SERVER_IP = os.getenv("SERVER_IP", "127.0.0.1")
+# 2026-11-27 脱敏：仓库里不再写真实服务器地址 / 默认密钥。
+# 算力机在 **node.env** 里配（和服务器 .env 的 API_SECRET 必须一致）：
+#   SERVER_IP=服务器地址
+#   SERVER_PORT=8080
+#   API_SECRET=和服务器一致
+SERVER_IP = os.getenv("SERVER_IP", "").strip()
 SERVER_PORT = os.getenv("SERVER_PORT", "8080")
-API_SECRET = os.getenv("API_SECRET", "my_super_secret_key_123")
+API_SECRET = os.getenv("API_SECRET", "").strip()
+if not SERVER_IP:
+    print("⚠️ node.env 没配 SERVER_IP（要连的服务器地址）——先用 127.0.0.1 兜底，"
+          "连不上就是没配。", flush=True)
+    SERVER_IP = "127.0.0.1"
+if not API_SECRET:
+    print("⚠️ node.env 没配 API_SECRET（要和服务器 .env 的 API_SECRET 一致）"
+          "——服务器会拒绝所有任务。", flush=True)
 BASE_URL = f"http://{SERVER_IP}:{SERVER_PORT}"
 
 TEMP_DIR = Path(os.getenv("TEMP_DIR", "./local_temp"))
@@ -206,8 +218,7 @@ def print_config() -> None:
                   "（Gyan/BtbN 的 full 版），复音素材瞬态会更好", flush=True)
     except Exception:
         pass
-    if API_SECRET == "my_super_secret_key_123":
-        print("⚠️ 用的是默认 secret —— node.env 里的 API_SECRET 可能没被读到", flush=True)
+    # 2026-11-27 脱敏：不再有默认 secret；没配时启动顶部已经提示过。
 
 # 可选加速：把 node.py 的 HTTP 流量走本地代理（机场客户端如 Clash 的混合端口）。
 # node.env 里配 NODE_PROXY=http://127.0.0.1:7897 即生效；留空=直连（默认）。
@@ -239,7 +250,7 @@ DOWNLOAD_TIMEOUT_READ = float(os.getenv("DOWNLOAD_TIMEOUT_READ", "180"))
 NETEASE_UA = os.getenv(
     "NETEASE_UA",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "(KHTML, like Gecko) Chrome/127.0.0.1 Safari/537.36",
 )
 
 

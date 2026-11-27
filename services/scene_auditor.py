@@ -47,7 +47,8 @@ from . import group_scene
 
 ENABLED = os.getenv("SCENE_AUDIT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 # 2026-11-24：审核模型由 providers 决定（AUDIT_PROVIDER / AUDIT_MODEL）
-from .providers import resolve as _resolve_provider  # noqa: E402
+from .providers import (resolve as _resolve_provider,
+                        call_tokens as _call_tokens)  # noqa: E402
 
 _AUDIT_P = _resolve_provider("audit")
 MODEL = _AUDIT_P["model"]
@@ -56,9 +57,10 @@ XAI_API_KEY = _AUDIT_P["api_key"]
 XAI_BASE_URL = _AUDIT_P["base_url"].rstrip("/")
 XAI_MODEL = _AUDIT_P["model"]
 TIMEOUT = tuning.f("SCENE_AUDIT_TIMEOUT")
-# 默认 20 条：用户 2026-11-19 ——「A：英伟达跌了吗」……10 分钟后「B：对啊，都是老黄的锅」，
+# 默认 20 条：用户 2026-11-19 ——「A：新番看了吗」……10 分钟后「B：对啊，都是原作的锅」，
 # 这种中间没人说话的对话，按时间窗拉会拆成两句，审核 LLM 根本没法判断。
 # 所以窗口按**条数**，且不低于 20（.env 里写小了也不生效，只能往大写）。
+# ⚠️ 这里只做「群摘要」；心情/好感不看这段对话，只看她的 [[THINK]]（ADR-038）。
 MAX_MSGS = max(20, tuning.i("SCENE_AUDIT_MAX_MSGS"))
 MIN_INTERVAL = tuning.f("SCENE_AUDIT_MIN_INTERVAL")
 # 审核同时给一段「这段在聊什么」的滚动总结（用户 2026-11-19，像 QQ 元宝总结）
@@ -269,6 +271,16 @@ async def audit_recent(gid: str, *, bot_qq: str = "", bot_name: str = "",
         _LAST_ERROR = "disabled: " + status().replace("\n", " ")
         return 0
 
+    # 2026-11-27 日预算刹车：审核占全天 token 的 ~7%，额度用完就不审
+    # （收发件人标签退化成硬逻辑，聊天本身不受影响）。
+    try:
+        from . import budget_guard as _bg
+        if _bg.state() == "rest":
+            _LAST_SKIP = "今日额度用完（LLM_DAILY_BUDGET）→ 不审"
+            return 0
+    except Exception:
+        pass
+
     now = time.time()
     if not force and now - float(_LAST_AUDIT.get(gid) or 0) < MIN_INTERVAL:
         return 0
@@ -319,7 +331,7 @@ async def audit_recent(gid: str, *, bot_qq: str = "", bot_name: str = "",
             {"role": "user", "content": prompt},
         ],
         "temperature": 0,
-        "max_tokens": 900,
+        **_call_tokens("audit", 900),
         "response_format": {"type": "json_object"},
     }
     headers = {"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"}

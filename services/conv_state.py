@@ -53,7 +53,8 @@ from .config import BOT_MODE, PROXY, XAI_API_KEY, XAI_BASE_URL, XAI_MODEL
 
 ENABLED = os.getenv("CONV_STATE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 # 2026-11-24：由 providers 决定（CONV_STATE_PROVIDER / CONV_STATE_MODEL）
-from .providers import resolve as _resolve_provider  # noqa: E402
+from .providers import (resolve as _resolve_provider,
+                        call_tokens as _call_tokens)  # noqa: E402
 
 _CS_P = _resolve_provider("conv_state")
 MODEL = _CS_P["model"]
@@ -206,7 +207,7 @@ async def update(key: str, lines, force: bool = False) -> bool:
             {"role": "user", "content": prompt},
         ],
         "temperature": 0,
-        "max_tokens": 700,
+        **_call_tokens("conv_state", 700),
         "response_format": {"type": "json_object"},
     }
     headers = {"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"}

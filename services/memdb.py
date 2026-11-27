@@ -38,6 +38,8 @@ PLAN_CAND = tuning.i("RET_PLAN_CAND")
 TAG_TOP = tuning.i("RET_TAG_TOP")
 STRENGTH_GAIN = tuning.f("RET_STRENGTH_GAIN")
 RECENCY_TAU_DAYS = tuning.f("RET_RECENCY_TAU_DAYS")
+# 2026-11-26：超出时间窗但被「高重要/强刻痕」放行的记忆，乘这个系数降权。
+OLD_FACTOR = tuning.f("MEM_OLD_FACTOR")
 # 检索融合：0=加权求和（旧行为）；1=多路 RRF（服务器侧先做，向量路仍留算力机）
 FUSION_RRF = tuning.i("RET_FUSION_RRF")
 RRF_K = max(1.0, tuning.f("RET_RRF_K"))
@@ -55,11 +57,15 @@ TAU_KIND = {
     "bond": tuning.f("MEM_TAU_BOND"),
     "fact": tuning.f("MEM_TAU_FACT"),
     "preference": tuning.f("MEM_TAU_PREFERENCE"),
+    # 2026-11-26 补：impression 是线上真实在写的 kind（MEMO 默认 / 印象 / aura_logic），
+    # 以前没登记 → 落到 TAU_DEFAULT=30，和一次性 event 同寿命。
+    "impression": tuning.f("MEM_TAU_IMPRESSION"),
     "style": tuning.f("MEM_TAU_STYLE"),
 }
 TAU_DEFAULT = tuning.f("MEM_TAU_DEFAULT")
-STYLE_MMR_ENABLED = tuning.i("STYLE_MMR_ENABLED")
-STYLE_MMR_LAMBDA = tuning.f("STYLE_MMR_LAMBDA")
+# ⚠️ 2026-11-27：STYLE_MMR_* 以前在这里也读了一份（给 `style_samples_of` 用）。
+#    那个函数是 `style_vault.samples(diverse=True)` 的**重复实现**（数据源是 sqlite
+#    影子表，从没接线），已删。MMR 的唯一实现留在 services/style_vault.py。
 
 _CJK = re.compile(r"[\u4e00-\u9fa5]")
 _WORD = re.compile(r"[a-zA-Z0-9]+")
@@ -792,20 +798,25 @@ def recall_catalog(query: str, *, offset: int = 0, limit: int = 10,
                  for i, h in enumerate(page)]
         return {"items": items, "total": len(hits), "offset": offset,
                 "has_more": len(hits) > offset + limit, "mode": "relevance"}
-    sql = "SELECT * FROM memories WHERE status='active'"
+    # 2026-11-26 修：以前 `total` 用的是「全库 active 条数」，把 gid / 人 / 时间区间
+    # 三个过滤都丢了 —— 翻某个人的目录时显示的是全库总数，`has_more` 也跟着错。
+    # 现在过滤条件只写一次，select 和 count 共用。
+    conds = ["status='active'"]
     args = []
     if gid:
-        sql += " AND (gid='' OR gid=?)"
+        conds.append("(gid='' OR gid=?)")
         args.append(str(gid))
     if speaker_qq:
-        sql += " AND (about_qq=? OR about_qq='')"
+        conds.append("(about_qq=? OR about_qq='')")
         args.append(str(speaker_qq))
     if time_range:
-        sql += " AND ts>=? AND ts<=?"
+        conds.append("ts>=? AND ts<=?")
         args.extend([float(time_range[0]), float(time_range[1])])
-    sql += " ORDER BY ts DESC LIMIT ? OFFSET ?"
-    args.extend([int(limit), int(offset)])
-    rows = c.execute(sql, args).fetchall()
+    _where = " AND ".join(conds)
+    rows = c.execute(
+        "SELECT * FROM memories WHERE " + _where +
+        " ORDER BY ts DESC LIMIT ? OFFSET ?",
+        args + [int(limit), int(offset)]).fetchall()
     items = [{"no": offset + i + 1,
               "id": r["id"],
               "time_str": time.strftime("%m-%d %H:%M", time.localtime(float(r["ts"] or 0))),
@@ -817,7 +828,8 @@ def recall_catalog(query: str, *, offset: int = 0, limit: int = 10,
               "mood_word": r["mood_word"] or "",
               "salience": float(r["salience"] or 0.0)}
              for i, r in enumerate(rows)]
-    total = c.execute("SELECT count(*) FROM memories WHERE status='active'").fetchone()[0]
+    total = c.execute(
+        "SELECT count(*) FROM memories WHERE " + _where, args).fetchone()[0]
     return {"items": items, "total": total, "offset": offset,
             "has_more": offset + len(items) < total, "mode": "time"}
 
@@ -907,7 +919,12 @@ def recall_planned(query: str = "", *, limit: int = 5, speaker_qq: str = "",
     c = _conn()
     now = time.time()
     q = str(query or "").strip()
-    qset = set(tokenize(q))
+    # 2026-11-26（K2）：查询侧**只用 bigram**。tokenize 会同时产出 bigram 和单字，
+    # 单字（的/了/我）会把覆盖率 bm 抬虚、也让 FTS 命中一堆无关记忆。
+    # 索引侧暂时还留着单字（重建要另开一轮），但查询不再用它。
+    _qt = tokenize(q)
+    _qbig = {t for t in _qt if len(t) >= 2}
+    qset = _qbig or set(_qt)
     qtag = {t for t in qset if len(t) >= 2}
 
     where = ["m.status='active'"]
@@ -915,9 +932,15 @@ def recall_planned(query: str = "", *, limit: int = 5, speaker_qq: str = "",
     if gid:
         where.append("(m.gid='' OR m.gid=?)")
         args.append(str(gid))
+    # 2026-11-26（T1，用户拍板）：超窗记忆**可以**放行，但要付代价。
+    # 以前是 `salience>=0.5` —— 而任何 `emotion_hit` 的记忆 salience 都 ≥0.6，
+    # 等于「带情绪的记忆永远无视时间窗」，「30 天交图书馆」形同虚设。
+    # 现在：门槛提到 0.8（只有极强刻痕），且放行的在打分里 ×MEM_OLD_FACTOR(0.5)。
+    _since = 0.0
     if max_age_days and float(max_age_days) > 0:
-        where.append("(m.ts>=? OR m.importance>=0.8 OR m.salience>=0.5)")
-        args.append(now - float(max_age_days) * 86400)
+        _since = now - float(max_age_days) * 86400
+        where.append("(m.ts>=? OR m.importance>=0.8 OR m.salience>=0.8)")
+        args.append(_since)
     if person_hard and str(speaker_qq).isdigit():
         where.append("(m.about_qq=? OR m.about_qq='')")
         args.append(str(speaker_qq))
@@ -939,7 +962,14 @@ def recall_planned(query: str = "", *, limit: int = 5, speaker_qq: str = "",
     # 角色脑 50ms 目标的主要开销）。MMR 会多取候选，所以给 12×limit 的余量。
     _cand = max(48, min(int(PLAN_CAND or 400), max(1, int(limit)) * 8))
     if qset and _INITED["fts"]:
-        match = " OR ".join(sorted(qset)[:24])
+        # 2026-11-26 修：以前 `sorted(qset)[:24]` 按**码点**截断。
+        # tokenize 同时产出 bigram（「白米」）和单字（「的」「了」），
+        # 按码点排序时单字会排在前面、把真正的关键词挤出 24 个名额 ——
+        # 中文 FTS 于是退化成「最近 N 条」。现在 bigram 优先，单字只在没有 bigram 时兜底。
+        _big = sorted({t for t in qset if len(t) >= 2})
+        _one = sorted({t for t in qset if len(t) < 2})
+        _terms = (_big[:12] if _big else _one[:6])
+        match = " OR ".join(_terms)
         try:
             rows = c.execute(
                 "SELECT m.* FROM memories_fts f JOIN memories m ON m.rowid=f.rowid "
@@ -1014,6 +1044,8 @@ def recall_planned(query: str = "", *, limit: int = 5, speaker_qq: str = "",
                         and float(r["salience"] or 0) < 0.5):
                     continue
             score = 100.0 * fused[i]
+            if _since and float(r["ts"] or 0) < _since:
+                score *= OLD_FACTOR
             if score >= float(min_score):
                 scored.append((score, r))
     else:
@@ -1026,6 +1058,9 @@ def recall_planned(query: str = "", *, limit: int = 5, speaker_qq: str = "",
                 if (float(r["importance"] or 0) < 0.8
                         and float(r["salience"] or 0) < 0.5):
                     continue
+            # 超窗但被放行的 → 降权（T1）
+            if _since and float(r["ts"] or 0) < _since:
+                score *= OLD_FACTOR
             if score >= float(min_score):
                 scored.append((score, r))
     scored.sort(key=lambda x: -x[0])
@@ -1205,54 +1240,6 @@ def add_style_sample(*, qq: str, gid: str = "", text: str,
     return sid
 
 
-def _style_sim(a: dict, b: dict) -> float:
-    """风格样本相似度：字符 bigram Jaccard + 长度桶/语气桶同质惩罚。"""
-    ta = set(tokenize(str((a or {}).get("text") or "")))
-    tb = set(tokenize(str((b or {}).get("text") or "")))
-    jac = (len(ta & tb) / max(1, len(ta | tb))) if (ta or tb) else 0.0
-    la = len(str((a or {}).get("text") or ""))
-    lb = len(str((b or {}).get("text") or ""))
-    same_len = 0.2 if (la <= 8) == (lb <= 8) else 0.0
-    pa = any(ch in str((a or {}).get("text") or "") for ch in "？?！!…")
-    pb = any(ch in str((b or {}).get("text") or "") for ch in "？?！!…")
-    same_punct = 0.1 if pa == pb else 0.0
-    return min(1.0, jac + same_len + same_punct)
-
-
-def style_samples_of(qq: str, *, gid: str = "", limit: int = 3) -> list:
-    """取这个人最像「说话方式」的 N 句：quality + recency，再做 MMR 去重。
-
-    style-white-moon-design §5.3：λ=0.7，避免 3 句都是同一长度/同一语气。
-    """
-    init()
-    lim = max(1, int(limit or 3))
-    cand = max(lim * 4, lim + 8)
-    if gid:
-        rows = _conn().execute(
-            "SELECT * FROM style_samples WHERE qq=? AND gid=? "
-            "ORDER BY quality DESC, ts DESC LIMIT ?",
-            (str(qq or ""), str(gid), cand)).fetchall()
-    else:
-        rows = _conn().execute(
-            "SELECT * FROM style_samples WHERE qq=? "
-            "ORDER BY quality DESC, ts DESC LIMIT ?",
-            (str(qq or ""), cand)).fetchall()
-    items = [dict(r) for r in rows]
-    if not int(STYLE_MMR_ENABLED or 0) or len(items) <= lim:
-        return items[:lim]
-    ts = [float(x.get("ts") or 0) for x in items]
-    t0, t1 = min(ts or [0]), max(ts or [0])
-    span = max(1.0, t1 - t0)
-
-    def _rel(x):
-        rec = (float(x.get("ts") or 0) - t0) / span
-        return 0.7 * float(x.get("quality") or 0.5) + 0.3 * rec
-
-    from . import mmr
-    return mmr.pick(items, lim, relevance=_rel, similarity=_style_sim,
-                    lam=float(STYLE_MMR_LAMBDA or 0.7))
-
-
 def upsert_thread(*, thread_id: str, gid: str, topic: str = "",
                   participants=None, last_ts: float = 0) -> bool:
     tid = str(thread_id or "").strip()
@@ -1270,14 +1257,6 @@ def upsert_thread(*, thread_id: str, gid: str, topic: str = "",
              float(last_ts or time.time())))
         _conn().commit()
     return True
-
-
-def threads_of(gid: str, *, limit: int = 10) -> list:
-    init()
-    rows = _conn().execute(
-        "SELECT * FROM threads WHERE gid=? ORDER BY last_ts DESC LIMIT ?",
-        (str(gid or ""), int(limit or 10))).fetchall()
-    return [dict(r) for r in rows]
 
 
 def resolve_person(name: str) -> str:

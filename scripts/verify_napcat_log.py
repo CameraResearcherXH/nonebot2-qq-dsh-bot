@@ -14,7 +14,7 @@
 
 输出
 ----
-`docs/verification-report-YYYYMMDD.md`：每条断言 = 文档章节 + 日志证据 + PASS/FAIL/SKIP。
+`docs/napcat-log-check-YYYYMMDD.md`：每条断言 = 文档章节 + 日志证据 + PASS/FAIL/SKIP。
 退出码：有 FAIL → 1；否则 0（SKIP 不算失败，代表这次日志没覆盖到）。
 """
 from __future__ import annotations
@@ -72,7 +72,7 @@ def _line_ts(line: str) -> float:
 
 
 def parse_log(text: str, after: str = "") -> dict:
-    d = {"judge": [], "window": [], "skip_rel": [], "fast": [],
+    d = {"judge": [], "window": [], "budget": [], "skip_rel": [], "fast": [],
          "lite_hit": 0, "lite_miss": 0, "rel": [], "out": [],
          "bubbles": [], "recall_slow": []}
     for line in text.splitlines():
@@ -86,6 +86,12 @@ def parse_log(text: str, after: str = "") -> dict:
                 "conf": float(m.group(3)), "v": float(m.group(4)),
                 "P": float(m.group(5)), "line": line.strip(),
                 "ts": _line_ts(line)})
+            continue
+        # 预算不够时「段 N 窗 → 只留 M 窗」是设计行为（P4b），P4 不该再判失败。
+        m = re.search(r"\[MOOD-JUDGE\] (\S+) 段 (\d+) 窗，预算只够 (\d+) 窗", line)
+        if m:
+            d["budget"].append({"key": m.group(1), "total": int(m.group(2)),
+                                "left": int(m.group(3))})
             continue
         m = RE_WINDOW.search(line)
         if m:
@@ -223,13 +229,21 @@ def check_log(d: dict) -> None:
         ok, ev = None, "没有触发快速护栏（没有 @她+强负面）"
     add("M8", "DESIGN §9 红线 1 例外", ok, ev)
 
-    # P4 段内消息不丢：窗数 ≥ ceil(n/8)，且 n ≤ 40×窗数
+    # P4 段内消息不丢：窗数 ≥ ceil(n / MOOD_JUDGE_CTX)，且 n ≤ 40×窗数。
+    # ⚠️ 2026-11-27：以前写死 8，且把「预算只够 N 窗」的截断也算失败。
+    #    预算截断是 P4b 的设计行为（丢最早窗），这里要排除。
     if d["window"]:
-        bad = [w for w in d["window"]
-               if w["wins"] < math.ceil(w["n"] / 8) or w["n"] > 40 * w["wins"]]
+        _size = max(1, tuning.i("MOOD_JUDGE_CTX"))
+        _budget = {(b["key"], b["left"]) for b in d.get("budget", [])}
+        bad = []
+        for w in d["window"]:
+            if (w["key"], w["wins"]) in _budget:
+                continue
+            if w["wins"] < math.ceil(w["n"] / _size) or w["n"] > 40 * w["wins"]:
+                bad.append(w)
         ok = not bad
         ev = (f"{len(d['window'])} 个段；最差 {bad[0]['line'][:120]}" if bad
-              else f"{len(d['window'])} 个段全部覆盖（n/wins 合理）")
+              else f"{len(d['window'])} 个段全部覆盖（窗大小 {_size}，预算截断已排除）")
     else:
         ok, ev = None, "没有分段判读记录"
     add("P4", "causal P4 段内消息不丢", ok, ev)
@@ -246,8 +260,12 @@ def check_log(d: dict) -> None:
         ok, ev = None, "没有超过 2 泡的回复"
     add("O4", "DESIGN §9 红线 1 气泡", ok, ev)
     if d["bubbles"]:
-        ok = max(d["bubbles"]) <= tuning.i("OUT_BUBBLES_MAX")
-        ev = f"最大气泡数 {max(d['bubbles'])}（上限 {tuning.i('OUT_BUBBLES_MAX')}）"
+        # DESIGN §9.1 例外：表情/语音保留不丢，可以多一个泡。
+        # 所以「文字泡 ≤2」在日志里可能是 3（2 文字 + 1 表情/语音），不算失败。
+        _text_cap = tuning.i("OUT_BUBBLES_MAX")
+        ok = max(d["bubbles"]) <= _text_cap + 1
+        ev = (f"最大气泡数 {max(d['bubbles'])}"
+              f"（文字上限 {_text_cap}，+1 给表情/语音例外）")
     else:
         ok, ev = None, "没有 气泡=N 的发送日志"
     add("O5", "DESIGN §9 红线 1 不截断", ok, ev)
@@ -278,8 +296,10 @@ def check_log(d: dict) -> None:
         add("S4b", "retrieval §7 角色脑 ≤50ms", None,
             f"后端={_backend}（50ms 只对 sqlite 生效）")
     elif d["recall_slow"]:
-        add("S4b", "retrieval §7 角色脑 ≤50ms", False,
-            f"{len(d['recall_slow'])} 次超 {d['recall_slow'][0]['target']:.0f}ms")
+        # 50ms 是**目标**不是红线（DESIGN：超了只告警）；这里只统计，不判定失败。
+        add("S4b", "retrieval §7 角色脑 ≤50ms", None,
+            f"{len(d['recall_slow'])} 次超 "
+            f"{d['recall_slow'][0]['target']:.0f}ms（性能观测项，不判定）")
     else:
         add("S4b", "retrieval §7 角色脑 ≤50ms", None,
             "sqlite 下没有超过 50ms 的召回")
@@ -389,6 +409,15 @@ def check_data(data_dir: Path) -> None:
                     row = json.loads(line)
                 except Exception:
                     continue
+                # ⚠️ 2026-11-27：mood_history 里混着旧格式（-100~100）和新格式（-1~1）。
+                # 混着算会把「65.98 → 55.61」当成反向；先按量纲过滤。
+                try:
+                    _v = float(row.get("value") or 0)
+                    _dl = float(row.get("delta") or 0)
+                except Exception:
+                    continue
+                if abs(_v) > 1.5 or abs(_dl) > 1.0:
+                    continue
                 _reason = str(row.get("reason") or "")
                 _sess = str(row.get("session") or "")
                 if _reason == "anchor":
@@ -447,6 +476,10 @@ def check_data(data_dir: Path) -> None:
                 a, b = seg[i - 1], seg[i]
                 if a["imp"] is None or b["imp"] is None or a["imp"] != b["imp"]:
                     continue      # 档位不同，步长本来就不同，不算回升
+                # 2026-11-26 用户拍板：|impact|≥2 会回补 P（MOOD_P_EVENT_BOOST），
+                # 下一步 K 回升、步长变大是设计行为，不算「K 不该回升」。
+                if abs(int(a["imp"])) >= 2:
+                    continue
                 # 两次观测之间夹了锚点 → 锚点会主动抬高 P（ANCHOR_P_ADD），
                 # 下一步 dv 变大是设计行为，不算「K 回升」。
                 if any(a["t"] - 2.0 <= x <= b["t"] + 2.0 for x in _anc):
@@ -557,8 +590,11 @@ def main() -> int:
     check_log(d)
     check_data(Path(args.data_dir))
     report = render_report(ROWS, ", ".join(args.log))
+    # ⚠️ 2026-11-27：默认文件名以前是 `verification-report-YYYYMMDD.md`，
+    #    会和手写的同日期验证报告**互相覆盖**（真踩过：手写报告被脚本盖掉）。
+    #    脚本报告统一叫 `napcat-log-check-YYYYMMDD.md`。
     out = Path(args.out) if args.out else (
-        ROOT / "docs" / f"verification-report-{time.strftime('%Y%m%d')}.md")
+        ROOT / "docs" / f"napcat-log-check-{time.strftime('%Y%m%d')}.md")
     out.write_text(report, encoding="utf-8")
     print(report)
     print(f"\n报告：{out}")

@@ -44,12 +44,17 @@ from __future__ import annotations
 
 import os
 
+from core import tuning
+
 # 角色 → (provider 环境变量前缀, 默认 provider)
 ROLES = {
     "roleplay": ("ROLEPLAY", "deepseek"),
     "judge": ("JUDGE", "deepseek"),
     "audit": ("AUDIT", "deepseek"),
     "vision": ("VISION", "glm"),
+    # 视觉备用 provider：主 provider 额度用尽/限流时自动换这家（默认 qwen）。
+    # 只配 `VISION_FALLBACK_PROVIDER/_MODEL/_BASE_URL/_API_KEY`，不影响主视觉。
+    "vision_fallback": ("VISION_FALLBACK", "qwen"),
     "expression": ("EXPRESSION", "deepseek"),
     "conv_state": ("CONV_STATE", "deepseek"),
     "profile": ("PROFILE", "deepseek"),
@@ -90,6 +95,21 @@ BUILTIN = {
     },
 }
 
+# 各 provider 单次输出上限（超过会被 API 拒绝 / 截断）。
+# 2026-11-27 用户反馈：用 GLM 当主聊天模型时输出被卡在 800，改 .env 也不生效 ——
+# 根因是 llm.py 主循环写死 `max_tokens: 800`，根本没读任何配置。
+MAX_OUTPUT_TOKENS = {
+    "deepseek": 8192,
+    "glm": 4096,
+    "qwen": 8192,
+    "xai": 8192,
+    "openai": 16384,
+    "custom": 8192,
+}
+
+# 新式 OpenAI 推理模型只认 `max_completion_tokens`，传 `max_tokens` 会 400。
+_COMPLETION_FIELD_MODELS = ("o1", "o3", "o4", "gpt-5")
+
 _CACHE: dict = {}
 
 
@@ -120,6 +140,67 @@ def provider_of(role: str) -> str:
     return (_env(f"{prefix}_PROVIDER") or _env("LLM_PROVIDER") or default).lower()
 
 
+def output_limit(role: str, default: int = 0) -> int:
+    """这个角色一次最多能输出多少 token（2026-11-27）。
+
+    优先级（高 → 低）：
+      1) `<ROLE>_MAX_TOKENS`，如 `ROLEPLAY_MAX_TOKENS=4096`；
+      2) `LLM_MAX_TOKENS`（全局覆盖，>0 才生效）；
+      3) provider=glm 时兼容旧的 `GLM_MAX_TOKENS`（用户以前只写这个）；
+      4) 角色默认（roleplay=`ROLEPLAY_MAX_TOKENS`，其它=`LLM_DEFAULT_MAX_TOKENS`）。
+    最后按 provider 上限 clamp（GLM 4096 / DeepSeek 8192 / OpenAI 16384…）。
+    """
+    role = str(role or "").strip().lower()
+    prefix, _ = ROLES.get(role, (role.upper(), "deepseek"))
+    name = provider_of(role)
+
+    val = _env(f"{prefix}_MAX_TOKENS")
+    if not val:
+        _g = int(tuning.i("LLM_MAX_TOKENS") or 0)
+        if _g > 0:
+            val = str(_g)
+    if not val and name == "glm":
+        # 兼容历史：GLM 用户以前只在 .env 写 GLM_MAX_TOKENS
+        val = _env("GLM_MAX_TOKENS")
+    try:
+        n = int(float(val))
+    except Exception:
+        if default:
+            n = int(default)
+        else:
+            n = int(tuning.i("ROLEPLAY_MAX_TOKENS") if role == "roleplay"
+                    else tuning.i("LLM_DEFAULT_MAX_TOKENS"))
+    cap = MAX_OUTPUT_TOKENS.get(name)
+    if cap:
+        n = min(n, cap)
+    return max(64, n)
+
+
+def call_tokens(role: str, wanted: int) -> dict:
+    """单次辅助调用：返回 `{字段名: 实际 max_tokens}`，可直接 `**` 进 payload。
+
+    `wanted` 是模块按任务定的预算（判读 90、审核 900…）。如果这个角色被切到
+    GLM 且开了 thinking，thinking 会先吃 token → 用 `GLM_MAX_TOKENS` 兜底，
+    避免返回空 JSON。其它 provider 原样返回。
+    """
+    p = resolve(role)
+    field = str(p.get("max_tokens_field") or "max_tokens")
+    val = int(wanted)
+    if str(p.get("provider")) == "glm" and str(
+            os.getenv("GLM_THINKING", "")).lower() in ("1", "true", "yes", "on"):
+        val = max(val, int(tuning.i("GLM_MAX_TOKENS")))
+    return {field: max(32, val)}
+
+
+def token_field(name: str, model: str) -> str:
+    """输出 token 的字段名：OpenAI 推理模型用 max_completion_tokens。"""
+    m = str(model or "").lower()
+    if str(name or "").lower() == "openai" and any(
+            m.startswith(p) for p in _COMPLETION_FIELD_MODELS):
+        return "max_completion_tokens"
+    return "max_tokens"
+
+
 def resolve(role: str) -> dict:
     """返回 {provider, base_url, api_key, model}，带进程内缓存。
 
@@ -147,11 +228,16 @@ def resolve(role: str) -> dict:
         key = _env("LLM_API_KEY")
     model = _env(f"{prefix}_MODEL") or sp.get("model") or "deepseek-chat"
 
+    _def = (tuning.i("ROLEPLAY_MAX_TOKENS") if role == "roleplay"
+            else tuning.i("LLM_DEFAULT_MAX_TOKENS"))
     out = {
         "provider": name,
         "base_url": base.rstrip("/"),
         "api_key": key,
         "model": model,
+        # 2026-11-27：输出 token 上限也进注册表，代码里不许再写死 800。
+        "max_tokens": output_limit(role, _def),
+        "max_tokens_field": token_field(name, model),
     }
     _CACHE[role] = out
     return dict(out)

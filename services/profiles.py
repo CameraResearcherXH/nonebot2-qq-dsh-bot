@@ -5,6 +5,10 @@
   bond.json     - 相处经验（"这个人有点闷，别逗太狠"）
   style.json    - 说话方式（"他喜欢发短句子"、"爱用表情"）
 """
+# 2026-11-26：本地 Python 3.8 也要能 import（`list[str]` 在 3.8 会炸）——
+# 和 services/mood.py 同一条约定，方便脱离容器跑 selftest / 数据修复。
+from __future__ import annotations
+
 from core import tuning
 import json
 import math
@@ -491,16 +495,75 @@ def bond_texts(qq: str) -> list[str]:
 
 
 def get_affinity(qq: str) -> float:
-    """好感度 -1.00 ~ +1.00（2026-11-20）。和 intimacy 不同：这是**显式**涨落。"""
+    """好感度 -1.00 ~ +1.00（2026-11-20）。和 intimacy 不同：这是**显式**涨落。
+
+    2026-11-26：`AFF_MODEL=v2` 时改为「bond + 痕迹求和」的读时计算（不落盘）。
+    """
+    if AFF_MODEL == "v2":
+        try:
+            return affinity_now(qq)
+        except Exception:
+            pass
     try:
         return max(-1.0, min(1.0, float(get_profile(str(qq)).get("affinity") or 0.0)))
     except Exception:
         return 0.0
 
 
+# ---- 好感 v1 双吃（2026-11-26 用户拍板）----
+# 旧 v1 只吃 `_delta`（0.10/0.22/0.40 名义步长）：模型说「这事很重」，好感就按满格走，
+# 哪怕她的心情其实只动了 0.02 —— 涨得太快，也和「好感只吃心情涨落」对不上。
+# 现在两项相加（`affinity_v1_step`）：
+#   ① 事件重量项 = AFF_V1_DELTA_K × |delta| × 人设/置信/新鲜度/饱和
+#   ② 实际位移项 = AFF_V1_DV_K × 三段式(dv)      ← 含 |dv|≥0.30 的尾部跳变
+# ①压到 0.25 → 日常不再那么快；②让「她真的被推动了很多」才算数；
+# 尾部（一见钟情 / 心碎）仍能一次跳到 AFF_V1_CAP。
+AFF_V1_DELTA_K = tuning.f("AFF_V1_DELTA_K")
+AFF_V1_DV_K = tuning.f("AFF_V1_DV_K")
+AFF_V1_CAP = tuning.f("AFF_V1_CAP")
+
+
+def affinity_v1_step(delta: float, dv: float, a: float, *,
+                     gain: float = 0.10, trust_speed: float = 1.0,
+                     k_eff: float = 1.0, novelty: float = 1.0) -> float:
+    """v1 单次好感增量（`-AFF_V1_CAP ~ +AFF_V1_CAP`）。
+
+    `delta` —— 事件名义步长（impact 档位查表），代表「这件事有多重」；
+    `dv`    —— `mood.observe` 走出来的实际位移，代表「她真的动了多少」。
+    `dv=0`（`MOOD_UPDATE=delta` 回滚、或本窗没有观测）时只剩事件项。
+    """
+    try:
+        d = float(delta or 0.0)
+    except Exception:
+        d = 0.0
+    try:
+        m = float(dv or 0.0)
+    except Exception:
+        m = 0.0
+    try:
+        cur = max(-1.0, min(1.0, float(a)))
+    except Exception:
+        cur = 0.0
+    sat = max(0.0, 1.0 - abs(cur))
+    # ① 事件重量项：方向跟 delta；负向再乘「越喜欢越宽容」（v1 特有，v2 用 AFF_NEG_BIAS）
+    w_event = (AFF_V1_DELTA_K * abs(d) * max(0.0, float(gain))
+               * max(0.0, float(trust_speed)) * max(0.0, float(novelty))
+               * max(0.0, min(1.0, float(k_eff))) * sat)
+    if d < 0:
+        try:
+            from . import relationship as _rln
+            w_event *= _rln.neg_weight(cur)
+        except Exception:
+            pass
+        w_event = -w_event
+    # ② 实际位移项：三段式（已含负向偏置 / 饱和 / 尾部跳变）
+    w_move = AFF_V1_DV_K * _aff_w_from_dv(m, cur, novelty=novelty)
+    return max(-AFF_V1_CAP, min(AFF_V1_CAP, w_event + w_move))
+
+
 def bump_affinity(qq: str, delta: float, reason: str = "") -> float:
     """
-    好感度涨落（-0.10 ~ +0.10 一次，由心情判读给）。
+    好感度涨落（单次 `±AFF_V1_CAP`，由心情判读给）。
 
     用户 2026-11-20：「心情是全局的，但是对谁安静对谁倾诉……要利用一下我们的
     档案好感值系统。当然那个好感值系统也没有特别详细的涨落。」
@@ -514,7 +577,7 @@ def bump_affinity(qq: str, delta: float, reason: str = "") -> float:
     if not qq.isdigit():
         return 0.0
     try:
-        d = max(-0.10, min(0.10, float(delta)))
+        d = max(-AFF_V1_CAP, min(AFF_V1_CAP, float(delta)))
     except Exception:
         return get_affinity(qq)
     if abs(d) < 1e-9:
@@ -527,8 +590,13 @@ def bump_affinity(qq: str, delta: float, reason: str = "") -> float:
         p["affinity_day"] = _day
         p["affinity_day_sum"] = 0.0
     _used = float(p.get("affinity_day_sum") or 0.0)
-    if _used * d > 0:
-        _room = AFFINITY_DAILY_CAP - abs(_used)
+    # 2026-11-26（外部审计抓到的真 bug）：这里原来是 `_used * d > 0`，
+    # 当天第一件事 `_used=0` → `0*d==0` 不成立 → **完全不受日上限约束**，
+    # 可以一次写满单次上限；写完之后 `_room = 0.15-0.36 = -0.21`，当天同向全部 return。
+    # 真实语义变成「当天第一句话决定全天额度」，和「每天最多 0.15」完全相反。
+    # 改成 `>= 0`：同向（含 _used==0 的第一件事）都走额度；只有反向（回头）不受限。
+    if _used * d >= 0:
+        _room = max(0.0, AFFINITY_DAILY_CAP - abs(_used))
         if _room <= 0:
             return get_affinity(qq)
         if abs(d) > _room:
@@ -566,6 +634,9 @@ def decay_affinity(qq: str, tau_days: float, now: float = 0) -> float:
     if not qq.isdigit():
         return 0.0
     now = float(now or time.time())
+    if AFF_MODEL == "v2":
+        # v2 的衰减由痕迹自己完成，不需要半衰期，也不落盘。
+        return affinity_now(qq, now)
     p = get_profile(qq)
     cur = float(p.get("affinity") or 0.0)
     if abs(cur) < 1e-9:
@@ -581,6 +652,386 @@ def decay_affinity(qq: str, tau_days: float, now: float = 0) -> float:
     p["affinity_at"] = now
     _save("profile", qq, p)
     return p["affinity"]
+
+
+# ============================================================
+# 好感 v2（2026-11-26）：痕迹求和 + 三段式 dv + 巩固 + 分层门槛
+#   设计见 docs/affinity-quantification-design.md（v2.5）
+#   `AFF_MODEL=v1`（默认）时下面这些不生效，完全走上面的旧逻辑。
+#   开关方式：.env 写 AFF_MODEL=v2 后重启。
+# ============================================================
+AFF_MODEL = str(tuning.raw("AFF_MODEL") or "v1").strip().lower()
+AFF_MAX = tuning.f("AFF_MAX")
+AFF_TRACE_T = max(1.0, tuning.f("AFF_TRACE_T"))
+AFF_TRACE_P = tuning.f("AFF_TRACE_P")
+AFF_TRACE_MAX = max(20, tuning.i("AFF_TRACE_MAX"))
+AFF_BOND_MAX = tuning.f("AFF_BOND_MAX")
+AFF_BOND_EXP = tuning.f("AFF_BOND_EXP")
+AFF_BOND_DEEP_MAX = tuning.f("AFF_BOND_DEEP_MAX")
+AFF_BOND_DEEP_EXP = tuning.f("AFF_BOND_DEEP_EXP")
+AFF_DV_K = tuning.f("AFF_DV_K")
+AFF_JUMP_FROM = tuning.f("AFF_JUMP_FROM")
+AFF_JUMP_K = tuning.f("AFF_JUMP_K")
+AFF_JUMP_GAMMA = tuning.f("AFF_JUMP_GAMMA")
+AFF_JUMP_SAT = tuning.f("AFF_JUMP_SAT")
+AFF_TAIL_FROM = tuning.f("AFF_TAIL_FROM")
+AFF_TAIL_BASE = tuning.f("AFF_TAIL_BASE")
+AFF_TAIL_K = tuning.f("AFF_TAIL_K")
+AFF_TAIL_GAMMA = tuning.f("AFF_TAIL_GAMMA")
+AFF_TAIL_SAT = tuning.f("AFF_TAIL_SAT")
+AFF_W_MAX = tuning.f("AFF_W_MAX")
+AFF_GUARD_POS = tuning.f("AFF_GUARD_POS")
+AFF_NEG_BIAS = tuning.f("AFF_NEG_BIAS")
+AFF_SAT_POS = tuning.f("AFF_SAT_POS")
+AFF_SAT_NEG = tuning.f("AFF_SAT_NEG")
+AFF_PEAK_DV = tuning.f("AFF_PEAK_DV")
+AFF_LOVE_DV = tuning.f("AFF_LOVE_DV")
+AFF_WARM_FULL = max(0.01, tuning.f("AFF_WARM_FULL"))
+AFF_PEAK_BONUS = tuning.f("AFF_PEAK_BONUS")
+AFF_HURT_GRUDGE = tuning.f("AFF_HURT_GRUDGE")
+AFF_CONS_FROM = tuning.f("AFF_CONS_FROM")
+AFF_CONS_TO = max(AFF_CONS_FROM + 0.01, tuning.f("AFF_CONS_TO"))
+AFF_CONS_K = tuning.f("AFF_CONS_K")
+AFF_TIER_SOFT = tuning.f("AFF_TIER_SOFT")
+AFF_COMP_W = tuning.f("AFF_COMP_W")
+AFF_COMP_CAP = max(0.01, tuning.f("AFF_COMP_CAP"))
+
+# 分层门槛：(门槛, 名字, 条件)；条件全部来自 dv 统计量（无名词判断）
+AFF_TIERS = (
+    (0.15, "眼熟", {"days": 7}),
+    (0.30, "熟人", {"days": 14}),
+    (0.45, "朋友", {"days": 60, "notes": 10}),
+    (0.60, "很好", {"days": 120, "notes": 20}),
+    (0.75, "暧昧", {"days": 180, "peaks": 3}),
+    (0.85, "爱", {"days": 240, "peaks": 5}),
+    (0.95, "唯一的爱", {"days": 365, "peaks": 8, "repairs": 1}),
+)
+
+
+def _aff_clamp(v: float) -> float:
+    return max(-1.0, min(AFF_MAX, float(v)))
+
+
+def _aff_traces(p: dict) -> list:
+    out = []
+    for x in (p.get("aff_traces") or []):
+        try:
+            out.append((float(x[0]), float(x[1])))
+        except Exception:
+            continue
+    return out
+
+
+def _aff_value(p: dict, now: float) -> float:
+    """a = bond + Σ w·(1+Δt/T)^-p。"""
+    s = 0.0
+    for t, w in _aff_traces(p):
+        dt = max(0.0, now - t) / 86400.0
+        s += w * (1.0 + dt / AFF_TRACE_T) ** (-AFF_TRACE_P)
+    return _aff_clamp(float(p.get("aff_bond") or 0.0) + s)
+
+
+def _aff_investment(qq: str, p: dict, now: float) -> tuple:
+    """浅层投入 I / 认识天数 / 记录条数。"""
+    notes = (get_bond(qq).get("notes") or [])
+    n = len(notes)
+    cands = [float(x.get("at") or 0) for x in notes]
+    for x in (p.get("affinity_log") or []):
+        try:
+            cands.append(float(x.get("at") or 0))
+        except Exception:
+            continue
+    for k in ("affinity_at", "first_at", "updated_at"):
+        try:
+            cands.append(float(p.get(k) or 0))
+        except Exception:
+            continue
+    ts = [x for x in cands if x > 0]
+    first = min(ts) if ts else now
+    days = max(0.0, (now - first) / 86400.0)
+    log = [x for x in (p.get("affinity_log") or []) if isinstance(x, dict)]
+    n7 = sum(1 for x in log if now - float(x.get("at") or 0) <= 7 * 86400)
+    inv = (0.50 * min(1.0, n / 20.0)
+           + 0.30 * min(1.0, days / 120.0)
+           + 0.20 * min(1.0, n7 / 150.0))
+    return inv, days, n
+
+
+def _aff_deep(p: dict) -> float:
+    peaks = int(p.get("aff_peaks") or 0)
+    repairs = int(p.get("aff_repairs") or 0)
+    warm = int(p.get("aff_warm_days") or 0)
+    return (0.50 * min(1.0, peaks / 10.0)
+            + 0.30 * min(1.0, repairs / 3.0)
+            + 0.20 * min(1.0, warm / 60.0))
+
+
+def _aff_bond_max(inv: float, inv_deep: float) -> float:
+    return (AFF_BOND_MAX * (max(0.0, inv) ** AFF_BOND_EXP)
+            + AFF_BOND_DEEP_MAX * (max(0.0, inv_deep) ** AFF_BOND_DEEP_EXP))
+
+
+def _aff_warmth7(p: dict, now: float) -> float:
+    s = 0.0
+    for x in (p.get("aff_dv_log") or []):
+        try:
+            t, dv = float(x[0]), float(x[1])
+        except Exception:
+            continue
+        if dv > 0 and now - t <= 7 * 86400:
+            s += dv
+    return s
+
+
+def _aff_w_from_dv(dv: float, a: float, *, novelty: float = 1.0) -> float:
+    """三段式：日常线性 / 显著凸性 / 尾部跳变（见文档 §2.4）。
+
+    **不再乘 confidence**：`dv` 是 `mood.observe` 走出来的实际位移，
+    里面已经含了 K（K 含 confidence）。再乘一遍就是同一个因素算两次
+    （2026-11-26 审计自己踩到的坑）。
+    """
+    x = abs(float(dv))
+    if x < 1e-9:
+        return 0.0
+    if x >= AFF_TAIL_FROM:
+        gain = AFF_TAIL_BASE + AFF_TAIL_K * (x ** AFF_TAIL_GAMMA)
+        sat = AFF_TAIL_SAT
+    elif x >= AFF_JUMP_FROM:
+        gain = AFF_JUMP_K * (x ** AFF_JUMP_GAMMA)
+        sat = AFF_JUMP_SAT
+    else:
+        gain = AFF_DV_K * x
+        sat = (AFF_SAT_NEG if (dv > 0 and a < 0)
+               else (AFF_SAT_POS if dv > 0 else AFF_SAT_NEG))
+    gain *= max(0.0, float(novelty))
+    if dv < 0:
+        w = -gain * AFF_NEG_BIAS * (1.0 - abs(a)) ** sat
+    else:
+        if a < 0 and x >= AFF_JUMP_FROM:
+            gain *= AFF_GUARD_POS
+        w = gain * (1.0 - abs(a)) ** sat
+    return max(-AFF_W_MAX, min(AFF_W_MAX, w))
+
+
+def _aff_kappa(a: float, warmth7: float) -> float:
+    if a <= AFF_CONS_FROM:
+        return 0.0
+    ka = AFF_CONS_K * max(0.0, min(1.0, (a - AFF_CONS_FROM)
+                                 / (AFF_CONS_TO - AFF_CONS_FROM)))
+    kw = max(0.0, min(1.0, warmth7 / AFF_WARM_FULL))
+    return ka * kw
+
+
+def _aff_add_trace(traces: list, now: float, w: float) -> list:
+    """按天聚合；超上限按权重裁最弱（不能按最近 N 条，长尾会被砍）。"""
+    if abs(w) < 1e-9:
+        return traces
+    day = int(now // 86400)
+    if traces and int(traces[-1][0] // 86400) == day:
+        t0, w0 = traces[-1]
+        traces[-1] = (t0, w0 + w)
+    else:
+        traces.append((now, w))
+    if len(traces) > AFF_TRACE_MAX:
+        traces.sort(key=lambda x: -abs(x[1]))
+        traces = sorted(traces[:AFF_TRACE_MAX], key=lambda x: x[0])
+    return traces
+
+
+def _aff_tier_cap(days: float, notes: float, peaks: float,
+                  repairs: float) -> float:
+    have = {"days": days, "notes": notes, "peaks": peaks, "repairs": repairs}
+    prev = 0.10
+    for th, _name, need in AFF_TIERS:
+        for k, v in need.items():
+            if have.get(k, 0) < v:
+                return prev + AFF_TIER_SOFT
+        prev = th
+    return AFF_MAX
+
+
+def _aff_ensure(p: dict, now: float) -> dict:
+    """旧档案迁移：没有 aff_traces 时，用当前 affinity 初始化一条痕迹。
+
+    之后只前进、不回算 —— 用户看不到跳变（设计文档 §5.1）。
+    """
+    if "aff_traces" in p:
+        return p
+    cur = float(p.get("affinity") or 0.0)
+    if abs(cur) < 1e-9:
+        return p
+    # 2026-11-26 修：痕迹时间必须用 **now**，不能用 affinity_at。
+    # 用 affinity_at（上次事件时间）会让旧档案一迁移就按「已经过了 30 天」衰减：
+    # 0.90 → 0.45、0.60 → 0.19，直接腰斩，违反「迁移不跳变」（文档 §5.1）。
+    p["aff_traces"] = [[now, round(cur, 5)]]
+    p["aff_bond"] = 0.0
+    # 2026-11-26：旧档案没有 peaks 记录，按当前好感**反推**（0.9 → 9 次心动）。
+    # 否则门槛按 peaks=0 算，老用户会被卡在 0.32，涨不上去（好感「冻住」）。
+    p["aff_peaks"] = min(10, max(0, int(round(abs(cur) * 10))))
+    p["aff_hurts"] = max(0, int(round(max(0.0, -cur) * 10)))
+    p.setdefault("aff_repairs", 0)
+    p.setdefault("aff_warm_days",
+                 min(60, max(0, int(round(abs(cur) * 60)))))
+    try:
+        _save("profile", str(p.get("qq") or ""), p)
+    except Exception:
+        pass
+    return p
+
+
+def affinity_now(qq: str, now: float = 0) -> float:
+    """v2 读：bond + 痕迹衰减（不落盘，迁移除外）。"""
+    qq = str(qq or "").strip()
+    if not qq.isdigit():
+        return 0.0
+    now = float(now or time.time())
+    return _aff_value(_aff_ensure(get_profile(qq), now), now)
+
+
+def add_affinity_event(qq: str, dv: float, reason: str = "", *,
+                       conf: float = 1.0, novelty: float = 1.0) -> float:
+    """v2 写：吃一条「归因到这个人的心情位移 dv」。
+
+    dv 是 mood.observe 的实际位移（-0.35~+0.35），不是 impact 档位。
+    `conf` 参数保留只为调用方兼容，**不参与计算**（dv 已含 K/置信）。
+    """
+    qq = str(qq or "").strip()
+    if not qq.isdigit():
+        return 0.0
+    try:
+        dv = float(dv)
+    except Exception:
+        return get_affinity(qq)
+    if abs(dv) < 1e-9:
+        return get_affinity(qq)
+    now = time.time()
+    p = _aff_ensure(get_profile(qq), now)
+    a_old = _aff_value(p, now)
+    w = _aff_w_from_dv(dv, a_old, novelty=novelty)
+    if abs(w) < 1e-9:
+        return a_old
+    # ---- 巩固：只对正向事件；高区 + 最近暖 → 一部分沉淀进 bond ----
+    # 负向全部留在 traces（会衰减），不能沉淀成底子——否则「伤害」变成永久记忆。
+    k = 0.0
+    if dv > 0:
+        k = _aff_kappa(a_old, _aff_warmth7(p, now))
+        if abs(dv) >= AFF_PEAK_DV:
+            k = min(0.85, k + AFF_PEAK_BONUS)
+        if dv >= AFF_LOVE_DV:
+            k = max(k, 0.5)
+    traces = _aff_add_trace(_aff_traces(p), now, w * (1.0 - k))
+    # ---- 统计量（全部来自 dv，无名词）----
+    peaks = int(p.get("aff_peaks") or 0)
+    hurts = int(p.get("aff_hurts") or 0)
+    repairs = int(p.get("aff_repairs") or 0)
+    warm_days = int(p.get("aff_warm_days") or 0)
+    if abs(dv) >= AFF_PEAK_DV:
+        peaks += 1
+        if dv >= AFF_LOVE_DV:
+            peaks += 1
+        if dv < 0:
+            hurts += 1
+            p["aff_hurt_at"] = now
+            p["aff_grudge"] = round(min(1.0, float(p.get("aff_grudge") or 0.0)
+                                       + AFF_HURT_GRUDGE), 4)
+        p["aff_peak_last"] = now
+    if dv > 0:
+        if int(p.get("aff_warm_day") or 0) != int(now // 86400):
+            warm_days += 1
+            p["aff_warm_day"] = int(now // 86400)
+        hurt_at = float(p.get("aff_hurt_at") or 0.0)
+        if hurt_at > 0 and now - hurt_at <= 7 * 86400:
+            repairs += 1
+            p["aff_hurt_at"] = 0.0
+    inv, days, n = _aff_investment(qq, p, now)
+    bm = _aff_bond_max(inv, _aff_deep({
+        "aff_peaks": peaks, "aff_repairs": repairs,
+        "aff_warm_days": warm_days}))
+    old_bond = float(p.get("aff_bond") or 0.0)
+    bond = old_bond + w * k
+    if bond > bm:
+        # bond 只增不减：上限变低（比如投入统计口径变了）也不能把存量压掉
+        bond = max(old_bond, bm)
+    # ---- 门槛：只封上涨、不回溯 ----
+    a_new = _aff_clamp(bond + sum(
+        wv * (1.0 + max(0.0, now - t) / 86400.0 / AFF_TRACE_T) ** (-AFF_TRACE_P)
+        for t, wv in traces))
+    cap = _aff_tier_cap(days, n, peaks, repairs)
+    if a_new > cap and a_new > a_old and traces:
+        excess = a_new - max(a_old, cap)
+        t0, w0 = traces[-1]
+        traces[-1] = (t0, w0 - excess)
+        a_new = _aff_clamp(a_new - excess)
+    # ---- 落盘 ----
+    dvl = [x for x in (p.get("aff_dv_log") or [])
+           if isinstance(x, list) and now - float(x[0] or 0) <= 14 * 86400]
+    dvl.append([now, round(dv, 4)])
+    p["aff_dv_log"] = dvl[-400:]
+    p["aff_traces"] = [[round(t, 1), round(wv, 5)] for t, wv in traces]
+    p["aff_bond"] = round(max(0.0, bond), 4)
+    p["aff_peaks"] = peaks
+    p["aff_hurts"] = hurts
+    p["aff_repairs"] = repairs
+    p["aff_warm_days"] = warm_days
+    p["affinity"] = round(a_new, 3)
+    p["affinity_at"] = now
+    hist = p.get("affinity_log") or []
+    hist.append({"at": now, "delta": round(w, 4), "to": round(a_new, 3),
+                 "why": str(reason or "")[:40], "dv": round(dv, 4)})
+    p["affinity_log"] = hist[-50:]
+    _save("profile", qq, p)
+    try:
+        from . import memdb
+        memdb.upsert_profile(qq=qq,
+                             name=str(p.get("name") or p.get("call_name") or ""),
+                             affinity=a_new)
+    except Exception:
+        pass
+    logger.info(f"[AFFv2] {qq} dv={dv:+.3f} w={w:+.3f} κ={k:.2f} "
+                f"bond={bond:.2f} a={a_new:+.3f} peaks={peaks} repairs={repairs}")
+    return a_new
+
+
+def add_affinity_comp(qq: str, reason: str = "陪伴") -> float:
+    """v2：中性陪伴（这一轮没走出 dv）的小额痕迹，天花板 AFF_COMP_CAP。
+
+    和 add_affinity_event 的区别：没有心情涨落，只是「在场」。
+    由调用方控制频次（每人每天 ≤ 6 次），这里只负责记一条。
+    """
+    qq = str(qq or "").strip()
+    if not qq.isdigit():
+        return 0.0
+    now = time.time()
+    p = _aff_ensure(get_profile(qq), now)
+    a_old = _aff_value(p, now)
+    room = max(0.0, (AFF_COMP_CAP - max(0.0, a_old)) / AFF_COMP_CAP)
+    w = AFF_COMP_W * (1.0 - abs(a_old)) ** 0.5 * room
+    if w < 1e-9:
+        return a_old
+    traces = _aff_add_trace(_aff_traces(p), now, w)
+    inv, days, n = _aff_investment(qq, p, now)
+    bond = min(float(p.get("aff_bond") or 0.0), _aff_bond_max(inv, _aff_deep(p)))
+    a_new = _aff_clamp(bond + sum(
+        wv * (1.0 + max(0.0, now - t) / 86400.0 / AFF_TRACE_T) ** (-AFF_TRACE_P)
+        for t, wv in traces))
+    # 2026-11-26 修：陪伴通道也要过门槛，否则新号靠每天闲聊就能刷到 0.8，
+    # 分层门槛对「只陪伴」形同虚设（事件通道本来就有这道 cap）。
+    cap = _aff_tier_cap(days, n, int(p.get("aff_peaks") or 0),
+                        int(p.get("aff_repairs") or 0))
+    if a_new > cap and a_new > a_old and traces:
+        excess = a_new - max(a_old, cap)
+        t0, w0 = traces[-1]
+        traces[-1] = (t0, w0 - excess)
+        a_new = _aff_clamp(a_new - excess)
+    p["aff_traces"] = [[round(t, 1), round(wv, 5)] for t, wv in traces]
+    p["affinity"] = round(a_new, 3)
+    p["affinity_at"] = now
+    hist = p.get("affinity_log") or []
+    hist.append({"at": now, "delta": round(w, 4), "to": round(a_new, 3),
+                 "why": str(reason or "")[:40], "dv": 0.0})
+    p["affinity_log"] = hist[-50:]
+    _save("profile", qq, p)
+    return a_new
 
 
 # 好感「走势」窗口（秒）：默认 30 分钟。

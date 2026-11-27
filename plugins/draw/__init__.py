@@ -208,7 +208,7 @@ async def _fetch_image(seg: MessageSegment, path: Path) -> bool:
         return False
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                      "(KHTML, like Gecko) Chrome/127.0.0.1 Safari/537.36",
         "Accept": "*/*",
     }
     try:

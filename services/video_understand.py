@@ -20,7 +20,7 @@ from nonebot import logger
 
 BILI_PLAYER_API = "https://api.bilibili.com/x/player/v2"
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+       "(KHTML, like Gecko) Chrome/127.0.0.1 Safari/537.36")
 _REFERER = "https://www.bilibili.com/"
 _BV_RE = re.compile(r"(BV[0-9A-Za-z]{10})")
 _SHORT_RE = re.compile(r"https?://b23\.tv/[0-9A-Za-z]+")

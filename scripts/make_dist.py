@@ -36,6 +36,9 @@ EXCLUDE_DIRS = {
     "patches",
     # 私人人格卡：发行仓只放通用模板（personality.example.txt）
     "Personality",
+    # 2026-11-27（服务器上生成发行版时发现）：模型权重 712MB，
+    # GitHub 单文件 100MB 上限会直接拒；绝不能进发行仓。
+    "loras",
 }
 EXCLUDE_FILES = {
     # node.py 现在随发行仓提供（算力机客户端）；node.env 只生成 .example
@@ -43,11 +46,13 @@ EXCLUDE_FILES = {
     "test.py", "jy.tex", "help.txt",
     # NapCat 登录二维码（私人）
     "napcat_login_qr.png",
+    # 机场订阅（base64 里是真实的 vmess/ss 节点 + UUID，属于凭据，绝不能发）
+    "subscribe.txt",
     # 与本项目无关的私人笔记 / 抓取的第三方文档
     "3a_zh.txt", "d3.txt", "e1.txt", "v1.txt",
     "t_api_zh.txt", "t_hdr_zh.txt", "t_iqtuning_zh.txt",
 }
-EXCLUDE_GLOBS = ("*.working", "*.bak", "*.old", "*.orig", "*.log", "*.pyc",
+EXCLUDE_GLOBS = ("*.working", "*.bak*", "*.old", "*.orig", "*.log", "*.pyc",
                  ".env.*", "docs/review-*.md",
                  "scripts/_*.py",
                  "scripts/xray_proxy.py")
@@ -91,6 +96,11 @@ def _num_placeholder(num: str) -> str:
 
 def is_excluded(rel: Path) -> bool:
     parts = rel.parts
+    # 服务器上的本地备份目录（backup_xxx_MMDD，含 tar/旧代码）一律不进发行仓。
+    # ⚠️ 不能用 EXCLUDE_GLOBS 的 "backup_*"：pathlib 的 match 是从右边锚定的，
+    #    "backup_x/before.tar" 匹配不到 "backup_*"（2026-11-27 真机踩到）。
+    if parts and parts[0].startswith("backup_"):
+        return True
     for i, p in enumerate(parts):
         if p not in EXCLUDE_DIRS:
             continue
@@ -154,7 +164,23 @@ def env_secret_values() -> list:
 
 
 # 私人服务器地址：发行仓统一换成 127.0.0.1
-PRIVATE_HOSTS = ("127.0.0.1",)
+# 2026-11-27 脱敏：仓库里不再写真实 IP（源码里也不留）。两种来源：
+#   ① 环境变量补（域名之类正则抓不到的）：DIST_PRIVATE_HOSTS=a.example.com,b.example.com
+#   ② 公网 IPv4 自动抓（下面 _IPV4）：127./10./192.168./172.16-31 这些私网地址保留
+PRIVATE_HOSTS = tuple(
+    h.strip() for h in os.getenv("DIST_PRIVATE_HOSTS", "").split(",") if h.strip()
+)
+
+_IPV4 = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}"
+                   r"(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
+
+
+def _is_private_ip(ip: str) -> bool:
+    if ip.startswith(("127.", "10.", "192.168.")):
+        return True
+    if re.match(r"^172\.(1[6-9]|2\d|3[01])\.", ip):
+        return True
+    return ip in ("0.0.0.0", "255.255.255.255", "1.2.3.4", "8.8.8.8")
 
 
 # 群友昵称：文档/注释/测试里出现过的真实群友称呼，统一换成通用占位名
@@ -202,8 +228,15 @@ def redact_hosts(dest: Path) -> list:
         new = text
         for h in PRIVATE_HOSTS:
             if h in new:
-                hits.append((p.relative_to(dest).as_posix(), "私人服务器 IP", "[REDACTED]"))
+                hits.append((p.relative_to(dest).as_posix(), "私人服务器地址", "[REDACTED]"))
                 new = new.replace(h, "127.0.0.1")
+        # 公网 IPv4 一律换掉（源码/文档/生成的 node.env.example 都可能带出来）
+        for _m in list(_IPV4.finditer(new)):
+            _ip = _m.group(0)
+            if _is_private_ip(_ip):
+                continue
+            hits.append((p.relative_to(dest).as_posix(), "公网 IP", "[REDACTED]"))
+            new = new.replace(_ip, "127.0.0.1")
         if new != text:
             try:
                 p.write_text(new, encoding="utf-8")

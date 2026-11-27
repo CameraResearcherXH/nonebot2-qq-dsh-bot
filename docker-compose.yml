@@ -48,6 +48,9 @@ services:
       #   · check_mounts 要读 docker-compose.yml（镜像里那份是旧的，会误报缺挂载）
       - ./docs:/app/docs
       - ./docker-compose.yml:/app/docker-compose.yml:ro
+      # ⚠️ 2026-11-26：清单也要挂。它以前**不在挂载里**，容器里读到的是镜像里那份旧清单
+      #   （52 条），`verify_deploy` 会报「52 个文件 / 一致 0」—— 2026-11-26 排查时被它误导过两次。
+      - ./deploy_manifest.txt:/app/deploy_manifest.txt:ro
 
   # ============================================================
   # RSSHub（已移除，2026-11-13）

@@ -140,6 +140,26 @@ python scripts/eval_replay.py judge --set data/eval/position_replay_out.jsonl \
 python scripts/position_report.py
 ```
 
+---
+
+## 8. 2026-11-27 新增：意图层（need_reply）离线评测
+
+`ATMO_GATE` 默认 0（关）。**要开闸门前**必须跑一次，准确率 ≥85% 且正例召回 ≥85%：
+
+```bash
+# 不花钱，先确认脚本/解析/打分本身没问题
+sudo docker compose exec -T bot python scripts/eval_intent.py --mock
+
+# 真模型：用当天 trace 重放（--neg-per-trace 1 约 200 条样本，成本很低）
+sudo docker compose exec -T bot python scripts/eval_intent.py \
+  --trace data/llm_trace/2026-11-27.jsonl --limit 200 --neg-per-trace 1 \
+  --concurrency 8 --out data/eval/intent_1127.jsonl
+```
+
+看三行就够：`准确率` / `正例召回` / `精确率`；判错样本会列出来，**先人工看是不是弱标签噪音**
+（正文点名「鱼宝/大肥鱼」但那一轮她没回，这种 label 本身就不对）。
+2026-11-27 首轮：192 条 → 96.9% / 100% / 94.8%（6 条误报里 4 条是标签噪音）。
+
 > 位置评测要先把证据撑到接近线上预算（5×~240 字）；90 字的上下文太短，
 > 头/中/尾几乎测不出差异。
 >

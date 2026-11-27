@@ -166,6 +166,11 @@ def t_memory():
 
     tmp = Path(tempfile.mkdtemp(prefix="regress_mem_"))
     old = (MV.MEM_DIR, MV.BLOCK_DIR, MV.INDEX_FILE)
+    # 2026-11-26：这个用例测的是 **json 回滚路径**（index.json / 原子写 / 目录不计命中）。
+    # 线上默认 MEMORY_BACKEND=sqlite，json 索引根本不会写 → 以前 3 条断言全红。
+    # sqlite 路径由 scripts/check_memory_dual.py 覆盖，别在这里混着测。
+    old_backend = MV.BACKEND
+    MV.BACKEND = "json"
     try:
         MV.MEM_DIR = tmp
         MV.BLOCK_DIR = tmp / "blocks"
@@ -224,6 +229,7 @@ def t_memory():
               f"strong={got.get('strong60')} neutral={got.get('neutral60')}")
     finally:
         MV.MEM_DIR, MV.BLOCK_DIR, MV.INDEX_FILE = old
+        MV.BACKEND = old_backend
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -367,10 +373,17 @@ def t_protocol():
     import services.llm as L
 
     static = L._behaviour_protocol("group_1", is_group=True, has_ctx=True, dynamic=False)
-    for i in ["00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11"]:
-        check(f"固定区仍有 ▍{i}", f"▍{i}" in static)
+    # 2026-11-26：协议小节改成「编号 + 名字」，且 02b/02c/02d/07 已删
+    # （由硬逻辑/post_rules 兜底）。所以不再逐个断言 00~11 都存在 ——
+    # 那样每删一节测试就红一次。改成断言「必须有的」+「必须没有的」。
+    for sec in ("▍00 工具", "▍01 长度", "▍02 接话", "▍05 称呼",
+                "▍06 记忆", "▍06b 心里话", "▍06c 心情", "▍09 底线", "▍10 人称"):
+        check(f"固定区仍有 {sec}", sec in static)
+    check("群聊固定区有 ▍04 叫人", "▍04 叫人" in static)
+    check("固定区不含已删的 ▍07", "▍07" not in static)
     check("固定区不含 ▍12（缓存优化）", "▍12" not in static)
     check("固定区不含 ▍13（缓存优化）", "▍13" not in static)
+    check("协议头声明「编号小的优先」", "编号小的优先" in static)
 
     # 私聊：04 群里怎么叫人 不该出现（旧行为）
     priv = L._behaviour_protocol("private_1", is_group=False, has_ctx=False, dynamic=False)
@@ -459,8 +472,10 @@ def t_pure_funcs():
     check("@ 解析：重名不猜（旧行为）", resolve_member("不存在", by, set()) == "")
 
     src = (ROOT / "plugins" / "chat" / "__init__.py").read_text(encoding="utf-8")
+    # 2026-11-26：「@她」和「引用回复她」拆成 _at_me()/_quote_me()，两种写法都认
     check("@ 纯问候不再一刀切（新行为）",
-          "SKIP_PURE_GREETING and not event.is_tome()" in src)
+          ("SKIP_PURE_GREETING and not _at_me(event)" in src
+           or "SKIP_PURE_GREETING and not event.is_tome()" in src))
     check("私聊仍不受纯问候限制（旧行为）", "PRIVATE_SLEEP" in src)
 
 

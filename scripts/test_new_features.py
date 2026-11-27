@@ -1294,6 +1294,370 @@ try:
 except Exception as _e:
     check("ENV 可导入", False, f"{type(_e).__name__}: {_e}")
 
+# ---- 好感 v2（AFF_MODEL=v2）：迁移 / 三段式 / 门槛 / 陪伴 ----
+try:
+    from services import profiles as _pf
+    _aff_dir = _tmp / "profiles"
+    _aff_dir.mkdir(exist_ok=True)
+    _pf.PROFILE_DIR = _aff_dir
+    _pf.AFF_MODEL = "v2"
+
+    def _seed(qq, **kw):
+        d = {"qq": qq, "affinity": 0.0}
+        d.update(kw)
+        _pf._save("profile", qq, d)
+
+    # 1) 迁移不跳变（旧档案没有 aff_traces，用当前 affinity 初始化）
+    for _i, (_a, _d) in enumerate([(0.90, 30), (0.60, 90), (0.30, 200)]):
+        _qq = "9000%d" % _i
+        _seed(_qq, affinity=_a, affinity_at=time.time() - 86400 * _d)
+        _got = _pf.affinity_now(_qq)
+        check("AFF：迁移不跳变 %.2f/%d天" % (_a, _d), abs(_got - _a) < 0.02,
+              "%.3f" % _got)
+
+    # 2) 三段式权重（日常 / 尾部）
+    _w1 = _pf._aff_w_from_dv(0.35, 0.0)
+    check("AFF：一见钟情 w≈0.362", abs(_w1 - 0.362) < 0.01, "%.3f" % _w1)
+    _w2 = _pf._aff_w_from_dv(-0.35, 0.90)
+    check("AFF：心碎 w≈-0.410", abs(_w2 + 0.410) < 0.01, "%.3f" % _w2)
+
+    # 3) 新号事件被门槛卡在 0.12
+    _qq = "90010"
+    _pf.add_affinity_event(_qq, 0.35)
+    _a3 = _pf.affinity_now(_qq)
+    check("AFF：新号 +0.35 被门槛卡 0.12", abs(_a3 - 0.12) < 0.02, "%.3f" % _a3)
+
+    # 4) 陪伴不能绕过门槛（60 次中性陪伴）
+    _qq = "90011"
+    for _ in range(60):
+        _pf.add_affinity_comp(_qq)
+    _a4 = _pf.affinity_now(_qq)
+    check("AFF：陪伴不能绕过门槛", _a4 <= 0.14, "%.3f" % _a4)
+
+    # 5) 心碎：a=0.90 一次 -0.35 → 约 -0.41
+    _qq = "90012"
+    _seed(_qq, aff_bond=0.78, affinity=0.90,
+          aff_traces=[[time.time(), 0.12]],
+          aff_peaks=5, aff_repairs=1, aff_warm_days=60,
+          affinity_at=time.time() - 86400 * 300,
+          affinity_log=[{"at": time.time() - 86400 * 300}])
+    _b = _pf.affinity_now(_qq)
+    _a5 = _pf.add_affinity_event(_qq, -0.35)
+    check("AFF：a=0.90 心碎 Δ≈-0.41", abs((_a5 - _b) + 0.41) < 0.02,
+          "%+.3f" % (_a5 - _b))
+
+    # 6) dv=0 不写
+    _qq = "90013"
+    check("AFF：dv=0 不写", _pf.add_affinity_event(_qq, 0.0) == 0.0)
+except Exception as _e:
+    check("AFF v2 可跑", False, f"{type(_e).__name__}: {_e}")
+
+# ---- 好感 v1 双吃（ADR-043）+ 锚点权重（ADR-042）----
+try:
+    from services import profiles as _pf3, mood as _mg3, mood_judge as _mj3
+    _pf3.AFF_MODEL = "v1"
+    _we = _pf3.affinity_v1_step(0.40, 0.0, 0.30)
+    _wm = _pf3.affinity_v1_step(0.0, 0.09, 0.30)
+    check("AFFv1：delta 项 > 0", _we > 0, "%+.4f" % _we)
+    check("AFFv1：dv 项 > 0（Δ=0 也吃）", _wm > 0, "%+.4f" % _wm)
+    # 尾部必须落在「dv 项天花板 = DV_K × AFF_W_MAX」附近（不是随便 >0.10 就算过）
+    _reach = _pf3.AFF_V1_DV_K * _pf3.AFF_W_MAX
+    _wt = _pf3.affinity_v1_step(0.40, 0.35, 0.0)
+    check("AFFv1：一见钟情 ≈ DV_K×AFF_W_MAX",
+          abs(_wt - _reach) < 0.02, "%+.4f（天花板 %.3f）" % (_wt, _reach))
+    _wh = _pf3.affinity_v1_step(-0.40, -0.35, 0.0)
+    check("AFFv1：心碎 ≈ -(DV_K×AFF_W_MAX)",
+          abs(_wh + _reach) < 0.02, "%+.4f" % _wh)
+    # 单次上限不能是「恒不触发」的死护栏（ADR-028 刚批过这种常量）
+    check("AFFv1：单次上限不是死护栏",
+          _pf3.AFF_V1_CAP <= _reach * 1.3 + 1e-9,
+          "CAP %.3f vs 可达 %.3f" % (_pf3.AFF_V1_CAP, _reach))
+    _wc = _pf3.affinity_v1_step(1.0, 0.35, 0.0)
+    check("AFFv1：单次上限 AFF_V1_CAP 生效",
+          abs(_wc) <= _pf3.AFF_V1_CAP + 1e-9, "%+.4f" % _wc)
+
+    # 日上限必须管住「当天第一件事」（旧 `_used*d > 0` 在 _used==0 时整条跳过）
+    _q = "90099"
+    _pf3._save("profile", _q, {"qq": _q, "affinity": 0.0})
+    _b1 = _pf3.bump_affinity(_q, 0.36, reason="t")
+    check("AFFv1：日上限管住当天第一件事", abs(_b1) <= 0.151, "%+.3f" % _b1)
+    _b2 = _pf3.bump_affinity(_q, 0.36, reason="t")
+    check("AFFv1：当天额度用完同向不再涨",
+          abs(_b2 - _b1) < 1e-6, "%+.3f → %+.3f" % (_b1, _b2))
+
+    _mv = _mg3._anchor_rec({"value": 0.0}, 2, 1.0, 0.0,
+                           gain=_mg3.ANCHOR_WEIGHT)
+    check("锚点：每窗权重 W=0.45（单次 ≤0.20）", abs(_mv - 0.20) < 1e-6,
+          "%+.3f" % _mv)
+    _mv2 = _mg3._anchor_rec({"value": 0.0}, 2, 1.0, 0.0,
+                            gain=_mg3.ANCHOR_GAIN)
+    check("锚点：独立锚点仍用 gain=0.25", abs(_mv2 - 0.175) < 1e-6,
+          "%+.3f" % _mv2)
+    # P 回补「只补不降」：P0=0.25 > CAP=0.20 时，±2 不能把 P 调低
+    check("P 回补只补不降（P0 > CAP）",
+          abs(_mg3.event_p_boost(0.25, 2) - 0.25) < 1e-9,
+          "%.3f" % _mg3.event_p_boost(0.25, 2))
+    check("P 回补仍会从地板抬起",
+          abs(_mg3.event_p_boost(0.005, 2) - 0.055) < 1e-9,
+          "%.3f" % _mg3.event_p_boost(0.005, 2))
+    _pr = _mj3._build_prompt("", "她心里有点亮", ["a → 你：在吗"])
+    check("判读 prompt：anchor_level 必填",
+          "anchor_level" in _pr and "必填" in _pr,
+          _pr[_pr.find("anchor_level"):][:60])
+
+    # 2026-11-27（外部审计）：锚点死区改成软死区 —— 边界必须连续，小抖动可忽略
+    _a_in = _mg3._anchor_rec({"value": 20.01}, 1, 1.0, 0.0,
+                             gain=_mg3.ANCHOR_WEIGHT)
+    _a_out = _mg3._anchor_rec({"value": 20.0}, 1, 1.0, 0.0,
+                              gain=_mg3.ANCHOR_WEIGHT)
+    check("锚点软死区：边界连续（0.149 vs 0.151 差 <0.005）",
+          abs(abs(_a_in) - abs(_a_out)) < 0.005,
+          "%.4f vs %.4f" % (_a_in, _a_out))
+    _a_tiny = _mg3._anchor_rec({"value": 34.0}, 1, 1.0, 0.0,
+                               gain=_mg3.ANCHOR_WEIGHT)
+    check("锚点软死区：小抖动可忽略（diff=0.01 → <0.002）",
+          abs(_a_tiny) < 0.002, "%+.4f" % _a_tiny)
+
+    # 2026-11-27（外部审计）：±3 一天最多一次，落到代码计数
+    _old_mf = _mg3.MOOD_FILE
+    _mg3.MOOD_FILE = _tmp / "mood_cap.json"
+    _mg3.MOOD_FILE.write_text('{"global": {"value": 0.0}, "sessions": {}}',
+                              encoding="utf-8")
+    check("±3 当日第一次生效", _mg3.cap_daily_impact("group_cap", 3) == 3)
+    check("±3 当日第二次降为 ±2", _mg3.cap_daily_impact("group_cap", 3) == 2)
+    check("±3 计数按会话隔离", _mg3.cap_daily_impact("group_cap2", 3) == 3)
+    check("±2 不受日限", _mg3.cap_daily_impact("group_cap", 2) == 2)
+    _mg3.MOOD_FILE = _old_mf
+except Exception as _e:
+    check("AFFv1 / 锚点可跑", False, f"{type(_e).__name__}: {_e}")
+
+# ---- 2026-11-27：long_doc 证据 6000 / 图书馆 3000 真接线 ----
+try:
+    from services import prompt_builder as _pb3, long_doc as _ld3, ctx_budget as _cb3
+    check("long_doc 证据预算 6000 字符",
+          _cb3.limit_chars("long_doc_evidence") == 6000,
+          str(_cb3.limit_chars("long_doc_evidence")))
+    check("long_doc 图书馆预算 3000 字符",
+          _cb3.limit_chars("long_doc_library") == 3000,
+          str(_cb3.limit_chars("long_doc_library")))
+    _hits3 = [{"summary": "s%d" % i, "ago": "3天前",
+               "text_full": ("长文证据%d-" % i) * 900} for i in range(1, 5)]
+    _pk_long = _pb3.build_packet(session_key="group_ld", user_text="详细讲讲这本书",
+                                 hits=_hits3, memory_limit=8, total_budget=12000,
+                                 long_doc=True, record=False)
+    _pk_short = _pb3.build_packet(session_key="group_ld", user_text="在吗",
+                                  hits=_hits3, memory_limit=8, total_budget=0,
+                                  long_doc=False, record=False)
+    _lm = len(str(_pk_long.get("memory_index") or ""))
+    _sm = len(str(_pk_short.get("memory_index") or ""))
+    check("long_doc 记忆块 > 500 字且 ≤6000", 500 < _lm <= 6000, str(_lm))
+    check("long_doc 带正文而不是 40 字目录",
+          "长文证据" in str(_pk_long.get("memory_index") or ""),
+          str(_pk_long.get("memory_index") or "")[:30])
+    check("常态记忆块仍是短目录（≤520）", _sm <= 520, str(_sm))
+except Exception as _e:
+    check("long_doc 接线可跑", False, f"{type(_e).__name__}: {_e}")
+
+# ---- 节流不该丢 THINK（2026-11-26 用户实测：她每句都写，是 cd 隔离了）----
+_old_cwd = os.getcwd()
+os.chdir(_tmp)
+os.environ["MOOD_FILE"] = str(_tmp / "mood_thinkq.json")
+os.environ["MOOD_THINK_FILE"] = str(_tmp / "think_thinkq.json")
+os.environ["MOOD_JUDGE_TRACE"] = "0"
+try:
+    import asyncio as _aio4
+    from services import mood_judge as _mj4
+
+    _seen = []
+
+    async def _fake_j(words, ctx=None, **kw):
+        _seen.append(kw.get("think") or "")
+        return {"ok": True, "word": "x", "desirability": 1, "cared": 2,
+                "impact": 1, "anchor_level": 0, "cause": "speaker",
+                "confidence": 0.8, "why": "w", "mind": "m", "src": "s",
+                "at": time.time(), "relation_relevance": 0.8,
+                "relation_trust": 0, "relation_respect": 0}
+
+    _mj4.judge = _fake_j
+    _mj4.MIN_INTERVAL = 60
+    _mj4.REFRESH = 0
+    _aio4.run(_mj4.judge_and_store("g_q", "", ["a"], think="第一句心里话",
+                                   addressed=True))
+    _r2 = _aio4.run(_mj4.judge_and_store("g_q", "", ["a"], think="第二句心里话",
+                                         addressed=True))
+    check("节流时 THINK 不丢（进队列）",
+          _mj4.pending_think_count("g_q") == 1,
+          f"pending={_mj4.pending_think_count('g_q')} err={_r2.get('err')}")
+    _mj4._LAST_AT["g_q"] = time.time() - 999
+    _aio4.run(_mj4.judge_and_store("g_q", "", ["a"], think="第三句心里话",
+                                   addressed=True))
+    _merged = _seen[-1] if _seen else ""
+    check("下次判读把攒着的 THINK 一起判",
+          "第二句心里话" in _merged and "第三句心里话" in _merged,
+          _merged[:60])
+    check("已判过的 THINK 不重复判", "第一句心里话" not in _merged, _merged[:60])
+
+    _mj4.MIN_INTERVAL = 0
+    _mj4.note_think("g_q2", "落盘的那句心里话")
+    _aio4.run(_mj4.judge_and_store("g_q2", "", ["a"], addressed=True))
+    check("调用方没传 think 时，用落盘的新 THINK",
+          "落盘的那句心里话" in (_seen[-1] if _seen else ""),
+          (_seen[-1] if _seen else "")[:60])
+except Exception as _e:
+    check("THINK 队列可跑", False, f"{type(_e).__name__}: {_e}")
+finally:
+    os.environ.pop("MOOD_JUDGE_TRACE", None)
+    os.chdir(_old_cwd)
+
+# ---- 接话前「读气氛」（2026-11-26 用户要求：群友在哭，别忽然哈哈哈）----
+try:
+    from services import atmosphere as _atmo
+
+    _d = {"mood": "压抑", "who": "月下橘", "feel": "难过，像在哭",
+          "others": "在斗图刷屏，没人接她", "tip": "先安慰她，别用哈哈哈开头"}
+    _blk = _atmo.render(_d, n=8)
+    check("气氛块带整体/谁在难过/接话注意",
+          "压抑" in _blk and "月下橘" in _blk and "别用哈哈哈" in _blk,
+          _blk[:90])
+    check("气氛解析吃 markdown 代码块",
+          (_atmo._parse('```json\n{"mood":"低落","who":"甲"}\n```') or {}).get("mood")
+          == "低落")
+    check("气氛解析拒绝空对象", _atmo._parse("{}") == {})
+except Exception as _e:
+    check("读气氛可跑", False, f"{type(_e).__name__}: {_e}")
+
+# ---- rag_search 兜底解析（2026-11-26：smart-query 卡 >70s）----
+try:
+    from services import agent_client as _ac
+
+    _raw = {
+        "success": True,
+        "output": (
+            "找到 2 个相关片段:\n\n"
+            "**片段 1** (来源: /app/documents/x.txt)\n"
+            "\"\\u5c0f\\u660e \\u6e29\\u5ba4\\u6548\\u5e94\"\n\n"
+            "**片段 2** (来源: /app/documents/467.json)\n"
+            "\"{\\\"title\\\":\\\"x\\\",\\\"author\\\":\\\"y\\\","
+            "\\\"paragraphs\\\":[\\\"z\\\"]}\""
+        ),
+    }
+    _fs = _ac._rag_tool_facts(_raw)
+    check("rag_search 结果能还原中文", any("小明" in x for x in _fs), str(_fs))
+    check("rag_search 过滤宋词 JSON",
+          bool(_fs) and all("paragraphs" not in x for x in _fs), str(_fs))
+    check("rag_search 失败返回空", _ac._rag_tool_facts({"success": False}) == [])
+except ModuleNotFoundError as _e:
+    # 本机（IDE）没有 aiohttp/nonebot；容器里会真的跑上面三条。
+    check("rag_search 解析（跳过：本机缺依赖）", True, str(_e))
+except Exception as _e:
+    check("rag_search 解析可跑", False, f"{type(_e).__name__}: {_e}")
+
+# ---- 输出 token 可配置（2026-11-27 用户真机：GLM 主模型被卡 800）----
+try:
+    from services import providers as _pv
+
+    _pv.reset()
+    os.environ["ROLEPLAY_MAX_TOKENS"] = "2048"
+    _pv.reset()
+    check("输出 token 读 ROLEPLAY_MAX_TOKENS",
+          _pv.resolve("roleplay")["max_tokens"] == 2048,
+          str(_pv.resolve("roleplay")))
+    os.environ["ROLEPLAY_MAX_TOKENS"] = "99999"
+    _pv.reset()
+    check("输出 token 按 provider 上限 clamp",
+          _pv.resolve("roleplay")["max_tokens"] <= 8192,
+          str(_pv.resolve("roleplay")))
+    os.environ.pop("ROLEPLAY_MAX_TOKENS", None)
+    os.environ["ROLEPLAY_PROVIDER"] = "glm"
+    os.environ["GLM_MAX_TOKENS"] = "2048"
+    os.environ.setdefault("GLM_API_KEY", "test-key")
+    _pv.reset()
+    check("GLM 主模型兼容旧的 GLM_MAX_TOKENS",
+          _pv.resolve("roleplay")["max_tokens"] == 2048,
+          str(_pv.resolve("roleplay")))
+    check("OpenAI 推理模型用 max_completion_tokens",
+          _pv.token_field("openai", "o1-mini") == "max_completion_tokens")
+    os.environ.pop("ROLEPLAY_PROVIDER", None)
+    os.environ.pop("GLM_MAX_TOKENS", None)
+    _pv.reset()
+except Exception as _e:
+    check("输出 token 可配置", False, f"{type(_e).__name__}: {_e}")
+
+# ---- 个人档案库（C 方案：30 天以前、本地、只她自己能查）----
+try:
+    from services import archive as _ar
+
+    _tmp_arc = Path(tempfile.mkdtemp()) / "arc.db"
+    _ar.DB_PATH = _tmp_arc
+    _ar._INITED["ok"] = False
+    try:
+        _ar._LOCAL.conn.close()
+    except Exception:
+        pass
+    _ar._LOCAL.conn = None
+    _now = time.time()
+    _ar.add(gid="g1", qq="1001", who="阿明", ts=_now - 40 * 86400,
+            text="阿明说奶奶住院了，他很担心")
+    _ar.add(gid="g1", qq="1002", who="小红", ts=_now - 5 * 86400,
+            text="小红昨天说新番很好看")
+    _ar.add(gid="g1", qq="1001", who="阿明", ts=_now - 40 * 86400,
+            text="阿明说奶奶住院了，他很担心")
+    _h = _ar.recall("奶奶 住院", gid="g1", limit=4)
+    check("档案库：只回 30 天以前",
+          len(_h) == 1 and "奶奶" in _h[0]["text"], str(_h))
+    check("档案库：重复写入只留一条", _ar.stats()["count"] == 2, str(_ar.stats()))
+    check("档案库：近期的不进档案",
+          all("新番" not in x["text"] for x in _ar.recall("新番", gid="g1")))
+    check("档案库：渲染块带时间/人",
+          "阿明" in _ar.render(_h) and "天前" in _ar.render(_h), _ar.render(_h))
+except Exception as _e:
+    check("个人档案库可跑", False, f"{type(_e).__name__}: {_e}")
+
+# ---- relevance 低不能挡心情（2026-11-27 外部审计，真问题）----
+try:
+    import asyncio as _aio5
+    from services import mood as _mg5, mood_judge as _mj5
+
+    os.environ["MOOD_FILE"] = str(_tmp / "mood_rel.json")
+    os.environ["MOOD_JUDGE_TRACE"] = "0"
+
+    async def _fake_rel(words, ctx=None, **kw):
+        return {"ok": True, "word": "空落落", "desirability": 2, "cared": 2,
+                "impact": 2, "anchor_level": 1, "cause": "self",
+                "confidence": 0.85, "why": "想起以前", "mind": "有点空",
+                "src": "", "at": time.time(), "relation_relevance": 0.0,
+                "relation_trust": 0, "relation_respect": 0}
+
+    _mj5.judge = _fake_rel
+    _mj5.MIN_INTERVAL = 0
+    _mj5.REFRESH = 0
+    _before = float(_mg5.get_mood("g_rel").get("value") or 0)
+    _aio5.run(_mj5.judge_and_store(
+        "g_rel", "", ["a"], think="想起以前有点空", addressed=True))
+    _after = float(_mg5.get_mood("g_rel").get("value") or 0)
+    check("relevance 低也照常更新心情（只挡好感/记忆）",
+          abs(_after - _before) > 1e-6,
+          f"{_before:+.2f} -> {_after:+.2f}")
+except Exception as _e:
+    check("relevance 低也更新心情", False, f"{type(_e).__name__}: {_e}")
+finally:
+    os.environ.pop("MOOD_JUDGE_TRACE", None)
+
+# ---- 引用互刷护栏（2026-11-26 真机：月下橘 45s 内引用她 4 次）----
+try:
+    from services import quote_guard as _qg
+
+    _qg.reset()
+    _g = "g_loop_test_1126"
+    _hits = [_qg.hit(_g, "10001", "20002") for _ in range(3)]
+    check("同一对 120s 内引用 3 次 → 触发反循环",
+          _hits[:2] == [False, False] and _hits[2] is True, str(_hits))
+    check("触发后进入冷却，继续不接",
+          _qg.hit(_g, "10001", "20002") is True)
+    check("不同的一对不受影响", _qg.hit(_g, "10001", "30003") is False)
+except Exception as _e:
+    check("引用互刷护栏可跑", False, f"{type(_e).__name__}: {_e}")
+
 print("PASS %d / FAIL %d" % (len(PASS), len(FAIL)))
 if FAIL:
     print("失败：" + "、".join(FAIL))

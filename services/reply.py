@@ -44,7 +44,7 @@ async def reply_with_multimodal(bot: Bot, event: MessageEvent, text: str, is_que
             try:
                 logger.info(f"[MULTI] 尝试下载图片: {url}")
                 timeout = aiohttp.ClientTimeout(total=10.0)
-                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.1 Safari/537.36"}
                 async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
                     async with session.get(url) as resp:
                         if resp.status == 200:

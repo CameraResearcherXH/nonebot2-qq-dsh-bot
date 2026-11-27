@@ -19,16 +19,16 @@
 
 | 目录 | 上游 | 许可证 | 修改 | 状态 |
 |---|---|---|---|---|
-| `bittorrents` | https://github.com/NightDust981989/nonebot-plugin-BitTorrents | 见上游 | 否 | 
-| `girls_2d` | https://github.com/zhuhiki/nonebot-plugin-2dgirls | 见目录 LICENSE | 否 | 
-| `gspanel` | https://github.com/monsterxcn/nonebot-plugin-gspanel | 见上游  | 否 | 
-| `jinriyunshi` | https://github.com/Doya16/NoneBot-QQbot-jinriyunshi | 见上游 | 否 | 
-| `nonebot_plugin_rollpig_plus` | https://github.com/Felis2026/nonebot-plugin-rollpig-plus | 见上游 | 否 | 
+| `bittorrents` | https://github.com/NightDust981989/nonebot-plugin-BitTorrents | 见上游 | 否 | 上游已确认，许可证待核对 |
+| `girls_2d` | https://github.com/zhuhiki/nonebot-plugin-2dgirls | 见目录 LICENSE | 否 | 上游已确认 |
+| `gspanel` | 待人工确认 | 未声明 | 否 | ⚠️ 待核对 |
+| `jinriyunshi` | 待人工确认 | 未声明 | 否 | ⚠️ 待核对 |
+| `nonebot_plugin_rollpig_plus` | https://github.com/Felis2026/nonebot-plugin-rollpig-plus | 见上游 | 否 | 上游已确认，许可证待核对 |
 | `petpet` | https://github.com/MeetWq/nonebot-plugin-petpet | MIT | 否 | ✅ 已确认 |
 | `picsearch` | 本项目自建（薄封装，调用 `vendor/PicImageSearch`） | 与本项目一致 | — | ✅ 自建 |
-| `pixivrank_search` | https://github.com/HibiKier/nonebot_plugin_pixivrank_search | 见上游 | 否 | 
-| `steam_judger` | https://github.com/Duogeyu/nonebot_steam_judger | 见上游 | 否 |
-| `VideoZoomer_master` | https://github.com/zsgvivo/VideoZoomer | 见目录 LICENSE / Notice.txt | 否 | 
+| `pixivrank_search` | https://github.com/HibiKier/nonebot_plugin_pixivrank_search | 见上游 | 否 | 上游已确认，许可证待核对 |
+| `steam_judger` | https://github.com/Duogeyu/nonebot_steam_judger | 见上游 | 否 | 上游已确认，许可证待核对 |
+| `VideoZoomer_master` | 待人工确认（volce） | 见目录 LICENSE / Notice.txt | 否 | ⚠️ 待核对 |
 
 ## 清单：`vendor/`
 

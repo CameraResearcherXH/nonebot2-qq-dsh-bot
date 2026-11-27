@@ -94,17 +94,20 @@ def _write_turn_metrics(session_key: str, stages: dict, cost: float) -> None:
 
 # 每一步的小标题（≤30 字，用户 2026-11-24：每块要有清晰总结，方便检查）
 SUMMARY = {
+    "气氛": "谁在难过 · 整体氛围 · 接话注意",
     "称呼": "固定区已给，这里再钉一句",
     "状态": "心情值 · 当前状态 · 那件事的心理",
     "档案": "称呼 · 身份 · 好感 · 印象最深的事",
     "总结": "判读模型：这句在接哪句、到底在说什么",
     "记忆": "按这句话检索到的旧事",
-    "图书馆": "久远归档，人称仅供参考",
+    "档案库": "30 天以前的旧事（只她自己能查）",
+    "图书馆": "外部语料/书，人称仅供参考",
     "已回": "这条回过没有，别回第二遍",
     "白月光": "借他习惯的说话方式，不做他",
 }
 # 打印顺序（也是 /测函数 流水线 的顺序）
-STAGE_ORDER = ("称呼", "状态", "档案", "总结", "记忆", "图书馆", "已回", "白月光")
+STAGE_ORDER = ("气氛", "称呼", "状态", "档案", "总结", "记忆", "档案库",
+               "图书馆", "已回", "白月光")
 # 单独一个块标题：/看模板 里一眼能认出「这是流水线取回来的数据」，
 # 而不是混在人格/规矩/历史里找（用户 2026-11-24）。
 PIPE_HEADER = "▍PIPELINE｜回复前动态取数（优先参考，别复述块名；某步失败只丢那步）"
@@ -119,6 +122,10 @@ def _hdr(name: str) -> str:
 _LIB_QUESTION_HINTS = (
     "记得", "之前", "上次", "以前", "曾经", "说过", "还记得", "那件事", "后来",
     "是不是", "有没有", "为什么", "为啥", "谁说的", "多少钱",
+    # 2026-11-26：**明确的时间回溯词**也算（结构信号，不是猜语义）。
+    # 本地角色脑只管近 30 天，提到这些词就该去翻归档。
+    "上周", "上上周", "上个星期", "上个月", "去年", "前天", "大前天", "昨天",
+    "那次", "当年", "小时候",
 )
 
 
@@ -190,12 +197,41 @@ async def build(
         stages[name] = f"×{type(e).__name__}"
         logger.debug(f"[PIPE] {name} 失败：{type(e).__name__}: {e}")
 
+    # ---------- ⓪ 读气氛（接话前先知道谁在难过；和 ①~③ 并行） ----------
+    # 用户 2026-11-26：「群友气氛很压抑，有个人在哭，他忽然进来哈哈哈的」。
+    # 所以每次接话前先读最近 8 句标签语，拿到「谁在难过 / 整体氛围 / 接话注意」。
+    # ⚠️ 只作提示，不改心情/好感；心情唯一来源仍是她的 THINK。
+    _atmo = None
+    _atmo_task = None
+    _atmo_timeout = 4.0
+    _atmo_msgs = 8
+    _intent: dict = {}
+    if gid:
+        try:
+            from . import atmosphere as _atmo
+            _atmo_timeout = float(_atmo.TIMEOUT)
+            _atmo_msgs = int(_atmo.MSGS)
+            if _atmo.enabled():
+                # 2026-11-27：① 把「当前这句」也给它（否则 need_reply 判的是
+                # 历史最后一句，不是她要回的那条）；② 把 replied_mids 传下去，
+                # 8 行历史里才会出现〔已回〕。
+                _atmo_task = asyncio.create_task(
+                    _atmo.read(gid, exclude_mids=seg_mids,
+                               replied_mids=replied_mids,
+                               text=str(text or "")))
+        except Exception as e:
+            logger.debug(f"[PIPE] 气氛启动失败: {type(e).__name__}: {e}")
+
     # ---------- ① 称呼（固定区已经给了，这里补一句硬约定） ----------
     try:
         from . import callname
-        _c = callname.render(speaker_qq, gid, speaker_name)
+        _c = callname.render(speaker_qq, gid, speaker_name).strip()
+        # callname.render 自带「▍你俩的称呼」标题；再套一层 _hdr 就是两个标题
+        # （真机 17:54 的 prompt 抓到）。去掉它那一行，保留流水线的块标题。
+        if _c.startswith("▍"):
+            _c = "\n".join(_c.splitlines()[1:]).strip()
         if _c:
-            blocks.append(_hdr("称呼") + "\n" + _c.strip())
+            blocks.append(_hdr("称呼") + "\n" + _c)
             stages["称呼"] = "✓"
         else:
             stages["称呼"] = "—"
@@ -295,6 +331,22 @@ async def build(
     except Exception as e:
         fail("档案", e)
 
+    # 收「气氛」：它从 ⓪ 就发出去了，和 ①②③ 并行；这里只等结果（最多 ATMO_TIMEOUT）。
+    # 放在 blocks 最前面：接话前先读气氛，别等正文写完才想起来「刚才有人在哭」。
+    if _atmo_task is not None:
+        try:
+            _at = await _step(
+                "气氛", _atmo_task,
+                min(_atmo_timeout, left()), default={}) or {}
+            if _at:
+                _intent = dict(_at)
+                blocks.insert(0, _atmo.render(_at, n=_atmo_msgs))
+                stages["气氛"] = "✓"
+            else:
+                stages["气氛"] = "—"
+        except Exception as e:
+            fail("气氛", e)
+
     # ---------- ④ 总结 + 图书馆：并行启动 ----------
     summary = ""
     # ⚠️ 2026-11-24：图片/视频的 text 里带着完整视觉报告（[图片识别结果]…），
@@ -310,12 +362,21 @@ async def build(
     # 图书馆（RAG v3）实测 5~14s：串在总结后面就必然超时（以前写死 2.5s，
     # 结果「图书馆=0」10/10）。这里先发出去，跟总结/记忆并行，最后再收。
     _lib_task = None
+    # 意图层给的检索词（2026-11-27）：它比「总结」更贴最后一句要问的东西。
+    _qs: dict = {}
+    try:
+        if _atmo is not None and _intent:
+            _qs = _atmo.queries_of(_intent)
+    except Exception:
+        _qs = {}
     try:
         from . import agent_client as _ac0
-        _lib_seed = (f"{speaker_name or '对方'} 图片" if _is_media
-                     else _txt_s.strip()[:120])
+        _lib_seed = (_qs.get("library")
+                     or (f"{speaker_name or '对方'} 图片" if _is_media
+                         else _txt_s.strip()[:120]))
         # 只对「像在问事/提旧事」的消息查图书馆；纯插科打诨不花这 5~14s。
-        if _want_library(_lib_seed):
+        # 意图层明确给了 library 检索词 → 也算「在问事」。
+        if _want_library(_lib_seed) or _qs.get("library"):
             from . import config as _cfg
             if _cfg.power_on("library"):
                 _lib_task = asyncio.create_task(
@@ -359,23 +420,41 @@ async def build(
 
     # 总结失败就用原话当检索词；媒体消息不要拿整段视觉报告去检索，
     # 否则记忆/图书馆块里又会出现画面细节。
+    # 2026-11-27：意图层给了 memory 检索词就优先用它（它只留关键词，
+    # 不会被「这句在接哪句」的整句总结稀释）。
     if _is_media:
         query = f"{speaker_name or '对方'} 图片"
     else:
-        query = summary or str(text or "")[:120]
+        query = _qs.get("memory") or summary or str(text or "")[:120]
 
     # ---------- ⑤⑥ 记忆 + 图书馆（并行，互不等待） ----------
     async def _mem_stage():
         try:
-            from . import memory_v2
+            from . import memory_v2, long_doc as _ld
+            # 2026-11-27（外部审计）：流水线是线上真正的取数入口，以前它不知道
+            # long_doc → staged 路径上「证据 6000 / 3 篇 × 1900」永远不生效。
+            _long = bool(_ld.is_long_doc(text))
             _hits = await _step(
                 "记忆",
-                asyncio.to_thread(memory_v2.recall, query, limit=4,
+                asyncio.to_thread(memory_v2.recall, query,
+                                  limit=(_ld.EVIDENCE if _long else 4),
                                   speaker_qq=speaker_qq, gid=gid),
                 min(3.0, left()), default=[]) or []
             if not _hits:
                 stages["记忆"] = "0"
                 return ""
+            if _long:
+                _parts = []
+                for i, h in enumerate(_hits[: max(1, int(_ld.PIECES or 3))], 1):
+                    _body = str(h.get("text_full") or h.get("text")
+                                or h.get("summary") or "").strip()
+                    _body = _body[: max(1, int(_ld.PIECE_CHARS or 1900))]
+                    _parts.append(f"【证据 {i}】{str(h.get('ago') or '')}\n{_body}")
+                _blob = _hdr("长答证据（正文，可直接引用，别编）") + "\n" + "\n\n".join(_parts)
+                _blob = ctx_budget.observe("long_doc_evidence", _blob,
+                                           source="pipeline")
+                stages["记忆"] = f"{len(_parts)}(长答)"
+                return _blob
             _lines = [f"{i}. {str(h.get('ago') or '')}｜{str(h.get('summary') or '')[:40]}"
                       for i, h in enumerate(_hits, 1)]
             stages["记忆"] = str(len(_hits))
@@ -396,16 +475,46 @@ async def build(
             if not _facts:
                 stages["图书馆"] = "0"
                 return ""
-            stages["图书馆"] = str(len(_facts))
-            return (_hdr("图书馆") + "\n"
-                    "（**语料库里的「我/你/他」不是现在的你我他**，只当参考线索，"
-                    "别照抄、别当成现在发生的事）\n"
-                    + "\n".join(f"· {str(x)[:100]}" for x in _facts[:3]))
+            from . import long_doc as _ld
+            _long = bool(_ld.is_long_doc(text))
+            _n = 12 if _long else 3
+            _c = 1900 if _long else 100
+            stages["图书馆"] = str(min(len(_facts), _n))
+            _blob = (_hdr("图书馆") + "\n"
+                     "（**语料库里的「我/你/他」不是现在的你我他**，只当参考线索，"
+                     "别照抄、别当成现在发生的事）\n"
+                     + "\n".join(f"· {str(x)[:_c]}" for x in _facts[:_n]))
+            if _long:
+                _blob = ctx_budget.observe("long_doc_library", _blob,
+                                           source="pipeline")
+            return _blob
         except Exception as e:
             fail("图书馆", e)
             return ""
 
-    _got = await asyncio.gather(_mem_stage(), _lib_stage())
+    async def _arc_stage():
+        # 个人档案库：本地 sqlite，只存 30 天以前（不依赖 RAG、不和图书馆共用）。
+        # 查询是毫秒级，所以不像图书馆那样做门控；近 30 天的重复由 archive 的时间窗挡掉。
+        try:
+            from . import archive
+            if not archive.enabled():
+                stages["档案库"] = "关"
+                return ""
+            _hits = await _step(
+                "档案库",
+                asyncio.to_thread(archive.recall, query,
+                                  limit=archive.TOP, gid=gid),
+                min(1.5, left()), default=[]) or []
+            if not _hits:
+                stages["档案库"] = "0"
+                return ""
+            stages["档案库"] = str(len(_hits))
+            return archive.render(_hits, n=archive.MIN_AGE_DAYS)
+        except Exception as e:
+            fail("档案库", e)
+            return ""
+
+    _got = await asyncio.gather(_mem_stage(), _lib_stage(), _arc_stage())
     blocks.extend([b for b in _got if b])
 
     # ---------- ⑦ 这条消息回过没有 ----------
@@ -460,6 +569,7 @@ async def build(
                      "speaker_qq": str(speaker_qq or ""),
                      "speaker_name": str(speaker_name or ""),
                      "src_text": str(text or "")[:120],
+                     "intent": dict(_intent or {}),
                      "stage_ms": dict(_TURN_MS)}
     _write_turn_metrics(session_key, stages, cost)
     logger.info(
@@ -467,11 +577,6 @@ async def build(
         f"｜{len(text_out)} 字｜{stages}")
     return {"text": text_out, "stages": stages, "summary": summary,
             "replied": replied, "cost": cost}
-
-
-def last_text() -> str:
-    """上一次流水线真正注入 prompt 的完整文本（给 /看模板 流水线 用）。"""
-    return str((STATS.get("last") or {}).get("text") or "")
 
 
 def dump_text() -> str:
@@ -491,6 +596,14 @@ def dump_text() -> str:
     if _src:
         lines.append(f"· 要回的原话：{_src[:80]}")
     lines.append(f"· 上次耗时 {last.get('cost')}s｜{last.get('chars')} 字")
+    _it = last.get("intent") or {}
+    if _it:
+        _nr = str(_it.get("need_reply") or "—")
+        _q = _it.get("queries") or {}
+        lines.append(
+            f"· 意图：need_reply={_nr}｜replied={_it.get('replied') or '—'}"
+            f"｜在问：{_it.get('asks') or '—'}"
+            + (f"｜检索词 {'/'.join(f'{k}={v}' for k, v in _q.items())}" if _q else ""))
     lines.append("· 各步：" + "｜".join(
         f"{k}={_st.get(k, '（没跑）')}" for k in STAGE_ORDER))
     body = str(last.get("text") or "").strip()

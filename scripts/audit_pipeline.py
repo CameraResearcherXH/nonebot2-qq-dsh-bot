@@ -220,18 +220,18 @@ async def main() -> int:
     print("\n[1] 群消息 → 群聊现场（谁→谁 / 线程 / 收件人）")
     gid = "100000017"
     group_scene.clear(gid)
-    group_scene.observe(gid, mid="101", qq="10001", name="阿明", text="英伟达跌了吗",
+    group_scene.observe(gid, mid="101", qq="10001", name="阿明", text="新番看了吗",
                         to_reason="", reply_mid="", is_bot=False, bot_qq="999",
                         names={"999": "小鲸鱼"})
-    group_scene.observe(gid, mid="102", qq="10002", name="小柚子", text="对啊 都是老黄的锅",
+    group_scene.observe(gid, mid="102", qq="10002", name="小柚子", text="对啊 都是原作的锅",
                         to_qq="10001", to_reason="reply", reply_mid="101",
                         is_bot=False, bot_qq="999", names={"999": "小鲸鱼"})
-    group_scene.observe(gid, mid="103", qq="10001", name="阿明", text="@小柚子 你买了？",
+    group_scene.observe(gid, mid="103", qq="10001", name="阿明", text="@小柚子 你追到第几集了？",
                         to_qq="10002", to_reason="at", reply_mid="",
                         is_bot=False, bot_qq="999", names={"999": "小鲸鱼"})
     snap = group_scene.snapshot(gid, bot_qq="999", my_names={"小鲸鱼"})
     block = group_scene.format_block(snap)
-    if "英伟达" in block and "老黄" in block and "买了" in block:
+    if "新番" in block and "原作" in block and "追到" in block:
         ok("1", f"3 条消息全部进了现场（{len(block)} 字）")
     else:
         bad("1", "现场缺消息", block[:300])
@@ -275,7 +275,7 @@ async def main() -> int:
     # ---------- 2. 对话 → 滚动状态 ----------
     print("\n[2] 对话 → 滚动状态（conv_state 压缩）")
     _Client.reply = json.dumps({
-        "topics": ["英伟达股票"], "background": ["阿明买了英伟达"],
+        "topics": ["新番剧情"], "background": ["阿明追了新番"],
         "progress": [], "pending": ["小柚子还没回答买没买"],
         "agreements": [],
     }, ensure_ascii=False)
@@ -284,16 +284,16 @@ async def main() -> int:
     # ⚠️ conv_state 要求 ≥6 行才压（太短不值得花 token）—— 少于 6 行它会直接
     #    返回 False，看起来像"没接上"，其实是闸门。这里给够 6 行。
     _cs_lines = [
-        "10:01 阿明：你们最近发现英伟达股票跌了吗",
-        "10:02 小柚子：对啊 都是老黄的锅",
-        "10:03 阿明：你买了？",
-        "10:04 小柚子：买了点 亏麻了",
+        "10:01 阿明：昨晚那部新番看了吗",
+        "10:02 小柚子：对啊 都是原作的锅",
+        "10:03 阿明：你追到第几集了？",
+        "10:04 小柚子：买了点 被刀麻了",
         "10:05 阿明：我也是",
         "10:06 小柚子：那就先放着吧",
     ]
     upd = await conv_state.update(f"group_{gid}", _cs_lines)
     state_block = conv_state.render(f"group_{gid}")
-    if upd and "英伟达" in state_block:
+    if upd and "新番" in state_block:
         ok("2", f"状态压缩并渲染（{len(state_block)} 字）")
     else:
         bad("2", "状态没压出来", f"update={upd} render={state_block[:120]!r}")
@@ -303,11 +303,11 @@ async def main() -> int:
     print("\n[3] 表达学习（群 / 人两种作用域）")
     try:
         expression._merge(f"group_{gid}", [
-            {"text": "老黄的锅", "scene": "吐槽", "tone": "轻松", "count": 1}])
+            {"text": "原作的锅", "scene": "吐槽", "tone": "轻松", "count": 1}])
         expression._merge("person_10001", [
             {"text": "你买了没", "scene": "追问", "tone": "随意", "count": 1}])
         exp_block = expression.render(gid, "10001")
-        if "老黄的锅" in exp_block and "你买了没" in exp_block:
+        if "原作的锅" in exp_block and "你买了没" in exp_block:
             ok("3", "群 + 人两个作用域都能渲染")
         else:
             bad("3", "表达学习缺作用域", exp_block[:200])
@@ -318,8 +318,8 @@ async def main() -> int:
     print("\n[4] 档案 / 记忆 写入")
     profiles.upsert_profile("10001", nickname="阿明", aliases=["阿明"], level="member")
     profiles.set_call_names("10001", call_name="阿明", bot_alias="小鲸鱼")
-    profiles.add_bond_note("10001", "聊过股票，他说亏麻了", emotion="sad")
-    memory_v2.remember(text="阿明买了英伟达，最近亏麻了", kind="impression",
+    profiles.add_bond_note("10001", "聊过新番，他说被刀麻了", emotion="sad")
+    memory_v2.remember(text="阿明追了新番，最近被刀麻了", kind="impression",
                        about_qq="10001", importance=0.8)
     _p4 = profiles.get_profile("10001")
     _bond = (profiles.get_bond("10001") or {}).get("notes") or []
@@ -334,12 +334,12 @@ async def main() -> int:
     print("\n[5] 上下文组装（build_prompt）")
     from services.prompt_builder import build_prompt
     prompt = build_prompt(
-        session_key=f"group_{gid}", user_text="你们最近发现英伟达股票跌了吗",
+        session_key=f"group_{gid}", user_text="昨晚那部新番看了吗",
         speaker_qq="10001", speaker_name="阿明", persona_text="",
         atmosphere="", focus_qqs=["10002"], addressed=False,
         scene_text=block,
     )
-    for k, label in (("现在时间", "时间"), ("阿明", "说话人"), ("英伟达", "记忆/话题")):
+    for k, label in (("现在时间", "时间"), ("阿明", "说话人"), ("新番", "记忆/话题")):
         if k in prompt:
             ok("5", f"上下文含「{label}」")
         else:
@@ -357,7 +357,7 @@ async def main() -> int:
     os.environ.setdefault("ALLOWED_PRIVATE", "10001")
     reply, _ = await L.call_llm(
         f"group_{gid}", prompt,
-        group_context=["10:01 阿明: 英伟达跌了吗", "10:02 小柚子: 对啊 都是老黄的锅"],
+        group_context=["10:01 阿明: 新番看了吗", "10:02 小柚子: 对啊 都是原作的锅"],
         speaker_qq="10001", speaker_name="阿明",
     )
     sent = payload_text()
@@ -367,11 +367,11 @@ async def main() -> int:
         "你在哪(群号)": "群号：100000017" in sent,
         "你的地盘": "你能说话的群" in sent,
         "工具目录": "[[TOOLS|" in sent,
-        "群聊现场": "英伟达" in sent,
+        "群聊现场": "新番" in sent,
         "档案(阿明)": "阿明" in sent,
-        "滚动状态": "之前的状态" in sent or "英伟达股票" in sent,
+        "滚动状态": "之前的状态" in sent or "新番剧情" in sent,
         "说话风格参考": "说话风格参考" in sent,
-        "历史对话": "老黄" in sent,
+        "历史对话": "原作" in sent,
     }
     for k, good in must.items():
         ok("6", f"请求里有「{k}」") if good else bad(

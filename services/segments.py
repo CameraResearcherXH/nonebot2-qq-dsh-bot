@@ -17,10 +17,14 @@
 from core import tuning
 import time
 
+from services.text import clean_name, render_name
+
 WAIT_SEC = tuning.f("SEGMENT_WAIT_SEC")
 MAX_SEC = tuning.f("SEGMENT_MAX_SEC")
 MAX_MSGS = tuning.i("SEGMENT_MAX_MSGS")
 HISTORY_KEEP = tuning.i("SEGMENT_HISTORY_KEEP")
+# 没有 ⭐ 的段 = 她主动插话：只给最后几条，避免捡起早就翻篇的话题（2026-11-27）
+INSERT_WINDOW = tuning.i("SEG_INSERT_WINDOW")
 
 _BUF: dict = {}
 _PROCESSED: dict = {}
@@ -241,15 +245,23 @@ def format(records: list, *, limit: int = 20) -> str:
       · 截断时保留 ⭐ 行（见 `_pick_rows`），不让它被挤出窗口；
       · 明确写「每条 ⭐ 都要回应」，不再说「默认只回最后一条」。
     """
+    # 👇 2026-11-27（上帝视角复盘 A1/A2）：没有 ⭐ 的段 = 她主动插话。
+    #    插话时给 13 条上下文，她容易捡起前面早就翻篇的话题
+    #    （真机 11:02：帧数已经聊完 8 条，她还在答「帧数优先」）。
+    #    插话只给最后 `SEG_INSERT_WINDOW` 条：够判断气氛，不会翻旧账。
+    _all = list(records or [])
+    if _all and not any(is_addressed(r) for r in _all):
+        limit = min(int(limit or 20), max(2, int(INSERT_WINDOW or 5)))
     rows = _pick_rows(records, limit)
     if not rows:
         return ""
     lines = []
     addressed = []
     for i, r in enumerate(rows, 1):
-        name = str(r.get("name") or r.get("uid") or "?")
+        _raw_name = clean_name(r.get("name") or r.get("uid") or "?")
+        name = render_name(_raw_name)
         uid = str(r.get("uid") or "")
-        who = f"{name}({uid})" if uid and uid != name else name
+        who = f"{name}({uid})" if uid and uid != _raw_name else name
         _mid = str(r.get("mid") or "")
         _tag = f"#{_mid} " if _mid else ""
         _txt = str(r.get("text") or "（图片/表情）")
@@ -259,7 +271,7 @@ def format(records: list, *, limit: int = 20) -> str:
         if _star:
             addressed.append(f"· #{_mid or '?'} {name}：{_txt[:120]}")
     _last = rows[-1]
-    _last_who = str(_last.get("name") or _last.get("uid") or "?")
+    _last_who = render_name(_last.get("name") or _last.get("uid") or "?")
     _last_star = is_addressed(_last)
     _omitted = max(0, len(list(records or [])) - len(rows))
     _omit_note = (f"，更早的 {_omitted} 条被略（看不懂就 `[[[HISTORY|20]]]` 往上翻）"
@@ -272,6 +284,10 @@ def format(records: list, *, limit: int = 20) -> str:
         "（群里每分钟有发送上限，连发会被限流/吞掉）；最多 2 条气泡，"
         "只引用最主要的那条（例如 `<reply:%s>`；"
         "**用行首 # 后面那串数字，不是方括号里的编号**，写错会引到别人身上）。\n"
+        "· **`<reply:>` 只能引本段里的消息号**：更早的消息用名字提，不要引用"
+        "（引了会被系统丢掉，还容易答成旧话题）。\n"
+        "· **没有 ⭐ 就是你在插话**：只接最后 2 条里的话题；最后两条是图片/表情就当话题断了，"
+        "别翻旧账；插话时不要用「你」，用「他/她/名字」。\n"
         "带「〔引用 …〕」的是被引用的旧消息，只作指代，"
         "**不要在回复里复述/朗读引用内容**（文字、图片都一样）。\n"
         "不写 `<reply:消息号>` 就默认回最后一条%s（%s）。）\n"

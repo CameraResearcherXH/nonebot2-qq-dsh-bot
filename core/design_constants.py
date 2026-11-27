@@ -2,7 +2,7 @@
 
 定位
 ----
-- **参数默认值只有一个地方**：`core/tuning.py` 的 `DEFAULTS`（`KEYS` 共 120 个设计键；
+- **参数默认值只有一个地方**：`core/tuning.py` 的 `DEFAULTS`（`KEYS` 共 122 个设计键；
   全部参数 377 个）。
   用户调试改那里或 `.env`；`docs/tuning.md` 由它生成。
 - 本文件不存值，只把 tuning 的平铺键**分组 + 加语义**（区间、枚举、派生计算），
@@ -46,6 +46,8 @@ KEYS = {
         "half_life_global_min": "MOOD_HALF_LIFE_GLOBAL_MIN",
         "step_1": "MOOD_STEP_1",
         "step_2": "MOOD_STEP_2",
+        "step_3": "MOOD_STEP_3",
+        "impact_max": "MOOD_IMPACT_MAX",
         "sensitivity_min": "MOOD_SENS_MIN",
         "sensitivity_max": "MOOD_SENS_MAX",
         "saturation": "MOOD_SATURATION",
@@ -66,6 +68,8 @@ KEYS = {
     "ANCHOR": {
         "every_turns": "MOOD_ANCHOR_EVERY",
         "idle_min": "MOOD_ANCHOR_IDLE_MIN",
+        # 2026-11-26：anchor_level 必填 + 每窗按权重混入（占大头）
+        "weight": "MOOD_ANCHOR_WEIGHT",
         "gain": "MOOD_ANCHOR_GAIN",
         "deadband": "MOOD_ANCHOR_DEADBAND",
         "max_move": "MOOD_ANCHOR_MAX_MOVE",
@@ -180,11 +184,14 @@ KEYS = {
 
 MOOD = {f: _v(k) for f, k in KEYS["MOOD"].items()}
 # 值域不是参数，是类型约束
+# 2026-11-26（v2.5）：impact 从 5 档扩到 7 档，档位上限读 tuning，
+# 不再硬编码 2 —— 否则 check_design_docs 看不见 ±3（假绿）。
 MOOD.update({
     "v_min": -1.0, "v_max": 1.0,
     "a_min": 0.0, "a_max": 1.0,
     "d_min": 0.0, "d_max": 1.0,
-    "impact_min": -2, "impact_max": 2,
+    "impact_min": -_t.i("MOOD_IMPACT_MAX"),
+    "impact_max": _t.i("MOOD_IMPACT_MAX"),
 })
 
 ANCHOR = {f: _v(k) for f, k in KEYS["ANCHOR"].items()}
@@ -238,17 +245,62 @@ AFFINITY_TARGETS = ("speaker", "recipient", "other")
 
 # ---------------------------------------------------------------- 派生
 def ctx_total(*, tools: bool = False, custom: bool = False,
-              multitarget: bool = False) -> int:
-    """按块加总。默认 = 常态口径（单目标 / 无工具 / 无 custom）。"""
+              multitarget: bool = False, all_blocks: bool = False) -> int:
+    """运行时**单块上限的 token 值之和**（不是字符，也不是 live 总池）。
+
+    ⚠️ 2026-11-27（外部审计）：这里直接加的是 `CTX_*` 原始值；而
+    `services/ctx_budget.limit_chars()` 会对 token 口径的块再 ×1.5。
+    所以：
+      · 本函数 4620 = **token 值之和**（文档旧写法误称「字符」）；
+      · 实际字符和 = 6540（常态）/ 7170（含 tools+multitarget）；
+      · live 总池仍是 `PROMPT_BUDGET=2200`，与本函数无关。
+
+    默认 = 常态口径（12 块 + style/custom 之一）= **4620**；
+    `all_blocks=True` 时只补 tools / multitarget（**5040**）；style_total 是聚合量，不重复加。
+    用于和 `ctx_budget._LIMITS` 全量对照。
+    **long_doc 两个块是「替代证据块」不是叠加**，任何口径都不含它们。
+    live 总池是 `PROMPT_BUDGET=2200`，与本函数无关（2026-11-26 审计 D）。
+    """
     blocks = ("persona", "expression", "protocol", "state", "profile",
               "summary", "evidence", "rhythm", "history", "post_rules",
               "anchor", "white_moon")
     total = sum(CTX[k] for k in blocks)
     total += CTX["custom"] if custom else CTX["style"]
-    if tools:
+    if all_blocks or tools:
         total += CTX["tools"]
-    if multitarget:
+    if all_blocks or multitarget:
         total += CTX["multitarget"]
+    # ⚠️ 不要再加 style_total：它是**聚合量**（expression+style+rhythm+white_moon），
+    #    这四项已经在 base 里加过一遍，再加就是重复计数（2026-11-26 审计）。
+    return total
+
+
+# 2026-11-27（外部审计）：`ctx_total()` 是 token 值之和，不是字符。
+# 这里按 `services/ctx_budget.BUDGET` 的换算（token 口径 ×1.5、字符口径 ×1.0）
+# 再算一遍真实字符和，供 `check_design_docs` 对照，防止「文档和常量抄同一个错数」。
+_CTX_TOKEN_KEYS = frozenset({
+    "persona", "expression", "protocol", "state", "style", "rhythm",
+    "history", "post_rules", "anchor", "tools", "multitarget",
+    "white_moon", "style_total", "evidence_long", "library_long",
+})
+
+
+def ctx_total_chars(*, tools: bool = False, custom: bool = False,
+                    multitarget: bool = False) -> int:
+    """运行时单块上限的**实际字符和**（常态 6540 / 含 tools+multi 7170）。"""
+    blocks = ("persona", "expression", "protocol", "state", "profile",
+              "summary", "evidence", "rhythm", "history", "post_rules",
+              "anchor", "white_moon")
+
+    def _chars(k: str) -> int:
+        return int(round(CTX[k] * (1.5 if k in _CTX_TOKEN_KEYS else 1.0)))
+
+    total = sum(_chars(k) for k in blocks)
+    total += _chars("custom" if custom else "style")
+    if tools:
+        total += _chars("tools")
+    if multitarget:
+        total += _chars("multitarget")
     return total
 
 

@@ -26,24 +26,24 @@
 | 分组 | 项数 |
 |---|---|
 | 回复 / 限流 / 主动插话 | 46 |
-| 心情 | 75 |
-| 档案 / 好感 | 14 |
+| 心情 | 83 |
+| 档案 / 好感 | 52 |
 | 记忆 | 34 |
 | 表情 | 7 |
 | 主动私聊 | 17 |
 | 安静 / 破冰 | 6 |
 | 提示词 | 8 |
-| 模型调用 | 23 |
+| 模型调用 | 20 |
 | 用量监测 | 4 |
 | 回复审核 | 14 |
 | 表达 / 语气 | 7 |
 | 视觉 | 19 |
 | 画图 | 2 |
-| 语音 / 音乐 | 30 |
+| 语音 / 音乐 | 31 |
 | 世界书 | 4 |
 | 安全 / 工具 | 9 |
-| 其他 | 98 |
-| **合计** | **417** |
+| 其他 | 123 |
+| **合计** | **486** |
 
 ## 回复 / 限流 / 主动插话
 
@@ -100,7 +100,7 @@
 
 | 参数 | 默认 | 说明 | 生效位置 |
 |---|---|---|---|
-| `AFFINITY_GAIN` | `0.05` | ⚠️ LEGACY（P3 删）：旧好感通道系数；新口径见 REL_* | `services/mood_judge.py` |
+| `AFFINITY_GAIN` | `0.05` | ⚠️ LEGACY（无读点，保留键名兼容旧 .env）：新口径见 AFF_* / REL_* | `services/mood_judge.py（设计，未接线）` |
 | `AROUSAL_LEVEL_HIGH` | `0.8` | judge arousal=high 对应的 a 值 | `services/mood_judge.py` |
 | `AROUSAL_LEVEL_LOW` | `0.2` | judge arousal=low 对应的 a 值 | `services/mood_judge.py` |
 | `AROUSAL_LEVEL_MID` | `0.5` | judge arousal=mid 对应的 a 值 | `services/mood_judge.py` |
@@ -118,15 +118,17 @@
 | `MOOD_AD_BASE_AROUSAL` | `0.35` | 唤醒 a 的回落基线（0~1） | `services/mood.py` |
 | `MOOD_AD_BASE_DOMINANCE` | `0.5` | 掌控 d 的回落基线（0~1） | `services/mood.py` |
 | `MOOD_ANCHOR_COUNT_SKIPPED` | `1` | 1=被 relevance 跳过的窗口也计入锚点计数；0=只数真判读 | `services/mood.py` |
-| `MOOD_ANCHOR_DEADBAND` | `0.15` | 锚点死区：差值小于它则跳过 | `services/mood.py` |
-| `MOOD_ANCHOR_EVERY` | `20` | 锚点：每多少轮判读一次 | `services/mood.py` |
-| `MOOD_ANCHOR_GAIN` | `0.25` | 锚点增益 K_a = gain × confidence | `services/mood.py` |
+| `MOOD_ANCHOR_DEADBAND` | `0.15` | 锚点软死区：差值小于它时按 smoothstep 衰减混入（不再硬跳过） | `services/mood.py` |
+| `MOOD_ANCHOR_EVERY` | `20` | 锚点：每多少窗额外回补一次 P（每窗都已按 WEIGHT 混入） | `services/mood.py` |
+| `MOOD_ANCHOR_GAIN` | `0.25` | 独立锚点（静默定时器/手动）的增益 K_a = gain × confidence | `services/mood.py` |
 | `MOOD_ANCHOR_IDLE_MIN` | `30` | 锚点：静默多少分钟也触发 | `services/mood.py` |
 | `MOOD_ANCHOR_LEVEL1` | `0.35` | 锚点 level ±1 对应的绝对偏移 | `services/mood.py` |
 | `MOOD_ANCHOR_LEVEL2` | `0.7` | 锚点 level ±2 对应的绝对偏移 | `services/mood.py` |
 | `MOOD_ANCHOR_MAX_MOVE` | `0.2` | 锚点单次最大位移 | `services/mood.py` |
 | `MOOD_ANCHOR_P_ADD` | `0.02` | 锚点后 P 的回补量 | `services/mood.py` |
+| `MOOD_ANCHOR_THINK_AGE_SEC` | `2100` | 静默锚点只认多久内的 THINK（秒；必须 ≥ 静默时长 + tick 间隔，默认 2100） | `services/mood_judge.py` |
 | `MOOD_ANCHOR_TIMER` | `1` | 静默锚点定时器（1=开，0=只在下一条消息时补锚） | `services/mood_judge.py` |
+| `MOOD_ANCHOR_WEIGHT` | `0.45` | 每窗锚点权重：v 向绝对档位拉 W×conf（anchor_level 占大头） | `services/mood.py` |
 | `MOOD_ENV_MAX_DELTA` | `0.05` | 不是冲她来（别人之间/群气氛）时单次 Δ 上限（0.05） | `services/mood_judge.py` |
 | `MOOD_FAST_CONF` | `0.4` | 快速通道置信度 | `services/mood.py` |
 | `MOOD_FAST_FLOOR` | `-0.45` | 快速通道强负面钳位（只降不升） | `services/mood.py` |
@@ -143,10 +145,13 @@
 | `MOOD_HALF_LIFE_GROUP_MIN` | `30` | 群聊心情半衰期（分钟） | `services/mood.py` |
 | `MOOD_HALF_LIFE_HOURS` | `12` | ⚠️ LEGACY（P2 删）：旧单一半衰期 12h；新口径按场景 30min/2h/6h | `services/mood.py` |
 | `MOOD_HALF_LIFE_PRIVATE_MIN` | `120` | 私聊心情半衰期（分钟） | `services/mood.py` |
-| `MOOD_HARD_CAP` | `0.35` | 单次硬上限（护栏，当前参数下不触发） | `services/mood.py` |
+| `MOOD_HARD_CAP` | `0.35` | 单次硬上限（±3 首条会触发：0.507→0.35，不是「永不触发」） | `services/mood.py` |
 | `MOOD_IDLE_AFTER` | `300` | 空闲多少秒后心情开始衰减（默认 300 = 5 分钟；之后每 5 分钟向 0 走一步） | `services/mood.py` |
 | `MOOD_IDLE_STEP` | `1` | 每步走多少点（内部 -100~100 口径，1.0 ≈ 外口径 0.01） | `services/mood.py` |
 | `MOOD_IDLE_TICK` | `300` | 衰减步长（秒）：每这么久向 0 走一步（默认 300 = 5 分钟走 0.01） | `services/mood.py` |
+| `MOOD_IMPACT3_DAILY_MAX` | `1` | ±3 档每会话每天最多几次（超了降到 OVER_TO；0=不限） | `services/mood.py` |
+| `MOOD_IMPACT3_OVER_TO` | `2` | ±3 超限后降到的档位（2 = 保留「大事」，但不再顶格） | `services/mood.py` |
+| `MOOD_IMPACT_MAX` | `3` | 判读档位上限（3 = 七档 -3~+3） | `services/mood.py` |
 | `MOOD_JUDGE_CTX` | `8` | 判读时带多少条上下文（8 = 5~8 条，和主模型上下文同源同条数） | `services/mood_judge.py` |
 | `MOOD_JUDGE_FRESH_SEC` | `600` | 判读结果有效期（秒），过期不当「现在」 | `services/mood.py` |
 | `MOOD_JUDGE_MAX_PER_HOUR` | `30` | 每会话每小时最多判读几次（含补判窗口）；超了只判最后一窗 | `services/mood_judge.py` |
@@ -156,13 +161,15 @@
 | `MOOD_JUDGE_TIMEOUT` | `12` | 判读调用超时（秒） | `services/mood_judge.py` |
 | `MOOD_LABEL_MAX` | `60` | 心情词最多保留多少个 | `services/mood.py` |
 | `MOOD_LABEL_TTL_HOURS` | `12` | 心情词的有效期（小时），过期不再当「现在」 | `services/mood.py` |
-| `MOOD_MAX_DELTA` | `0.5` | ⚠️ LEGACY（P2 删）：单次涨幅上限，旧公式用 | `services/mood.py` |
+| `MOOD_MAX_DELTA` | `0.5` | 名义 Δ 的夹取上限（判读护栏 / mood.apply_delta 仍在用，不是死键） | `services/mood.py` |
 | `MOOD_MAX_SESSIONS` | `50` | 最多保留多少个会话的心情（防字典无限长） | `services/mood.py` |
 | `MOOD_MAX_STEP` | `0.3` | ⚠️ LEGACY（P2 删）：单次判读最多改变多少，旧公式用 | `services/mood.py` |
 | `MOOD_NOISE_DELTA` | `0.03` | Δ 噪音门槛：|Δ| 小于它视为 0（0.03，不动数值/好感/刻痕） | `services/mood_judge.py` |
 | `MOOD_P0` | `0.25` | 不确定度初值 | `services/mood.py` |
 | `MOOD_PEAK_MIN_DELTA` | `0.03` | 进入「峰值事件」候选的最小 |Δ|（0.03，防小事顶掉大事） | `services/mood.py` |
 | `MOOD_PEAK_WINDOW_SEC` | `7200` | 心情峰值事件的保质期（秒，默认 7200 = 2 小时；每件事最多挂 2 小时） | `services/mood.py` |
+| `MOOD_P_EVENT_BOOST` | `0.05` | |impact|≥2 时 P 的回补量（让突发事件推得动心情） | `services/mood.py` |
+| `MOOD_P_EVENT_CAP` | `0.2` | 回补后 P 的上限（防止连刷把 K 顶太高） | `services/mood.py` |
 | `MOOD_Q_RATE_BASE` | `0.02` | 过程噪声速率（每小时，基数） | `services/mood.py` |
 | `MOOD_Q_RATE_SLOPE` | `0.1` | 过程噪声速率（每小时，乘 reactivity） | `services/mood.py` |
 | `MOOD_RELEVANCE_GATE` | `0.25` | 窗口相关度低于此值只衰减不判读 | `services/mood.py` |
@@ -173,6 +180,7 @@
 | `MOOD_SENS_MIN` | `0.6` | 人设敏感度下限 | `services/mood.py` |
 | `MOOD_STEP_1` | `0.1` | 观测步长 impact=±1（相对位移） | `services/mood.py` |
 | `MOOD_STEP_2` | `0.22` | 观测步长 impact=±2 | `services/mood.py` |
+| `MOOD_STEP_3` | `0.4` | 观测步长 impact=±3（猛击：一见钟情/被背叛） | `services/mood.py` |
 | `MOOD_THINK_KEEP` | `30` | 判读心理活动保留多少条 | `services/mood_judge.py` |
 | `MOOD_WINDOW_MAX_SEC` | `300` | 判读窗口时间上限（秒）：不足 N 句但过了这么久也判（慢群防滞后） | `services/mood_judge.py` |
 
@@ -180,8 +188,46 @@
 
 | 参数 | 默认 | 说明 | 生效位置 |
 |---|---|---|---|
-| `AFFINITY_DAILY_CAP` | `0.15` | ⚠️ LEGACY（P3 删）：旧好感日上限；新口径见 REL_DAILY_CAP | `services/profiles.py` |
+| `AFFINITY_DAILY_CAP` | `0.15` | v1 好感每日净变化上限（profiles.bump_affinity 用；v2 不用） | `services/profiles.py` |
 | `AFFINITY_TREND_WINDOW_SEC` | `1800` | 好感走势的统计窗口（秒） | `services/profiles.py` |
+| `AFF_BOND_DEEP_EXP` | `1.2` | 深层 bond 随 I_deep 的陡度 | `services/profiles.py` |
+| `AFF_BOND_DEEP_MAX` | `0.3` | 深层投入额外 bond（里程碑/修复/暖天数） | `services/profiles.py` |
+| `AFF_BOND_EXP` | `1.5` | 浅层 bond 随投入的陡度 | `services/profiles.py` |
+| `AFF_BOND_MAX` | `0.6` | 浅层投入的 bond 上限 | `services/profiles.py` |
+| `AFF_COMP_CAP` | `0.8` | 陪伴通道天花板 | `services/profiles.py` |
+| `AFF_COMP_W` | `0.004` | 一句中性陪伴的痕迹权重 | `services/profiles.py` |
+| `AFF_CONS_FROM` | `0.75` | 巩固起点 a | `services/profiles.py` |
+| `AFF_CONS_K` | `0.6` | 满载时沉淀进 bond 的比例 | `services/profiles.py` |
+| `AFF_CONS_TO` | `0.95` | 巩固满载点 a | `services/profiles.py` |
+| `AFF_DV_K` | `0.6` | 日常区 dv→好感 换算系数 | `services/profiles.py` |
+| `AFF_GUARD_POS` | `0.7` | a<0 时正向跳变折扣（有防备） | `services/profiles.py` |
+| `AFF_HURT_GRUDGE` | `0.15` | 负向 peak 加多少记仇 | `services/profiles.py` |
+| `AFF_JUMP_FROM` | `0.15` | 显著区起点 |dv|（骤暖/骤冷） | `services/profiles.py` |
+| `AFF_JUMP_GAMMA` | `1.5` | 显著区凸性指数 | `services/profiles.py` |
+| `AFF_JUMP_K` | `1.6` | 显著区放大系数 | `services/profiles.py` |
+| `AFF_JUMP_SAT` | `0.35` | 显著区饱和指数（高好感也推得动） | `services/profiles.py` |
+| `AFF_LOVE_DV` | `0.3` | 一见钟情阈值（peaks+2、κ≥0.5） | `services/profiles.py` |
+| `AFF_MAX` | `0.99` | 好感硬上限（0.99，不给 1.0） | `services/profiles.py` |
+| `AFF_MODEL` | `v1` | 好感模型开关（v1=指数衰减 + delta/dv 双吃 / v2=痕迹求和） | `services/profiles.py` |
+| `AFF_NEG_BIAS` | `1.6` | 负面事件权重 | `services/profiles.py` |
+| `AFF_PEAK_BONUS` | `0.25` | 一次 peak 额外加的巩固比例 | `services/profiles.py` |
+| `AFF_PEAK_DV` | `0.15` | peak 计数阈值（显著事件） | `services/profiles.py` |
+| `AFF_SAT_NEG` | `0.35` | 日常区负向饱和指数 | `services/profiles.py` |
+| `AFF_SAT_POS` | `0.7` | 日常区正向饱和指数 | `services/profiles.py` |
+| `AFF_TAIL_BASE` | `0.06` | 尾部区基础跳变 | `services/profiles.py` |
+| `AFF_TAIL_FROM` | `0.3` | 尾部区起点 |dv|（心碎/一见钟情） | `services/profiles.py` |
+| `AFF_TAIL_GAMMA` | `1.8` | 尾部区凸性指数 | `services/profiles.py` |
+| `AFF_TAIL_K` | `2` | 尾部区放大系数 | `services/profiles.py` |
+| `AFF_TAIL_SAT` | `0.15` | 尾部区饱和指数（几乎不看当前好感） | `services/profiles.py` |
+| `AFF_TIER_SOFT` | `0.02` | 分层门槛软上限余量 | `services/profiles.py` |
+| `AFF_TRACE_MAX` | `400` | 每人最多保留的痕迹天数（按天聚合） | `services/profiles.py` |
+| `AFF_TRACE_P` | `0.5` | 痕迹幂律指数（ACT-R d≈0.5） | `services/profiles.py` |
+| `AFF_TRACE_T` | `10` | 痕迹衰减时间常数（天） | `services/profiles.py` |
+| `AFF_V1_CAP` | `0.15` | v1 单次好感增量上限（= 日上限 0.15；实测最大 0.136，旧的 ±0.10 装不下尾部） | `services/profiles.py` |
+| `AFF_V1_DELTA_K` | `0.25` | v1 事件重量项系数（旧版等效 1.0；压小 = 好感不再那么快） | `services/profiles.py` |
+| `AFF_V1_DV_K` | `0.3` | v1 实际位移项系数（乘三段式；尾部跳变仍能到单次上限） | `services/profiles.py` |
+| `AFF_WARM_FULL` | `0.25` | 7 天暖流达到多少算「一直在暖」（κ 满载） | `services/profiles.py` |
+| `AFF_W_MAX` | `0.42` | 单次好感痕迹硬上限（单次上限；当前 dv 上限 0.35 → 最大 0.362，0.42 为 ±4/放宽预留，不是死护栏） | `services/profiles.py` |
 | `AVATAR_PX` | `160` | 头像生成尺寸（像素） | `services/profile_card.py` |
 | `AVATAR_TTL_DAYS` | `7` | 头像缓存保留天数 | `services/profile_card.py` |
 | `BOND_EVENT_MIN_DELTA` | `0.15` | 「印象最深的一件事」的门槛：记忆 |Δ| 达到多少才算（0.15） | `services/profiles.py` |
@@ -308,9 +354,6 @@
 | `LLM_TRACE_KEEP_DAYS` | `7` | 模型调用 trace 保留天数 | `services/llm.py` |
 | `LLM_TRACE_MAX_CHARS` | `60000` | 单条 trace 最大字符数 | `services/llm.py` |
 | `LOCAL_MEMORY_DAYS` | `30` | 本地记忆回溯天数 | `services/llm.py` |
-| `LONG_DOC_ENABLED` | `1` | 长答模式总开关（1=用户明确要长答时放开输出/证据预算；0=回滚成普通回复） | `services/llm.py` |
-| `LONG_DOC_EVIDENCE` | `8` | 长答模式最多带几条证据（普通模式按 RET_EVIDENCE_MAX） | `services/llm.py` |
-| `LONG_DOC_MAX_TOKENS` | `2000` | 长答模式单次生成的最大 token | `services/llm.py` |
 | `MAX_REQ_ROUNDS` | `6` | 单次生成最多请求几轮 | `services/llm.py` |
 | `MAX_REQ_ROUNDS_FAST` | `2` | 快路径最多请求几轮 | `services/llm.py` |
 | `MAX_TOOL_TURNS` | `6` | 一次对话里最多几轮工具调用 | `services/llm.py` |
@@ -326,7 +369,7 @@
 |---|---|---|---|
 | `API_USAGE_KEEP_DAYS` | `60` | 旧版用量记录保留天数 | `services/api_usage.py` |
 | `API_USAGE_TIMEOUT` | `8` | 旧版用量统计超时（秒） | `services/api_usage.py` |
-| `LLM_DAILY_BUDGET` | `0` | 每日 token 预算（0 = 不告警） | `services/llm_usage.py` |
+| `LLM_DAILY_BUDGET` | `0` | 每日 token 预算（0 = 不刹车）；到 100% 她回一句固定话术然后当天不再消耗 | `services/llm_usage.py` |
 | `LLM_USAGE_KEEP_DAYS` | `90` | 用量明细保留天数 | `services/llm_usage.py` |
 
 ## 回复审核
@@ -396,6 +439,7 @@
 | 参数 | 默认 | 说明 | 生效位置 |
 |---|---|---|---|
 | `AGENT_LIBRARY_TIMEOUT` | `14` | 图书馆 RAG 单次检索上限（秒，默认 14；实测 5~14s） | `services/agent_client.py` |
+| `AGENT_RAG_TOOL_TIMEOUT` | `12` | 直接调 rag_search 工具的超时（秒，默认 12；smart-query 卡住时用它兜底） | `services/agent_client.py` |
 | `AGENT_RECALL_TIMEOUT` | `3` | 算力机回忆接口超时（秒，默认 3；它在回复关键路径上） | `services/agent_client.py` |
 | `AGENT_REFLECT_QUEUE_TIMEOUT` | `600` | 算力机反思任务排队超时（秒） | `services/agent_client.py` |
 | `AGENT_REFLECT_TIMEOUT` | `180` | 算力机反思任务执行超时（秒） | `services/agent_client.py` |
@@ -453,6 +497,15 @@
 
 | 参数 | 默认 | 说明 | 生效位置 |
 |---|---|---|---|
+| `ARCHIVE_ENABLED` | `1` | 个人档案库开关（1=开；本地 sqlite，只存旧事，不依赖 RAG） | `services/archive.py` |
+| `ARCHIVE_MAX_CHARS` | `420` | 档案块最多多少字（进 prompt 的上限） | `services/archive.py` |
+| `ARCHIVE_MIN_AGE_DAYS` | `30` | 档案库只收多少天以前的旧事（默认 30；近期记忆走 memdb） | `services/archive.py` |
+| `ARCHIVE_TOP` | `4` | 档案库一次最多回几条 | `services/archive.py` |
+| `ATMO_ENABLED` | `1` | 接话前是否读群气氛（1=开；只作提示，不改心情/好感） | `services/atmosphere.py` |
+| `ATMO_MAX_CHARS` | `240` | 气氛块最多多少字（进 prompt 的上限） | `services/atmosphere.py` |
+| `ATMO_MSGS` | `8` | 读气氛看最近多少句（默认 8，和主模型上下文同源同条数） | `services/atmosphere.py` |
+| `ATMO_TIMEOUT` | `5` | 读气氛调用超时（秒），超时只丢这一块，不拖慢回复 | `services/atmosphere.py` |
+| `ATMO_TTL` | `90` | 同一窗口的气氛缓存多久（秒），避免连发时重复调用 | `services/atmosphere.py` |
 | `BUBBLE_DELAY_BASE_MS` | `300` | 多气泡之间的基础停顿（毫秒） | `services/aura_logic.py` |
 | `BUBBLE_DELAY_MAX_MS` | `1600` | 多气泡停顿上限（毫秒，别让人等太久） | `services/aura_logic.py` |
 | `BUBBLE_DELAY_PER_CHAR` | `90` | 多气泡停顿按字数叠加（毫秒/字） | `services/aura_logic.py` |
@@ -470,14 +523,23 @@
 | `CTX_RHYTHM` | `180` | 表达节奏上限 | `services/ctx_budget.py` |
 | `CTX_STATE` | `240` | 状态卡上限 | `services/ctx_budget.py` |
 | `CTX_STYLE` | `250` | 对方原话样本上限 | `services/ctx_budget.py` |
-| `CTX_STYLE_TOTAL` | `730` | 风格相关合计上限（不含 persona；≥ 各分项之和 730） | `services/ctx_budget.py` |
+| `CTX_STYLE_TOTAL` | `730` | 风格相关合计上限（= expression120+style250+rhythm180+white_moon180=730；custom 另算） | `services/ctx_budget.py` |
 | `CTX_TOOLS` | `300` | 工具说明上限（仅 intent=tool） | `services/ctx_budget.py` |
 | `CTX_WARN_SEC` | `600` | 同一个块超限告警的最小间隔（秒） | `services/ctx_budget.py` |
 | `CTX_WHITE_MOON` | `180` | 白月光 1 行事实上限 | `services/ctx_budget.py` |
 | `HARNESS_MAX_OUTPUT` | `3000` | Harness 桥回给 QQ 的最大字数 | `services/harness.py` |
 | `HARNESS_TIMEOUT` | `300` | Harness 桥单次调用最长秒数 | `services/harness.py` |
-| `MAX_BUBBLES` | `2` | 一条回复最多拆几个气泡 | `services/aura_logic.py` |
+| `LLM_BUDGET_SOFT_RATIO` | `0.9` | 日预算的「提前说休息」比例（0.9 = 用到 90% 就先提醒） | `services/budget_guard.py` |
+| `LLM_DEFAULT_MAX_TOKENS` | `800` | 其它角色（判读/审核/表达…）默认输出 token 上限 | `services/providers.py` |
+| `LLM_MAX_TOKENS` | `0` | 全局输出 token 覆盖（>0 时压过各角色默认；0=不覆盖） | `services/providers.py` |
+| `LONG_DOC_ENABLED` | `1` | 长答模式总开关（1=用户明确要长答时放开输出/证据预算；0=回滚成普通回复） | `services/long_doc.py` |
+| `LONG_DOC_EVIDENCE` | `8` | 长答模式检索候选条数（普通模式按 RET_EVIDENCE_MAX） | `services/long_doc.py` |
+| `LONG_DOC_MAX_TOKENS` | `2000` | 长答模式单次生成的最大 token | `services/long_doc.py` |
+| `LONG_DOC_PIECES` | `3` | 长答模式真正进 prompt 的证据篇数（DESIGN：3 篇） | `services/long_doc.py` |
+| `LONG_DOC_PIECE_CHARS` | `1900` | 长答模式每篇证据最多多少**字符**（DESIGN：1900） | `services/long_doc.py` |
+| `MAX_BUBBLES` | `2` | ⚠️ LEGACY（2026-11-26 合并进 OUT_BUBBLES_MAX）：一条回复最多拆几个气泡 | `` |
 | `MEM_BAD_BOOST` | `1.15` | 负性记忆存储加成（坏比好强） | `services/memdb.py` |
+| `MEM_OLD_FACTOR` | `0.5` | 超时间窗但被放行的记忆的降权系数（0.5 = 减半） | `services/memdb.py` |
 | `MEM_SAL_FLOOR` | `0.045` | 倒 U 中段起点 w（u=low 时的值） | `services/memdb.py` |
 | `MEM_SAL_HIGH` | `0.6` | 倒 U 高段起点（u>此值：极端冲击回落） | `services/memdb.py` |
 | `MEM_SAL_LOW` | `0.15` | 倒 U 低段上界（u<此值：小冲击几乎不记） | `services/memdb.py` |
@@ -488,8 +550,13 @@
 | `MEM_TAU_DEFAULT` | `30` | 未知 kind 的提取半衰期（天） | `services/memdb.py` |
 | `MEM_TAU_EVENT` | `30` | event 提取半衰期（天） | `services/memdb.py` |
 | `MEM_TAU_FACT` | `365` | fact 提取半衰期（天） | `services/memdb.py` |
+| `MEM_TAU_IMPRESSION` | `180` | impression 提取半衰期（天，她对这个人的印象；以前漏配 → 掉到 30） | `services/memdb.py` |
 | `MEM_TAU_PREFERENCE` | `180` | preference 提取半衰期（天） | `services/memdb.py` |
 | `MEM_TAU_STYLE` | `365` | style 提取半衰期（天） | `services/memdb.py` |
+| `OCR_MAX_CROPS` | `3` | 图片文字增强：最多裁几个文字块送模型（越多越贵） | `services/ocr.py` |
+| `OCR_MAX_SIDE` | `2200` | 图片文字增强：增强后最长边上限（像素） | `services/ocr.py` |
+| `OCR_TIMEOUT` | `45` | 图片文字增强：单次视觉调用超时（秒） | `services/ocr.py` |
+| `OCR_UPSCALE_MIN_W` | `1400` | 图片文字增强：宽度不足这个值就放大（小字靠这个救） | `services/ocr.py` |
 | `PERSONA_BASELINE_V` | `0` | 人设心情基线 -0.3~0.3（衰减回落点和锚点都叠在它上面） | `services/persona_traits.py` |
 | `PERSONA_EXPRESSIVENESS` | `0.5` | 人设表达欲 0~1（<0.3 视为冷/内敛，压借风格比例） | `services/white_moon.py` |
 | `PERSONA_FORGIVENESS` | `0.5` | 人设宽容 0~1：道歉回补 = 0.03×(0.5+forgiveness) | `services/persona_traits.py` |
@@ -505,7 +572,7 @@
 | `REL_AFFINITY_BASE` | `0` | 好感基线 | `services/relationship.py` |
 | `REL_AFFINITY_HALF_LIFE_DAYS` | `7` | 好感半衰期（天，再乘深度系数） | `services/relationship.py` |
 | `REL_CONTACT_NORM_N` | `50` | 近 7 天互动次数归一化的分母 | `services/relationship.py` |
-| `REL_DAILY_CAP` | `0.15` | 好感每日变化上限 | `services/relationship.py` |
+| `REL_DAILY_CAP` | `0.15` | 信任+尊重每日净变化上限（不是好感；好感用 AFFINITY_DAILY_CAP） | `services/relationship.py` |
 | `REL_DEPTH_CONTACT_COEF` | `0.5` | 深度系数里联系频率的权重 | `services/relationship.py` |
 | `REL_DEPTH_INTIMACY_COEF` | `2` | 深度系数里 intimacy 的权重 | `services/relationship.py` |
 | `REL_GRUDGE_HALF_LIFE_DAYS` | `14` | 记仇半衰期（天） | `services/relationship.py` |
@@ -528,16 +595,18 @@
 | `RET_STRENGTH_GAIN` | `0.1` | 命中后提取强度回补：r += gain×(1−r) | `services/memdb.py` |
 | `RET_STYLE_TOP` | `3` | 风格候选池条数 | `services/white_moon.py` |
 | `RET_TAG_TOP` | `5` | 每条记忆最多打几个 topic 标签 | `services/memdb.py` |
-| `RET_W_BM25` | `1` | 打分：关键词重合权重 | `services/memdb.py` |
+| `RET_W_BM25` | `1` | 打分：关键词**覆盖率**权重（键名沿用历史；sqlite 侧不是 BM25，没有 idf） | `services/memdb.py` |
 | `RET_W_RECENCY` | `0.4` | 打分：时间新鲜度权重 | `services/memdb.py` |
 | `RET_W_SALIENCE` | `0.5` | 打分：显著性 w（倒 U）权重 | `services/memdb.py` |
 | `RET_W_STRENGTH` | `0.6` | 打分：提取强度权重 | `services/memdb.py` |
 | `RET_W_STRUCT` | `1.2` | 打分：人/时间/情绪命中权重 | `services/memdb.py` |
 | `RET_W_TAG` | `0.8` | 打分：标签重合权重 | `services/memdb.py` |
+| `ROLEPLAY_MAX_TOKENS` | `4000` | 主聊天单次输出 token 上限（含 thinking；推理模型别低于 4000） | `services/providers.py` |
 | `SEGMENT_HISTORY_KEEP` | `24` | 保留多少个「处理过的段」给上下文/翻历史 | `services/segments.py` |
 | `SEGMENT_MAX_MSGS` | `40` | 群聊分段：最多攒多少条（防刷屏） | `services/segments.py` |
 | `SEGMENT_MAX_SEC` | `30` | 群聊分段：最长攒多久必须处理（默认 30 秒） | `services/segments.py` |
 | `SEGMENT_WAIT_SEC` | `3.5` | 群聊分段：安静多少秒算「这一段说完了」（默认 3.5） | `services/segments.py` |
+| `SEG_INSERT_WINDOW` | `5` | 主动插话时只给最后几条（没有 ⭐ 的段；防止接旧话题） | `services/segments.py` |
 | `STYLE_MMR_ENABLED` | `1` | 风格样本选择是否启用 MMR | `services/style_vault.py` |
 | `STYLE_MMR_LAMBDA` | `0.7` | 风格 MMR 相关性权重（λ=0.7） | `services/style_vault.py` |
 | `STYLE_VAULT_ENABLED` | `1` | 说话样本库：1=自动记每个人的原话（省流模式也记） | `services/style_vault.py` |

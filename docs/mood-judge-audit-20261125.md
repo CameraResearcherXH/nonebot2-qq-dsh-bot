@@ -5,6 +5,11 @@
 
 ---
 
+> **2026-11-26 状态更新（重要）**：本文是 11-25 的审计快照，其中两条**已修**：
+> ① 「判读改两段式」已落地（`desirability × cared`，7 档 ±3）；
+> ② 本文没提的 `_ctx_of` 丢窗口 / passive 窗白烧调用，已修（见 `CHANGELOG` 第二十五轮）。
+> 其余建议（工具收敛、self_tool_run 群聊禁用）仍是待办。
+
 ## 0. 一句话结论
 
 判读链路**方向是对的**（她自己的 THINK 是唯一标签源），但「她这条在回」这一环以前是
@@ -229,11 +234,16 @@ impact 由代码合成：`impact = desirability × cared_weight`，`cared=0 → 
 - 无 THINK 不调用判读（省调用）、删除自动补写心里话；
 - 核查脚本：`scripts/audit_mood_judge.py`。
 
-### 待办（按优先级）
+### 待办（2026-11-26 更新状态）
 
-1. **判读改两段式**（`about / desirability / agency / cared`）→ 代码合成 impact；
-2. **标注改用语义模型**：词表只做分层抽样，判读 LLM 出标签，人工抽检 10%；
-3. **工具收敛**：画图/媒体/原神各合并成一个入口；
-4. `self_tool_run` 群聊禁用（只读）；
-5. `proactive` 与 `stay_silent` 互斥校验；
-6. `intimacy` 有 1.00 的饱和值，抽查是否被「note 条数」顶满（影响「越亲近越宽容」）。
+| # | 待办 | 状态 |
+|---|---|---|
+| 1 | 判读改两段式（`desirability / cared`）→ 代码合成 impact | ✅ **已做**：`mood_judge` 用 `impact = round(desirability×cared/2)`，`cared=0` 显式归零；线上最新 10 条 trace 全部带 `desirability` |
+| 2 | 标注改用语义模型（词表只做分层抽样） | 🟡 半做：`scripts/prelabel_emotion_llm.py` 有了，但**没跑完 200 条 + 人工抽检** |
+| 3 | 工具收敛（画图/媒体/原神各合并成一个入口） | ⬜ 未做（36 个工具 → 目标 ~20） |
+| 4 | `self_tool_run` 群聊禁用（只读） | ✅ **已做**：写/跑/自造工具默认只私聊（`EXEC_SCOPE`），群聊只留 `self_tool_file` |
+| 5 | `proactive` 与 `stay_silent` 互斥校验 | ⬜ 未做 |
+| 6 | `intimacy` 1.00 饱和、是否被 note 条数顶满 | ✅ **已做**：`min(0.98, score/3)`，线上实测 0.92~0.98 |
+
+> 另外两条本轮新增（不在这份 11-25 的清单里）：
+> `anchor_level` 必填 + 每窗权重（ADR-042）、节流不再丢 THINK（§5.1b）。

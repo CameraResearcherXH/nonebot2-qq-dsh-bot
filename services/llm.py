@@ -15,6 +15,7 @@ import httpx
 from nonebot import logger
 from .config import (BOT_MODE, MOCK_REPLY, XAI_API_KEY, XAI_BASE_URL, XAI_MODEL,
                      PROXY, ROLEPLAY_API_KEY, ROLEPLAY_BASE_URL, ROLEPLAY_MODEL,
+                     ROLEPLAY_MAX_TOKENS, ROLEPLAY_MAX_TOKENS_FIELD,
                      NODE_COMPUTE, CODE_AGENT, HARNESS_ENABLED)
 from .persona import persona_for, persona_name
 from . import attention, conv_state, expression, chat_switch, ctx_budget
@@ -121,6 +122,42 @@ _NODE_ONLY_TOOLS = {
 TOOL_SCOPES: dict = {}
 # 这些工具执行期间「只收不发」：bot.send 被拦下，内容交回模型自己决定发不发。
 HOLD_TOOLS: set = set()
+
+# ================= 工具可用性预检（2026-11-27） =================
+# 用户：「工具无法使用/超时的时候，它会把调用句子发出来（TOOLS|画图 TOOLS|搜图）……
+#       加一层降级策略，调用之前先看工具状态。」
+# 具体状态（/技能 开关、算力机 caps/心跳）只有 plugins/chat 知道，
+# 所以这里留一个**回调**：chat 启动时 `set_availability(fn)` 注入，
+# services 不反向依赖 plugins。
+_AVAIL_FN = None
+# 本轮被判定「用不了」的工具 → {名字: 原因}，用于给模型一句明确提示
+_UNAVAIL: dict = {}
+# 本轮**运行期**失败过的工具：避免模型在同一个回合里反复重试（越试越慢、越试越乱）
+_FAILED_TURN: set = set()
+
+
+def set_availability(fn) -> None:
+    """由 plugins/chat 注入：`fn(name) -> (可用?, 原因)`。"""
+    global _AVAIL_FN
+    _AVAIL_FN = fn
+
+
+def tool_available(name: str) -> tuple:
+    try:
+        if _AVAIL_FN is None:
+            return True, ""
+        return _AVAIL_FN(str(name))
+    except Exception:
+        return True, ""
+
+
+def unavailable_hint() -> str:
+    """本轮不挂的工具，写成一句提示塞进 prompt（比让模型自己发现更省事）。"""
+    if not _UNAVAIL:
+        return ""
+    items = "、".join("%s（%s）" % (k, v) for k, v in list(_UNAVAIL.items())[:8])
+    return ("▍这些工具现在用不了：%s。**不要调用、也不要假装做到了**；"
+            "直接说没接上 / 换个办法 / 让她稍后再试。" % items)
 # 3 → 6：现在多了 napcat_help / napcat_call 这种「先看说明再动手」的两段式，
 # 3 轮不够（menu → help → call 就没了，她连开口的机会都没有）。
 MAX_TOOL_TURNS = tuning.i("MAX_TOOL_TURNS")
@@ -318,28 +355,20 @@ RET_TOOLS_TOP = tuning.i("RET_TOOLS_TOP")
 _TOOL_CORE = {"send", "stay_silent"}
 
 # long_doc（DESIGN §3.3 / ADR-033/039）：
-#   用户明确要「详细讲讲 / 分析一下」时，单轮放开输出 token 与证据条数；
-#   LONG_DOC_ENABLED=0 可整体回滚成普通回复。
-LONG_DOC_ENABLED = tuning.i("LONG_DOC_ENABLED")
-LONG_DOC_MAX_TOKENS = tuning.i("LONG_DOC_MAX_TOKENS")
-LONG_DOC_EVIDENCE = tuning.i("LONG_DOC_EVIDENCE")
+#   用户明确要「详细讲讲 / 分析一下」时，单轮放开输出 token 与证据预算。
+#   2026-11-27：判定/常量挪到 services/long_doc.py，reply_pipeline 也读同一份
+#   （以前流水线看不到 long_doc，staged 路径上 6000/3000 永远不生效）。
+#   `llm.is_long_doc` / `llm.LONG_DOC_*` 保留为兼容别名。
+from . import long_doc as _ld
+
+LONG_DOC_ENABLED = _ld.ENABLED
+LONG_DOC_MAX_TOKENS = _ld.MAX_TOKENS
+LONG_DOC_EVIDENCE = _ld.EVIDENCE
+LONG_DOC_PIECES = _ld.PIECES
+LONG_DOC_PIECE_CHARS = _ld.PIECE_CHARS
 CTX_HARD_CAP = tuning.i("CTX_HARD_CAP")
 
-_LONG_DOC_HINTS = (
-    "详细讲讲", "详细说说", "展开说", "展开讲", "深入讲", "具体讲讲",
-    "写个总结", "总结一下", "分析一下", "分析下", "梳理一下",
-    "这本书", "这篇论文", "这段代码", "讲了什么", "讲的是什么",
-)
-
-
-def is_long_doc(text: str) -> bool:
-    """这句是不是在要「长答」（只认明确措辞，避免把日常闲聊拉长）。"""
-    if not int(LONG_DOC_ENABLED or 0):
-        return False
-    t = _tool_query_of(text)
-    if len(t) < 6:
-        return False
-    return any(k in t for k in _LONG_DOC_HINTS)
+is_long_doc = _ld.is_long_doc
 
 
 def _tool_blob(spec: dict) -> str:
@@ -390,6 +419,7 @@ def tools_for(key: str, query: str = "") -> list:
     群聊只拿 scope 里带 group 的（再减去黑名单）；给了 query 时按描述重合度取 top N。
     """
     want = "group" if str(key).startswith("group") else "private"
+    _UNAVAIL.clear()
     out = []
     for s in TOOLS_SPEC:
         name = (s.get("function") or {}).get("name")
@@ -397,7 +427,19 @@ def tools_for(key: str, query: str = "") -> list:
             continue
         if want == "group" and name in GROUP_TOOL_DENY:
             continue
+        # 2026-11-27：调用前预检。send / stay_silent 是协议工具，永远保留。
+        if name not in _TOOL_CORE:
+            ok, why = tool_available(name)
+            if not ok:
+                _UNAVAIL[name] = why or "不可用"
+                continue
         out.append(s)
+    if _UNAVAIL:
+        try:
+            logger.info("[TOOLS] 本轮不挂 %d 个：%s" % (
+                len(_UNAVAIL), "、".join("%s(%s)" % kv for kv in list(_UNAVAIL.items())[:5])))
+        except Exception:
+            pass
     n = int(RET_TOOLS_TOP or 0)
     if n <= 0 or len(out) <= n:
         return out
@@ -517,6 +559,10 @@ async def _run_tool_calls(calls: list) -> list:
         handler = TOOL_HANDLERS.get(name)
         if not handler:
             result = f"没有这个工具：{name}"
+        elif name in _FAILED_TURN:
+            # 2026-11-27：同一回合里失败过的工具不再重试（越试越慢，还会把标记漏出去）
+            result = (f"「{name}」刚才这一轮已经失败过，别再重试。"
+                      f"直接说没弄成 / 换个办法，**不要**把调用写法当话发出去。")
         elif not _skill_ok(name):
             # 2026-11-20：非核心能力被 /技能 关掉 → 直接告诉模型，别让它反复重试
             result = f"「{name}」这个能力被主人关掉了。用别的方式回答，不要重复调用。"
@@ -531,7 +577,13 @@ async def _run_tool_calls(calls: list) -> list:
             try:
                 result = await handler(args)
             except Exception as e:
-                result = f"工具 {name} 执行失败：{type(e).__name__}: {e}"
+                # 2026-11-27：失败要「说清 + 别重试 + 别把调用写法发出去」。
+                # 以前只回一句 `工具 X 执行失败：...`，模型会继续尝试，
+                # 甚至把 `TOOLS|画图` 这类标记当话交给 send。
+                _FAILED_TURN.add(name)
+                result = (f"【工具失败】{name} 没跑起来（{type(e).__name__}: {e}）。"
+                          f"这一轮不要再调它；也不要跟对方说已经做好了 —— "
+                          f"要么换个办法，要么直说没弄成。")
             finally:
                 _sent = list(_TOOL_SENT.get() or [])
                 _TOOL_SENT.reset(_tok)
@@ -588,9 +640,12 @@ TOOL_CATALOG = {
         "  · [[MEMORY|关键词|翻页2]] —— 看第 2 页（每页 10 条）\n"
         "  · [[MEMORY|展开|编号]] —— 展开某条看详细\n"
         "  · 按时间查：[[MEMORY|前天上午]] / [[MEMORY|昨天]] / [[MEMORY|3天前]] —— 直接翻那段时间的记忆\n"
-        "· [[LIBRARY|关键词]] —— 查很久以前的往事（算力机归档）\n"
+        "· [[ARCHIVE|关键词]] —— 查你自己的旧档案（30 天以前，本地库，只你能查）\n"
+        "· [[LIBRARY|关键词]] —— 查外部图书馆（书/资料；没搭 RAG 就没有）\n"
         "· [[PROFILE|名字]] —— 查某个人：人物卡（人/事情/你在他面前/关系/语气/注意）+ 相关记忆\n"
         "  · [[PROFILE|名字|翻页2]] —— 相处印象一页 6 条，往前翻\n"
+        "  · [[PROFILE|我]]（或名字留空）—— 群友说「查看档案 / 我的档案」又没点名时，"
+        "查**说话人自己**，别沉默\n"
         "· profile_card —— 查某人档案，并返回档案图片路径（想发就 send(image=路径)）\n"
         "· profile_update —— 把聊天里确认过的稳定信息写回档案（简介/性格/状态/备注/语气样例）\n"
         "· lore_add —— 往本群设定库写词条（梗/事件/群规/两个人的关系）；只有聊到关键词才注入\n"
@@ -824,7 +879,7 @@ def _tool_search(kw: str) -> str:
 
 
 _REQ_RE = re.compile(
-    r"\[\[\[?\s*(SEARCH|LIBRARY|SING|WHO|HISTORY|MEMORY|PROFILE|ASKGLM|LATER"
+    r"\[\[\[?\s*(SEARCH|LIBRARY|ARCHIVE|SING|WHO|HISTORY|MEMORY|PROFILE|ASKGLM|LATER"
     r"|LIKE|POKE|NAPCAT|TOOLS|STICKER|VIDEO|VIDEO_UNDERSTAND|video_understand|LUCK)\s*"
     r"(?:\|\s*([^\]]{0,300}?)\s*)?\]\]\]?")
 
@@ -862,8 +917,9 @@ _DEEP_RE = re.compile(r"\[\[\[?\s*DEEP\s*(?:\|[^\]]{0,60})?\]\]\]?", re.I)
 # 往上翻历史最多多少条。用户 2026-11-11：「最高 20 条，以免把上下文拉爆」。
 HISTORY_MAX = tuning.i("HISTORY_MAX")
 
-# 一条回复最多拆几个气泡（和 aura_logic.MAX_BUBBLES 是同一个 env，两处各读一次）
-MAX_BUBBLES = tuning.i("MAX_BUBBLES")
+# 一条回复最多拆几个气泡。2026-11-26：统一读 OUT_BUBBLES_MAX
+# （MAX_BUBBLES 已标 LEGACY；以前两处各读一个键，靠测试断言维持相等）
+MAX_BUBBLES = tuning.i("OUT_BUBBLES_MAX")
 
 # 模型调用失败时的兜底话术（按故障类型分）。
 # 不要「服务器繁忙」这种客服腔；也别假装正常聊天糊过去。
@@ -1394,17 +1450,31 @@ async def _fulfill_requests(reply: str, msgs: list, client, headers: dict) -> st
         # （用户 2026-11-19：档案只给 3 条她就以为只有 3 条，于是不去翻）
         _pparts = [p.strip() for p in str(q or "").split("|") if p.strip()]
         _pname = _pparts[0] if _pparts else str(q or "").strip()
+        _qq = ""
+        # 2026-11-27（上帝视角复盘 C1）：群友打「查看档案/我的档案」**不会说查谁**，
+        #   以前 `_pname` 为空 → 花名册查不到 → 没有卡片 → 她只能沉默。
+        #   现在「没点名 / 说的是我」= 查**说话人自己**。
+        if _pname in ("", "我", "自己", "我的", "本人", "俺", "me", "self"):
+            try:
+                _ev0 = TOOL_CTX.get("event")
+                _sq = str(TOOL_CTX.get("speaker_qq")
+                          or getattr(_ev0, "user_id", "") or "")
+                _gid0 = str(getattr(_ev0, "group_id", "") or "")
+            except Exception:
+                _sq, _gid0 = "", ""
+            if _sq:
+                _qq = _sq
+                _pname = profiles.call_of(_sq, "", _gid0) or _sq
         _ppage = 1
         if len(_pparts) > 1 and re.search(r"翻页|页", _pparts[1]):
             _ppage = max(1, int(re.sub(r"\D", "", _pparts[1]) or 1))
         src = f"关于「{_pname}」你知道的"
         _parts = []
-        _qq = ""
         try:
             _ev = TOOL_CTX.get("event")
             _bot = TOOL_CTX.get("bot")
             _gid = str(getattr(_ev, "group_id", "") or "")
-            if _gid and _bot:
+            if _gid and _bot and not _qq:
                 from . import group_roster
                 _members = await group_roster.members_of(_bot, _gid)
                 _hit = group_roster.find(_members, _pname, limit=1)
@@ -1535,6 +1605,24 @@ async def _fulfill_requests(reply: str, msgs: list, client, headers: dict) -> st
                     got = "\n".join(_lines)
         except Exception as e:
             logger.warning(f"[REQ] 查本地记忆失败: {type(e).__name__}: {e}")
+            got = ""
+    elif kind == "ARCHIVE":
+        # 个人档案库（2026-11-26 C 方案）：只存 30 天以前，本地 sqlite，
+        # 不依赖 RAG、不和图书馆共用。只她自己能查。
+        src = "你的个人档案库（30 天以前的旧事）"
+        try:
+            from . import archive
+            _ev = TOOL_CTX.get("event")
+            _gid = str(getattr(_ev, "group_id", "") or "")
+            _hits = archive.recall(str(q or ""), limit=archive.TOP, gid=_gid)
+            if _hits:
+                got = archive.render(_hits, n=archive.MIN_AGE_DAYS)
+            else:
+                got = (f"档案库里没找到「{q}」的旧事"
+                       f"（只存 {archive.MIN_AGE_DAYS} 天以前；"
+                       f"近期的用 [[MEMORY|{q}]]，外面的书用 [[LIBRARY|{q}]]）")
+        except Exception as e:
+            logger.warning(f"[REQ] 查档案库失败: {type(e).__name__}: {e}")
             got = ""
     elif kind == "ASKGLM":
         # 让 GLM 先答一遍当参考 —— 她懒得想、或者想多一个角度时用。
@@ -1744,7 +1832,8 @@ async def _fulfill_requests(reply: str, msgs: list, client, headers: dict) -> st
     r = await client.post(
         f"{ROLEPLAY_BASE_URL}/chat/completions", headers=headers,
         json={"model": ROLEPLAY_MODEL, "messages": msgs,
-              "temperature": 1.0, "max_tokens": 800},
+              "temperature": 1.0,
+              ROLEPLAY_MAX_TOKENS_FIELD: ROLEPLAY_MAX_TOKENS},
     )
     r.raise_for_status()
     out = r.json()["choices"][0]["message"].get("content") or ""
@@ -1911,7 +2000,11 @@ def _save_thought(key: str, user_text: str, reason: str):
 
 _NOT_INTERJECT = (
     "⭐/→你 / @你 / 戳你 → 接；其他随心情，想吐槽就接，不想接就 (不想回复)。\n"
-    "多条用一条答完；被 @ 不许沉默；带〔已回〕的消息不再接。"
+    "多条用一条答完；被 @ 不许沉默；带〔已回〕的消息不再接。\n"
+    # 2026-11-26：引用回复从「硬逻辑必回」改成「你自己决定」。
+    "有人**引用回复你** → 通常回一句（这是明确在跟你说话）；"
+    "但如果你发现对方也是 AI、你俩在互相引用对轰，就停，别接 —— 想回哪条就用 "
+    "send(quote=那条消息号)，不想回就不吭声。"
 )
 
 _SEARCH_PROTOCOL = (
@@ -2038,8 +2131,11 @@ def _post_rules(key: str, speaker_qq: str = "", gid: str = "") -> str:
     is_group = str(key).startswith("group")
     try:
         if is_group:
+            # 2026-11-26：与发送层（plugins/chat 用 OUT_BUBBLE_CHARS）保持一致。
+            # 以前这里用 GROUP_MAX_HANZI=20，模型只写 20 字，
+            # OUT_BUBBLE_CHARS=40 在生成侧永远用不上（2026-11-26 审计修复）。
             limit = group_tuning.max_hanzi(
-                key, tuning.i("GROUP_MAX_HANZI"))
+                key, tuning.i("OUT_BUBBLE_CHARS"))
         else:
             limit = tuning.i("PRIVATE_MAX_HANZI")
     except Exception:
@@ -2319,14 +2415,24 @@ def _behaviour_protocol(key: str, *, is_group: bool = False,
         secs.append(("11 QQ操作", _napcat))
     # 12/13（引用回复 / @ 失败）是「每轮都变」的，默认不进固定区，
     # 由 _dynamic_protocol 单独放到最后一条 system（见 call_llm）。
+    # 2026-11-26：动态小节**不参与 protocol 预算裁剪**。
+    # 以前 dynamic=True 时把它们 extend 进 secs、一起交给 ctx_budget，
+    # 协议一超预算就从**尾部**切 —— 「12 引用回复 / 13 @失败」正好在末尾，
+    # 于是「每轮必须遵守的规矩」被静默裁掉（回归测试 `dynamic=True 仍可合并` 抓到的）。
+    _dyn_body = ""
     if dynamic:
-        secs.extend(_dynamic_sections(key, is_group=is_group))
+        _dyn = [(t, b) for t, b in _dynamic_sections(key, is_group=is_group)
+                if str(b or "").strip()]
+        _dyn_body = "\n\n".join(f"▍{t}\n{b}" for t, b in _dyn)
 
     head = "按编号看；冲突时编号小的优先。"
     # 空小节（比如注意力漂移关掉了）直接不渲染，别留个空标题
     body = "\n\n".join(f"▍{t}\n{b}" for t, b in secs if str(b or "").strip())
     # 整段协议只统计（CTX_PROTOCOL 是 token 预算，默认不硬裁）
-    return ctx_budget.observe("protocol", f"{head}\n\n{body}", source=key)
+    _out = ctx_budget.observe("protocol", f"{head}\n\n{body}", source=key)
+    if _dyn_body:
+        _out = _out + "\n\n" + _dyn_body
+    return _out
 
 
 def _length_rule(key: str) -> str:
@@ -2540,6 +2646,22 @@ async def call_llm(
     staged_text: str = "",
 ) -> tuple:
     logger.info(f"[LLM] 开始生成回复 key={key}")
+    _FAILED_TURN.clear()        # 新的一轮：失败过的工具重新允许尝试
+    # ================= 日预算刹车（2026-11-27） =================
+    # 用户：「每日告警 200w token，接近超过的时候她就提前说今天休息啦，
+    #        然后后续就暂时不消耗了。」
+    # 档位见 services/budget_guard.py：soft 只是加一句提示；rest 才真的不调模型。
+    try:
+        from . import budget_guard as _bg
+        _bg_state = _bg.state()
+    except Exception:
+        _bg, _bg_state = None, "off"
+    if _bg_state == "rest":
+        if _bg.claim("rest", key):
+            logger.warning(f"[BUDGET] 今日额度用完 → 回固定话术（{key}）")
+            return _bg.notice_line(), False
+        logger.info(f"[BUDGET] 今日额度用完 → 静默（{key}）")
+        return "(不想回复)", False
     # 动态流水线（reply_pipeline）产出的数据块；空 = 走原来的静态拼装
     _staged = str(staged_text or "").strip()
     _long_doc = False       # 视觉分支不判长答；文字分支会重新算
@@ -2560,7 +2682,8 @@ async def call_llm(
         headers = {"Authorization": f"Bearer {ROLEPLAY_API_KEY}",
                    "Content-Type": "application/json"}
         payload = {"model": ROLEPLAY_MODEL, "messages": msgs,
-                   "temperature": 1.2, "max_tokens": 500}
+                   "temperature": 1.2,
+                   ROLEPLAY_MAX_TOKENS_FIELD: min(500, ROLEPLAY_MAX_TOKENS)}
         kwargs = {"timeout": 60}
         if PROXY: kwargs["proxy"] = PROXY
         async with httpx.AsyncClient(**kwargs) as client:
@@ -2866,19 +2989,13 @@ async def call_llm(
             memory_limit=(LONG_DOC_EVIDENCE if _long_doc
                           else (0 if _staged else tuning.i("RET_MEMORY_TOP"))),
             total_budget=(CTX_HARD_CAP if _long_doc else 0),
+            long_doc=_long_doc,
             gid=_gid,
             addressed=_addressed_flag,
             scan_text=_scan_text,
         )
 
         library_text = ""
-        if _long_doc and _hits:
-            # 长答模式的证据块：只统计/按 CTX_LONG_DOC_EVIDENCE 裁剪
-            ctx_budget.observe(
-                "long_doc_evidence",
-                "\n".join(str(h.get("summary") or h.get("text") or "")
-                          for h in _hits),
-                source=key)
         if _staged:
             logger.info("[LLM] 🧩 已用动态流水线取数 → 跳过静态图书馆")
         elif no_library:
@@ -2916,6 +3033,7 @@ async def call_llm(
                     memory_limit=(LONG_DOC_EVIDENCE if _long_doc
                                   else tuning.i("RET_MEMORY_TOP")),
                     total_budget=(CTX_HARD_CAP if _long_doc else 0),
+                    long_doc=_long_doc,
                     record=False,
                     gid=_gid,
                     addressed=_addressed_flag,
@@ -3123,10 +3241,39 @@ async def call_llm(
     kwargs = {"timeout": 60}
     if PROXY: kwargs["proxy"] = PROXY
 
+    # soft 档（用到日预算 90%）：提醒她「这轮说完就休息」——
+    # 每会话每天只塞一次，别每轮都加（会变成复读）。
+    if _bg_state == "soft":
+        try:
+            if _bg.claim("soft", key):
+                # ⚠️ 不再新增一个 system 块：`selftest_all` 盯着 llm.py 里
+                #    `msgs.append` 的数量（每多一块就多一份固定开销，也更容易
+                #    打断前缀缓存）。这里挂到**最后一个 system 块**（recency 最高，
+                #    本来就是「本轮规矩」的位置）；一个 system 都没有才 insert 一个。
+                _hint = _bg.soft_hint()
+                for _m in reversed(msgs):
+                    if _m.get("role") == "system":
+                        _m["content"] = (str(_m.get("content") or "")
+                                         + "\n\n" + _hint)
+                        break
+                else:
+                    msgs.insert(0, {"role": "system", "content": _hint})
+                logger.info(f"[BUDGET] 接近日预算 → 提示她准备休息（{key}）")
+        except Exception:
+            pass
+
     # 工具按会话类型挂：默认只有私聊有；napcat_help/napcat_call 群聊也挂
     # （群里禁言、改名片、戳一戳本来就是群里的事，不挂等于她做不到）
     _tools = [] if no_tools else tools_for(key, text)
     allow_tools = bool(_tools)
+    # 2026-11-27：本轮「用不了」的工具，明说一句 —— 比让模型自己踩空再补救便宜得多。
+    # 挂在最后一个 system 块末尾（不新增块：selftest 卡 `msgs.append` 数量）。
+    _uh = unavailable_hint()
+    if _uh:
+        for _m in reversed(msgs):
+            if _m.get("role") == "system":
+                _m["content"] = str(_m.get("content") or "") + "\n\n" + _uh
+                break
     reply, reason = "", ""
 
     # 👇 接线快照：`/测函数 链路` 直接看这一份。
@@ -3140,6 +3287,18 @@ async def call_llm(
             _ver = str(getattr(_sa, "VERSION", "") or "")
         except Exception:
             _ver = ""
+        # 整份 prompt 的真实长度：所有 message（system+历史+本条）+ 工具 schema。
+        # ⚠️ 2026-11-27：以前这里直接引用未定义的 `_prompt_chars`，被外层 except 吞掉 →
+        #    整个 `pipeline_last.json` 从来没写成功过（`/测函数 链路` 一直是旧数据）。
+        try:
+            _tool_chars = len(json.dumps(_tools, ensure_ascii=False)) if _tools else 0
+        except Exception:
+            _tool_chars = 0
+        _prompt_chars = sum(len(str(m.get("content") or "")) for m in msgs) + _tool_chars
+        try:
+            ctx_budget.observe_prompt_total(_prompt_chars, source=str(key))
+        except Exception:
+            pass
         _wire = {
             "ts": time.time(),
             "key": str(key),
@@ -3148,6 +3307,9 @@ async def call_llm(
             "ctx_n": len(group_context or []),
             "sys_chars": len(_sys_all),
             "user_chars": len(str(text or "")),
+            # 整份 prompt（含历史/工具说明）：`/测函数 链路` 直接看这个数
+            "prompt_chars": int(_prompt_chars or 0),
+            "long_doc": bool(_long_doc),
             # ▍标题就是「哪些块进来了」——空块不会渲染，所以有标题=真的有内容
             "blocks": re.findall(r"▍([^\n]{1,28})", _sys_all),
             "tools": [(s.get("function") or {}).get("name") for s in _tools],
@@ -3192,7 +3354,11 @@ async def call_llm(
                     "model": ROLEPLAY_MODEL,
                     "messages": msgs,
                     "temperature": 1.0,
-                    "max_tokens": (LONG_DOC_MAX_TOKENS if _long_doc else 800),
+                    # ⚠️ 2026-11-27：以前写死 800，改 .env 的 GLM_MAX_TOKENS /
+                    # ROLEPLAY_MAX_TOKENS 都不生效（用户真机踩到：GLM 主模型回复被卡）。
+                    # 现在读 provider 注册表，并按 provider 上限 clamp。
+                    ROLEPLAY_MAX_TOKENS_FIELD: (
+                        LONG_DOC_MAX_TOKENS if _long_doc else ROLEPLAY_MAX_TOKENS),
                 }
                 if allow_tools:
                     payload["tools"] = _tools

@@ -32,7 +32,7 @@ from services.sticker_library import sticker_lib
 
 from services.aura_logic import (
     parse_reply, has_mention, expand_mentions, wants_voice, bubble_delay,
-    strip_protocol_residue, clean_voice_text,
+    strip_protocol_residue, clean_voice_text, clean_outgoing, extract_stickers,
 )
 
 from services.access import is_owner, display_name, nickname_variants
@@ -43,6 +43,8 @@ from services.config import GROUP_WATCH_MODE, POWER_MODE, power_on  # noqa: E402
 from services import (attention, expression, chat_switch, proactive, mood_judge,
                       profile_miner, quiet_advisor, skill_switch, segments,
                       poke_guard)
+# 意图层（2026-11-27）：只给主动插话用一个「该不该接」的闸门（默认关）。
+from services import atmosphere as atmo_intent
 from services import identity as identity_mod
 from services.prompt_builder import build_prompt
 
@@ -1496,6 +1498,16 @@ async def _reply_quote(event: MessageEvent, max_chars: int | None = None) -> str
             _mid = rid          # 少数适配器的 message_id 是字符串
         d = await get_bot().call_api("get_msg", message_id=_mid)
         out = _quote_from_msg(d, max_chars or QUOTE_MAX_CHARS)
+        # 把「被引用者 QQ」记在 event 上：`_quote_me()` 不再依赖适配器有没有给
+        # `event.reply.sender`（NapCat 经常是空的，2026-11-26 互刷事故根因）。
+        try:
+            _sd = (d.get("sender") or {}) if isinstance(d, dict) else {}
+            _quid = str((d.get("user_id") if isinstance(d, dict) else "")
+                        or _sd.get("user_id") or "")
+            if _quid:
+                setattr(event, "_quote_qq", _quid)
+        except Exception:
+            pass
     except Exception as e:
         # 消息太旧被删 / 权限不够 / 号不对 —— 都不该影响主流程
         logger.debug(f"[QUOTE] 取被引用消息失败（{rid}）: {type(e).__name__}: {e}")
@@ -1744,6 +1756,117 @@ def _reply_to_other(event, self_id: str) -> bool:
         uid = str(getattr(getattr(rp, "sender", None), "user_id", "") or "")
         # 引用的可能是旧号（换号前的她）→ 也算「不是别人」
         return bool(uid) and not _is_self_qq(uid, event)
+    except Exception:
+        return False
+
+
+# ================= 「@她」 vs 「引用回复她」 =================
+# 2026-11-26 用户：「两个角色扮演 ai 互相无限引用回复……把引用回复的权限从硬逻辑
+# 交还给角色扮演 llm，变成一个 function calling，然后这个引用回复尽量去回复，
+# 但不是每次被引用回复都去回复。她自己决定。」
+#
+# 根因：nonebot 的 `event.is_tome()` **同时包含 @她 和 引用回复她**。
+# 以前所有「必回」判定都用 is_tome()，于是「引用她」= 无条件回 →
+# 两个 bot 互相引用就无限对轰。
+# 现在拆开：
+#   · `_at_me()`    —— 真 @（含 @全体？不含，to_me 只认 @她），仍然**必回**；
+#   · `_quote_me()` —— 只是引用回复她 → **软信号**：照常进队列让她自己决定，
+#                     但不再绕过冷却/纯问候/收尾语这些闸门。
+def _quote_target_mid(event) -> str:
+    """这条消息引用的是哪条（reply 段优先，其次 event.reply.message_id）。"""
+    try:
+        for seg in event.get_message():
+            if seg.type == "reply":
+                return str((seg.data or {}).get("id") or "")
+    except Exception:
+        pass
+    try:
+        return str(getattr(getattr(event, "reply", None), "message_id", "") or "")
+    except Exception:
+        return ""
+
+
+def _quote_me(event) -> bool:
+    """这条是「引用回复她」（不判断有没有同时 @）。
+
+    ⚠️ 2026-11-26 真机事故：`event.reply.sender` 在 NapCat 上经常是空的，
+    旧实现只读它 → 引用她永远判成 False → `_at_me()` 退回 `is_tome()`（它同时含引用）
+    → 「引用她」被当成「@她」必回 → 两个 AI 互相引用无限对轰
+    （17:08:49~17:09:13 月下橘引用她 4 次，她回了 4 次，日志里一条 `[LOOP]` 都没有）。
+
+    现在按可靠性从高到低判：
+      ① `_reply_quote` 调 get_msg 时记下的被引用者 QQ（`event._quote_qq`）；
+      ② `event.reply.sender.user_id`（适配器给了就用）；
+      ③ 被引用的 mid 在群现场里是不是她自己发的（`is_bot=True`）。
+    """
+    # ① get_msg 拿到的真实发送者（最可靠）
+    try:
+        _q = str(getattr(event, "_quote_qq", "") or "")
+        if _q and _is_self_qq(_q, event):
+            return True
+    except Exception:
+        pass
+    # ② 适配器给的 reply.sender
+    try:
+        rp = getattr(event, "reply", None)
+        if rp is not None:
+            uid = str(getattr(getattr(rp, "sender", None), "user_id", "") or "")
+            if uid and _is_self_qq(uid, event):
+                return True
+    except Exception:
+        pass
+    # ③ 被引用的 mid 在群现场里 = 她自己发的
+    try:
+        _mid = _quote_target_mid(event)
+        _gid = str(getattr(event, "group_id", "") or "")
+        if _mid and _gid:
+            _m = group_scene.find_by_mid(_gid, _mid)
+            if _m and _m.get("is_bot"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _at_me(event) -> bool:
+    """**只算 @**（「引用回复她」不算）。
+
+    ⚠️ 2026-11-27 真机抓到的根因（比 `_quote_me` 本身更隐蔽）：
+      `event.to_me` / `event.is_tome()` **同时包含「@她」和「引用回复她」**。
+      旧实现第一行就 `if event.to_me: return True` → 引用永远走不到下面的
+      `_quote_me` 判断 → 引用她仍被当成 @ 必回 → 反循环护栏永远不触发
+      （16h 日志：64 次引用她，`[LOOP]` 0 次、软通道日志 0 次）。
+
+    现在顺序反过来：
+      ① 消息里真有 `at` 段指向她 → 必回（即使同时引用她）；
+      ② 只是引用她 → 不算 @（交给模型自己决定）；
+      ③ 适配器只给 `to_me`/`is_tome` 的兜底。
+    """
+    try:
+        # ① 真 @（at 段里有她）—— 优先级最高
+        for seg in event.get_message():
+            if seg.type == "at" and _is_self_qq(str(seg.data.get("qq") or ""), event):
+                return True
+        # ② 引用她（且没有真 @）→ 不算 @
+        if _quote_me(event):
+            return False
+        # ③ 适配器兜底（有些实现只给 to_me）
+        return bool(getattr(event, "to_me", False)) or bool(event.is_tome())
+    except Exception:
+        return False
+
+
+# ---- 反「互相引用」护栏（结构信号，不猜语义）----
+# 同一个群里、同一对人，120s 内出现 ≥3 次「引用→被引用」的来回，
+# 就不再给「引用她」的软通道（只留 @）。
+# 这不是猜「谁在说什么」，只看「谁引用了谁」这个结构。
+# 具体计数/冷却在 `services/quote_guard.py`（无 nonebot 依赖，方便离线单测）：
+#   · 120s 内第 3 次 → 判定互刷；
+#   · 判定后冷却 5 分钟，冷却期内直接不接（真 @ 仍走必回）。
+def _quote_loop_hit(gid, a, b) -> bool:
+    try:
+        from services import quote_guard
+        return quote_guard.hit(gid, a, b, log=logger.info)
     except Exception:
         return False
 
@@ -2256,9 +2379,10 @@ async def _need_reply(event: MessageEvent) -> bool:
             except Exception as e:
                 logger.debug(f"[SCENE] 补现场失败: {type(e).__name__}: {e}")
         # ⚠️ 不要按时间清空上下文（用户 2026-11-19）：
-        #   A 说「你们发现英伟达跌了吗」→ 10 分钟后 B「对啊，都是老黄的锅」，
+        #   A 说「新番看了吗」→ 10 分钟后 B「对啊，都是原作的锅」，
         #   清空后她只看到后半句，等于没有上下文。改成插一条「隔了 N 分钟」分隔线，
         #   时间信息交给模型自己判断（每行本来就带时间戳）。
+        #   ⚠️ 这段只是**给判读看的上下文**；心情/好感只来自她的 [[THINK]]（ADR-038）。
         _silent = time.time() - last_group_activity.get(gid, 0)
         if _silent > SILENT_TIMEOUT:
             try:
@@ -2339,8 +2463,16 @@ async def _need_reply(event: MessageEvent) -> bool:
                 _atq = _canon_at([q for q in _at_targets(event)
                                   if q not in ("all", "everyone")])
                 _me = _self_id(event)
-                if event.is_tome():
+                # ⚠️ 2026-11-27 真机：`event.is_tome()` 在 NapCat 上不只「@ 她」为真
+                #    （引用她也为真，实测甚至「@ 别人」也出现过 True）。
+                #    旧写法只要 is_tome 就把 `_me` 插到最前 → 「萌萌香 @冬眠耗子」
+                #    被记成「→ 你」，她以为整段都在跟自己说话。
+                #    现在：@ 名单里真有她才算；@ 的是别人就保留别人；
+                #    一个 @ 都没有（纯引用/适配器兜底）才补她自己。
+                if _me in _atq:
                     _atq = [_me] + [q for q in _atq if q != _me]
+                elif not _atq and event.is_tome():
+                    _atq = [_me]
                 if _rq and _is_self_qq(_rq, event):
                     _rq = _me
                 _scene_meta = group_scene.observe(
@@ -2523,7 +2655,7 @@ async def _need_reply(event: MessageEvent) -> bool:
             _off, _why = chat_switch.is_off(f"group_{gid}", uid)
             if _off:
                 _strict = chat_switch.is_strict(f"group_{gid}", uid)
-                if event.is_tome() and chat_switch.ANSWER_WHEN_CALLED and not _strict:
+                if _at_me(event) and chat_switch.ANSWER_WHEN_CALLED and not _strict:
                     logger.info(f"[SWITCH] 安静中，但被 @ → 给一次回应机会（{_why}）")
                 else:
                     logger.info(f"[SWITCH] 安静中 → 不入队（{_why}）")
@@ -2552,7 +2684,7 @@ async def _need_reply(event: MessageEvent) -> bool:
         #    她等 15 秒时把这几句读进上下文、并在这轮回复里一起照顾到了；
         #    之后它们再各自触发一次完整回复 = 同一件事回两遍。
         #    **@ 她的一定要回**，所以只拦非 @ 的。
-        if (not event.is_tome()
+        if (not _at_me(event)
                 and float(getattr(event, "time", 0) or 0)
                 <= llm_mod.later_seen_until(gid)):
             logger.info(
@@ -2573,7 +2705,8 @@ async def _need_reply(event: MessageEvent) -> bool:
             #    `[COOLDOWN] 刚回过 Ns，这条没点她` 吞掉，用户看到的就是
             #    「只理了艾特，下一句没理」。关注窗口本来就是「接完还能跟上」。
             _focusing = _focus_active(f"group_{gid}", str(event.user_id))
-            _addressed_now = (event.is_tome() or _focusing
+            # 2026-11-26：「引用她」不再豁免冷却（以前 is_tome 把它和 @ 混在一起）
+            _addressed_now = (_at_me(event) or _focusing
                               or _calls_me_by_name(
                                   _t_own, f"group_{gid}", str(event.user_id)))
             if (_cool > 0 and not _addressed_now and _last_reply > 0
@@ -2589,19 +2722,27 @@ async def _need_reply(event: MessageEvent) -> bool:
         #    很多群夜里只剩这个，她一句句接等于把人吵醒。
         # ⚠️ 但 @ 她的不拦（2026-11-17 审计）：@ 一句「晚安」是明确的社交动作，
         #    大概率就是想被回一句；一刀切会显得很没礼貌。交给模型判断。
-        if SKIP_PURE_GREETING and not event.is_tome() and _is_pure_greeting(t):
+        if SKIP_PURE_GREETING and not _at_me(event) and _is_pure_greeting(t):
             logger.debug(f"[GREET] {gid} 纯问候，不回：{t[:20]}")
             return False
         # 👇 操作性短指令不接（「扫扫」「来了」「发一下」）——
         #    群里在互相配合做事，她插一句就是干扰。@ 她时不受影响。
-        if SKIP_OP_SHORT and not event.is_tome() and _is_op_short(t):
+        if SKIP_OP_SHORT and not _at_me(event) and _is_op_short(t):
             logger.debug(f"[OP] {gid} 操作性短指令，不接：{t[:12]}")
             return False
         # 👇 收尾语不接：别人已经说「算了 / 先这样 / 拜拜」了，再接就是硬凑
-        if SKIP_CLOSING and not event.is_tome() and _is_closing(t):
+        if SKIP_CLOSING and not _at_me(event) and _is_closing(t):
             logger.debug(f"[CLOSE] {gid} 收尾语，不接：{t[:12]}")
             return False
-        if GROUP_NEED_AT and not event.is_tome():
+        # 2026-11-26：「引用回复她」不再等于「必回」。
+        #   ① 反循环护栏：同一对人在 120s 内互相引用 ≥3 次 → 直接不接（只认 @）；
+        #   ② 否则放行到队列，让她自己决定（她有 send / stay_silent 两个工具）。
+        if _quote_me(event) and not _at_me(event):
+            if _quote_loop_hit(gid, uid, _self_id(event)):
+                return False
+            logger.info(f"[QUOTE] {gid} 引用回复她 → 交给模型自己决定（不再硬回）")
+            return True
+        if GROUP_NEED_AT and not _at_me(event):
             # 👇 关注会话：被 @ 之后的后续几条，即使没 @ 也可能接，
             #    但要结合上下文先判断是不是在跟她说，不能每条都答（用户 2026-11-17）。
             if _focus_active(f"group_{gid}", event.user_id):
@@ -4807,7 +4948,12 @@ async def _session_worker(bot: Bot, session_key: str):
             except Exception as e:
                 logger.debug(f"[PROFILE] 更新失败: {e}")
 
-            # ---------- 2) 关键词情绪：降级为兜底（主通道是 DeepSeek 的 [[MEMO]]） ----------
+            # ---------- 2) 关键词情绪：**只影响记忆显著性，不改心情/好感** ----------
+            # 2026-11-26（用户强调「心理活动为唯一判定」）：
+            #   这里算出来的 strong_emotion 只传给 memory_v2.remember 的 emotion_hit /
+            #   emotion_weight（决定这条记忆记不记、记多牢）。
+            #   **心情和好感的唯一输入是她的 [[THINK]] → impact → dv**（ADR-038），
+            #   不是「群里出现了什么词」。
             delta, strong_emotion = 0.0, False
             try:
                 delta, strong_emotion = mood.judge_message_mood(text)
@@ -5596,8 +5742,17 @@ async def _session_worker(bot: Bot, session_key: str):
                 #    自动引用最后一条就会引到别人身上。
                 #    所以优先引「这一段里最后一条真的 @ 了她」的消息。
                 _mens = [r for r in (_seg_records or []) if r.get("mentioned")]
-                if _is_group and _mens:
-                    _auto_rid = str(_mens[-1].get("mid") or "")
+                # ⚠️ 2026-11-27 用户真机：「我说了一句话，之前有个人 @ 她，
+                #    她接了我的话，却引用了上次 @ 那个人的消息」。
+                #    根因：这里无条件取「段内最后一条 @ 她的」，哪怕那之后别人
+                #    又说了话、她实际回的是后面那句 → 引用挂到旧 @ 上。
+                #    现在只有「@ 她的那条**就是最后一条**」才自动引用；
+                #    最后一条是「引用她」的，落到下面的 `ev.is_tome()` 分支引最后一条；
+                #    最后一条是别人普通插话 → 不自动引用（让模型自己写 `<reply:>`）。
+                _last_mid = str(((_seg_records or [])[-1] or {}).get("mid") or "")
+                if (_is_group and _mens
+                        and str(_mens[-1].get("mid") or "") == _last_mid):
+                    _auto_rid = _last_mid
                     _auto_call = str(_mens[-1].get("name") or "")
                 elif _is_group and (ev.is_tome() or _pic_msg):
                     _auto_rid = str(getattr(ev, "message_id", "") or "")
@@ -5703,6 +5858,15 @@ async def _session_worker(bot: Bot, session_key: str):
                     if _has_long_tag:
                         val = val.strip()[len("[[LONG]]"):].strip()
                     _long = _has_long_tag and not _is_group
+                    # 2026-11-27：发送前最后一道兜底 —— 任何残留协议标记都不许外发。
+                    # （正文路径 parse_reply 洗过一遍，但长文/合并转发/工具回填可能带残留）
+                    try:
+                        _v2 = clean_outgoing(val)
+                        if _v2 != val:
+                            logger.info(f"[OUT] 剥掉残留协议标记：{val[:50]}")
+                            val = _v2
+                    except Exception:
+                        pass
                     # 👇 群聊规矩（用户 2026-11-18）：**20 字内直接发，20 字以上合并转发**。
                     #    以前是 >20 字直接截断，经常砍在半句话上。
                     #    带真 @ / 引用回复的没法塞进卡片，这两种才退回截断。
@@ -6140,6 +6304,22 @@ async def _random_chat_loop(bot: Bot):
                     if not decision["reply"]:
                         logger.debug(f"[GROUP] {gid} 不接话: {decision['reason']}")
                         continue
+
+                    # 👇 意图层闸门（2026-11-27，默认关）：只挡「主动插话」，
+                    #    不影响 @ 她的正常回复。离线评测 need_reply 准确率
+                    #    ≥85% 之前 ATMO_GATE=0；拿不到新鲜意图（缓存过期）就不挡。
+                    if atmo_intent.gate_on():
+                        # 只有「她看过的那段窗口 == 现在这段」才敢用这个结论。
+                        try:
+                            _tail = group_scene.history_lines(gid, 2)
+                        except Exception:
+                            _tail = None
+                        _it = atmo_intent.fresh(gid, tail=_tail)
+                        if atmo_intent.need_reply_of(_it) == "no":
+                            logger.info(
+                                f"[INTENT] {gid} 意图=不用接"
+                                f"（{_it.get('why') or '—'}）→ 本轮不插话")
+                            continue
 
                     # 查看频率：刚连说过几句 → 内部频率已经衰减，这里会自然收敛；
                     # 久没开口 → 恢复期逐步放开（用户 2026-11-19，参考 MaiBot）。
@@ -6655,6 +6835,8 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
             "· 主动 — 主动私聊现在会想找谁（只看不发）\n"
             "· 用量 — API 余额 + 本机记账的调用量（token/次数/缓存命中）\n"
             "· 心情 — 她的原话 / 第三方判读（名词+阈值）/ 老数值 对照（加「重判」重跑）\n"
+            "  · 心情 敏感度 [1.3] — 看她多容易被话影响（不带数字=只看）\n"
+            "· 关系 [QQ号] — 最近的信任/尊重/好感事件流水 + 当前四量\n"
             "· 头像 QQ号 — 头像从哪来：NapCat / 直连 / 为什么没拿到\n"
             "· 全链路 — 一条命令看心情这套通没通（判读/数值/插话/安静/记忆/档案）\n"
             "· 安静 [群号/QQ] [时长] — 强制安静（连 @ 也不回；默认 60 分钟）\n"
@@ -6779,6 +6961,11 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
             f"· 会话 {_d.get('key')}｜人格 {_d.get('persona')}｜媒体 {_d.get('media')}",
             f"· 上下文 {_d.get('ctx_n')} 条｜system {_d.get('sys_chars')} 字"
             f"｜user {_d.get('user_chars')} 字",
+            # 2026-11-27：整份 prompt 的真实长度（含历史/工具 schema）。
+            # `PROMPT_BUDGET=2200` 只约束动态块，整份超了只告警不裁 —— 这里给真相。
+            f"· 整份 prompt {_d.get('prompt_chars') or '?'} 字"
+            f"（软上限 {tuning.i('CTX_SOFT_CAP')}，超了只告警不裁）"
+            + ("｜长答模式 long_doc" if _d.get("long_doc") else ""),
             f"· 安静 {_d.get('off')}（强制不回 {_d.get('forced_silent')}）"
             f"｜注意力档位 {_d.get('drift')}",
             f"· 工具 {_n_tools} 个（约 {_n_tools * 80} token）："
@@ -7064,6 +7251,41 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
             pass
         _msg = "\n".join(_lines)
         for _i, _c in enumerate(_chunk_text(_msg, 1200), 1):
+            await bot.send(event, _c)
+            await asyncio.sleep(0.3)
+        await _test_fn.finish()
+
+    if what.startswith(("档案库", "旧档案", "archive")):
+        # /测函数 档案库 [迁移] —— 看个人档案库（30 天以前，只她自己能查）
+        from services import archive as _ar
+        if any(k in what for k in ("迁移", "搬", "migrate")):
+            try:
+                _r1 = await asyncio.to_thread(
+                    _ar.migrate_dialogue, min_age_days=_ar.MIN_AGE_DAYS)
+                _r2 = await asyncio.to_thread(
+                    _ar.migrate_memdb, min_age_days=_ar.MIN_AGE_DAYS)
+                await bot.send(event, f"迁移完成：\n· 对话 {_r1}\n· 旧记忆 {_r2}")
+            except Exception as e:
+                await bot.send(event, f"迁移失败：{type(e).__name__}: {e}")
+        _txt_a = _ar.status_text()
+        for _c in _chunk_text(_txt_a, 1200):
+            await bot.send(event, _c)
+            await asyncio.sleep(0.3)
+        await _test_fn.finish()
+
+    if what.startswith(("气氛", "读气氛", "意图", "atmo", "intent")):
+        # /测函数 气氛 [群号] [刷新] —— 看接话前读到的群氛围（谁在难过/其他人什么状态）。
+        # 「刷新/强制」会真的再读一次（花一次很小的 LLM 调用）。
+        from services import atmosphere as _atmo
+        _gid_a = _tgt_gid or str(getattr(event, "group_id", "") or "")
+        if any(k in what for k in ("刷新", "强制", "重读")):
+            try:
+                await asyncio.wait_for(
+                    _atmo.read(_gid_a, force=True), timeout=_atmo.TIMEOUT + 1)
+            except Exception as e:
+                await bot.send(event, f"读气氛失败：{type(e).__name__}: {e}")
+        _txt_a = _atmo.status(_gid_a)
+        for _c in _chunk_text(_txt_a, 1200):
             await bot.send(event, _c)
             await asyncio.sleep(0.3)
         await _test_fn.finish()
@@ -7630,10 +7852,54 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
         logger.warning("[SCENE-CARD] 现场图渲染返回空（Pillow/字体？），退回文字")
         await _test_fn.finish(_scene_selfcheck(event, gid=_scope))
 
+    if what.startswith(("关系", "relationship", "rel ")) or what == "rel":
+        # 👇 2026-11-27：`relationship.audit_text()` 的 docstring 一直写着
+        #    「给 /测函数 关系 用」，但这条命令从来没存在过（函数 0 引用）。
+        #    /测函数 关系 [QQ号] —— 最近的信任/尊重/好感事件流水 + 当前四量。
+        from services import relationship as _rel
+        _q = _tgt_qq or ""
+        _lines = [f"▍关系事件（{('QQ ' + _q) if _q else '全部会话'}，最近 10 条）"]
+        try:
+            if _q:
+                _s = _rel.state_of(_q)
+                _lines.append(
+                    f"· 现在：好感 {_s['affinity']:+.3f}｜信任 {_s['trust']:.2f}"
+                    f"｜尊重 {_s['respect']:.2f}｜亲近 {_s['intimacy']:.2f}")
+        except Exception:
+            pass
+        try:
+            _lines.append(_rel.audit_text(_q, 10))
+        except Exception as e:
+            _lines.append(f"读流水失败：{type(e).__name__}: {e}")
+        await _test_fn.finish("\n".join(_lines))
+
     if what.startswith(("心情", "mood")):
         # 心情判读（影子）：她的原话 / 第三方判读 / 老数值 三者对照
         # 带群号就查那个群的心情（私聊里也能看群）
         _sk = f"group_{_tgt_gid}" if _tgt_gid else _get_session_key(event)
+        # 👇 2026-11-27：敏感度旋钮（以前 `mood.set_sensitivity()` 写好了但**没有
+        #    任何写入口**，`sensitivity()` 永远读默认 1.0 —— 等于死的）。
+        #    /测函数 心情 敏感度        → 只看
+        #    /测函数 心情 敏感度 1.3    → 设成 1.3（范围 SENS_MIN~SENS_MAX）
+        if "敏感度" in what or "sens" in what.lower():
+            _arg = re.sub(r"(敏感度|sens(?:itivity)?)", " ", what,
+                          flags=re.I).strip()
+            _cur = mood.sensitivity(_sk)
+            if not _arg:
+                await _test_fn.finish(
+                    f"当前敏感度 {_cur:.2f}（{_sk}）\n"
+                    f"范围 {mood.SENS_MIN:.2f}~{mood.SENS_MAX:.2f}，默认 1.0"
+                    "（乘在心情观测步长上：1.3 = 更容易被她的话影响）\n"
+                    "用法：/测函数 心情 敏感度 1.3")
+            try:
+                _nv = mood.set_sensitivity(float(_arg.split()[0]), _sk)
+            except Exception as e:
+                await _test_fn.finish(
+                    f"设置失败：{type(e).__name__}: {e}\n"
+                    "用法：/测函数 心情 敏感度 1.3")
+            await _test_fn.finish(
+                f"敏感度 {_cur:.2f} → {_nv:.2f}（{_sk}）\n"
+                f"范围 {mood.SENS_MIN:.2f}~{mood.SENS_MAX:.2f}；写回 1.0 恢复默认")
         try:
             _m = mood.get_mood(_sk)
         except Exception as e:
@@ -7759,6 +8025,12 @@ async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
         try:
             from services import llm_usage as _lu, api_usage as _au
             _out = [_lu.report_text(_d)]
+            # 2026-11-27：日预算刹车现在是真的（到 100% 她会说一句然后当天不消耗）
+            try:
+                from services import budget_guard as _bgd
+                _out.append(_bgd.status_text())
+            except Exception:
+                pass
             try:
                 _bal = await _au.fetch_balance()
                 if _bal.get("ok") and _bal.get("items"):
@@ -8176,6 +8448,46 @@ def _safe_send_path(p: str):
     return None
 
 
+# ================= 工具可用性预检（2026-11-27） =================
+# 用户：「工具无法使用/超时的时候，它会把调用句子发出来（TOOLS|画图 TOOLS|搜图）。
+#       加一层降级策略，调用之前先看工具状态。」
+# services 层不知道「/技能 开关 / 算力机 caps / 心跳」，所以由这里注入回调。
+_NODE_CAP_TOOLS = {
+    "draw": "draw", "draw_image": "draw", "draw_from_pixiv": "draw",
+    "sing": "tts", "tts": "tts", "tts_voice": "tts",
+    "cover": "cover", "song": "cover", "rvc": "rvc", "rvc_cover": "rvc",
+    "audio_split": "split", "split": "split",
+    "video_understand": "video_understand",
+}
+
+
+def _tool_available(name: str) -> tuple:
+    """(可用?, 原因) —— 调用前预检，不可用就**不挂**这个工具。"""
+    try:
+        if not skill_switch.is_enabled(name):
+            return False, "被 /技能 关了"
+    except Exception:
+        pass
+    need = _NODE_CAP_TOOLS.get(str(name))
+    if need:
+        try:
+            from plugins.tool_dispatcher import STATUS
+            caps = set(STATUS.get("caps") or [])
+            if not _compute_online():
+                return False, "算力机离线"
+            if caps and need not in caps:
+                return False, "算力机没上报 %s" % need
+        except Exception:
+            pass
+    return True, ""
+
+
+try:
+    llm_mod.set_availability(_tool_available)
+except Exception as e:  # pragma: no cover
+    logger.warning(f"[TOOLS] 可用性回调注入失败：{type(e).__name__}: {e}")
+
+
 async def _tool_send(args: dict) -> str:
     """把待发内容 / 文字 / 图片 / 语音发到当前会话。"""
     from pathlib import Path
@@ -8188,6 +8500,12 @@ async def _tool_send(args: dict) -> str:
     done = _pending_sent()
     msg = Message()
     used = []
+
+    # ①' 引用回复（2026-11-26）：她可以自己决定引用哪条。
+    #     reply 段必须是第一个段，否则 NapCat 不认。
+    _quote = str(args.get("quote") or "").strip()
+    if _quote.isdigit():
+        msg += MessageSegment.reply(int(_quote))
 
     # ① 工具拦下来的待发内容（编号从 1 开始，工具结果里会告诉她）
     _p = args.get("pending")
@@ -8204,8 +8522,29 @@ async def _tool_send(args: dict) -> str:
 
     # ② 她自己写的文字 / @ / 图片 / 语音
     _text = str(args.get("text") or "").strip()
+    _stickers: list = []
     if _text:
-        msg += MessageSegment.text(_text)
+        # ⚠️ 2026-11-27 真机：模型把「工具目录标记」当话交给 send →
+        #    群里直接出现 `[[TOOLS|画图与搜图]]`（bot log 16:16:34）。
+        #    send 的参数以前没走 parse_reply 的清洗，这里补上；
+        #    洗完是空的 → 说明整句都是标记，**不发**，并告诉她该怎么改。
+        # ⚠️ 2026-11-27 18:03 又一条（群 100000016）：
+        #    `send(text="这群已经变成图片展览馆了 |||<sticker:吃瓜>")` →
+        #    群里原样看到 `|||<sticker:吃瓜>`。所以这里要把表情标签**摘出来真发**，
+        #    文字里的 `|||` / `<sticker:…>` 由 clean_outgoing 清掉。
+        _stickers = extract_stickers(_text)
+        _clean = clean_outgoing(_text)
+        if not _clean and not _stickers:
+            logger.info(f"[SEND-TOOL] 只收到协议标记，已拦下：{_text[:60]}")
+            return ("这条不是要发的话，是**给你自己看的协议标记**（工具目录/记忆/引用之类）。"
+                    "已经替你丢掉了，没有发出去。要说话就直接写要说的话；"
+                    "要用工具就直接调用工具，别把调用写法当文字发。")
+        if _clean:
+            if _clean != _text:
+                logger.info(f"[SEND-TOOL] 剥掉协议标记后发送：{_text[:40]} → {_clean[:40]}")
+            msg += MessageSegment.text(_clean)
+        elif _stickers:
+            logger.info(f"[SEND-TOOL] 文字部分只有表情标签：{_stickers}")
     _at = str(args.get("at") or "").strip()
     if _at.isdigit():
         msg += MessageSegment.at(int(_at))
@@ -8225,16 +8564,36 @@ async def _tool_send(args: dict) -> str:
                     f"{_f[:80]}")
         msg += _seg(f"file://{_sp}")
 
-    if not msg:
+    if not msg and not _stickers:
         return "没说要发什么（pending / text / image / voice 至少给一个）"
 
-    try:
-        await bot.send(event=ev, message=msg)
-    except Exception as e:
-        if _is_send_timeout(e):
-            return "发出去了（图片可能晚几秒到）"
-        logger.warning(f"[SEND-TOOL] 发送失败: {type(e).__name__}: {e}")
-        return f"没发出去：{type(e).__name__}"
+    if msg:
+        try:
+            await bot.send(event=ev, message=msg)
+        except Exception as e:
+            if _is_send_timeout(e):
+                return "发出去了（图片可能晚几秒到）"
+            logger.warning(f"[SEND-TOOL] 发送失败: {type(e).__name__}: {e}")
+            return f"没发出去：{type(e).__name__}"
+
+    # `<sticker:吃瓜>` → 真发一张表情（走表情库的精确/近义匹配；没有就静默跳过）
+    _st_note = ""
+    if _stickers:
+        _ok, _miss = 0, []
+        for _tag in _stickers[:2]:
+            try:
+                if await send_sticker_by_tag(bot, ev, _tag):
+                    _ok += 1
+                else:
+                    _miss.append(_tag)
+            except Exception as e:
+                _miss.append(f"{_tag}({type(e).__name__})")
+        if _ok:
+            _st_note += f"（另外发了一张「{_stickers[0]}」表情）"
+        if _miss:
+            logger.info(f"[SEND-TOOL] 表情库里没有：{_miss}")
+            _st_note += (f"（表情「{'、'.join(_miss)}」库里没有，没发出去；"
+                         "别跟对方说你发了表情）")
 
     done.update(used)
     # 记一笔：这一轮她已经用工具发过东西了。
@@ -8245,7 +8604,7 @@ async def _tool_send(args: dict) -> str:
         _LAST_TOOL_SEND[_sk] = time.time()
     except Exception:
         pass
-    return "发出去了"
+    return "发出去了" + _st_note
 
 
 register_tool(
@@ -8267,6 +8626,9 @@ register_tool(
                     "image": {"type": "string", "description": "图片路径或 URL"},
                     "voice": {"type": "string", "description": "语音文件路径"},
                     "at": {"type": "string", "description": "要 @ 的 QQ 号"},
+                    "quote": {"type": "string",
+                              "description": "要引用回复的消息号（群聊里那条消息开头的数字）。"
+                                             "引用回复是她自己的决定，不是必须的。"},
                 },
                 "required": [],
             },
@@ -9358,7 +9720,7 @@ register_tool(
 _GIRL_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/127.0.0.1 Safari/537.36"
     )
 }
 

@@ -30,6 +30,10 @@ def all_py() -> list:
     files += sorted(PLUGINS.glob("*/__init__.py"))
     files += sorted((ROOT / "scripts").glob("*.py"))
     files += [ROOT / "node.py"] if (ROOT / "node.py").exists() else []
+    # ⚠️ 2026-11-27：以前不扫 bot.py → `services/dep_trace.py` 永远被判孤儿
+    #    （它唯一的调用点就是 `bot.py` 的 `_install_dep_trace()`）。
+    #    误报比漏报更糟：会让人去「修」一个本来正常的模块。
+    files += [ROOT / "bot.py"] if (ROOT / "bot.py").exists() else []
     return [f for f in files if f.exists()]
 
 
@@ -177,8 +181,12 @@ def main() -> int:
             inner = refs[0][1] if refs else 0
             (dead_real if inner <= 0 else dead_inner).append((rel, name, lineno, inner))
 
+    # ⚠️ 2026-11-27 口径校准：**死代码 ≠ 接线断裂**。
+    #    · 孤儿模块（services/*.py 没人 import）＝ 真断线 → 阻塞；
+    #    · 零引用公开函数 ＝ 冗余/预留 → **只提示，不阻塞**（删或接线都是产品决定，
+    #      脚本不该替人拍板；但也不许当作「已接线」自证）。
     if dead_real:
-        print(f"❌ 纯死代码（全项目 0 引用，建议删）：{len(dead_real)} 个")
+        print(f"⚠️ 纯死代码（全项目 0 引用，建议删或接线）：{len(dead_real)} 个")
         for path, name, ln, _ in dead_real:
             print(f"   · {path}::{name}()  L{ln}")
     else:
@@ -194,9 +202,12 @@ def main() -> int:
 
     print()
     print("=" * 70)
-    print(f"小结：孤儿模块 {len(orphan)}｜真死代码 {len(dead_real)}"
-          f"｜内部函数 {len(dead_inner)}｜工具链问题 {len(problems)}")
-    return 1 if (orphan or dead_real or problems) else 0
+    print(f"小结：孤儿模块 {len(orphan)}（阻塞）｜纯死代码 {len(dead_real)}（提示）"
+          f"｜内部函数 {len(dead_inner)}｜工具链问题 {len(problems)}（阻塞）")
+    if dead_real:
+        print("   ↳ 死代码不阻塞构建；要清就「删掉」或「真的接上去」，"
+              "别靠改这个脚本变绿。")
+    return 1 if (orphan or problems) else 0
 
 
 if __name__ == "__main__":

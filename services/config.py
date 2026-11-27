@@ -59,6 +59,12 @@ _roleplay = _resolve_provider("roleplay")
 ROLEPLAY_API_KEY = _roleplay["api_key"]
 ROLEPLAY_BASE_URL = _roleplay["base_url"]
 ROLEPLAY_MODEL = _roleplay["model"]
+# 2026-11-27：主聊天输出 token 也走 provider 注册表（以前 llm.py 写死 800，
+# 用户改 .env 的 GLM_MAX_TOKENS / ROLEPLAY_MAX_TOKENS 都不生效）。
+ROLEPLAY_MAX_TOKENS = int(_roleplay.get("max_tokens")
+                          or tuning.i("ROLEPLAY_MAX_TOKENS"))
+ROLEPLAY_MAX_TOKENS_FIELD = str(
+    _roleplay.get("max_tokens_field") or "max_tokens")
 # ⚠️ MAX_HISTORY 已废弃删除：历史轮次由 chat 的 MAX_GROUP_RECENT（群聊上下文条数）
 #    + prompt_builder 的预算分配（PROMPT_BUDGET / BLOCK_BUDGET）共同控制。
 #    .env 里留着 MAX_HISTORY 也不会有任何作用。

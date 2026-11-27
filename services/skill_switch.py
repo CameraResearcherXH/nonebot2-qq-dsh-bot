@@ -46,7 +46,8 @@ SKILL_GROUPS = {
     "self_tools": {"self_tool_file", "self_tool_run", "self_tool_write"},
     # CODE_AGENT=harness 时的改代码桥（和 self_tools 二选一）
     "code": {"harness_ask", "harness_status", "harness_reset"},
-    "vision": {"vision_source"},
+    # ocr_image：图里字看不清时用 OpenCV 增强再读（2026-11-27）
+    "vision": {"vision_source", "ocr_image"},
     "lore": {"lore_add"},
     "proactive": {"proactive.interject", "proactive.private"},
     "third_party": {

@@ -2,13 +2,17 @@
 """块级上下文预算（CTX_*）：先量，再决定裁不裁。
 
 为什么单独一个模块：
-  · CTX_* 的默认值来自 DESIGN §3.3（**token** 口径），而 live 的块是**字符**；
+  · CTX_* 存的是**单块上限（token 口径）**，而 live 的块是**字符**；
     直接拿 120 当字符会把状态卡/协议裁成残句。
+  · DESIGN §3.3 的 2120 是**常态目标（字符）**，不是这里的值；
+    这里是「单块最多能有多大」，最后还有 `PROMPT_BUDGET=2200` 总池兜底。
   · 所以默认 `CTX_ENFORCE=0`：只统计每个块多大、超了多少，日志里报一次；
     确认某个块真的该裁，再把 `CTX_ENFORCE=1`（或以后按块开关）打开。
-  · 这样 15 个键全部**有真实读点**，但不会一上来就改变线上 prompt。
+  · 这样 **18 个块级键**（15 个 token 口径 + 3 个字符口径）全部**有真实读点**，
+    但不会一上来就改变线上 prompt。
 
-换算：中文约 1 token ≈ 1.5 字（保守），所以 chars = CTX_* × 1.5。
+换算：中文约 1 token ≈ 1.5 字（保守），所以 chars = CTX_* × 1.5；
+`CTX_PROFILE / CTX_EVIDENCE / CTX_SUMMARY` 本身已是字符，scale=1.0。
 """
 from __future__ import annotations
 
@@ -38,8 +42,11 @@ BUDGET = {
     "multitarget": ("CTX_MULTITARGET", 1.5),
     "white_moon": ("CTX_WHITE_MOON", 1.5),
     "style_total": ("CTX_STYLE_TOTAL", 1.5),
-    "long_doc_evidence": ("CTX_LONG_DOC_EVIDENCE", 1.5),
-    "long_doc_library": ("CTX_LONG_DOC_LIBRARY", 1.5),
+    # ⚠️ 2026-11-27（外部审计）：DESIGN §3.3 的 6000/3000 是**字符**
+    # （3 篇 × ≤1900 + 出处 300 = 6000），不是 token。以前这里 ×1.5
+    # 变成 9000/4500，和 `design_constants.BUDGET` 的 6000/3000 对不上。
+    "long_doc_evidence": ("CTX_LONG_DOC_EVIDENCE", 1.0),
+    "long_doc_library": ("CTX_LONG_DOC_LIBRARY", 1.0),
     # ⚠️ 下面三个是**字符口径**（scale=1.0）：prompt_builder.BLOCK_BUDGET 直接拿它们
     # 当字符用（profile / memory_index / yesterday）。以前这里没有映射，导致
     # 同一个键在别处被 ×1.5、在这里没人观测（2026-11-25 统一）。
@@ -49,7 +56,7 @@ BUDGET = {
 }
 
 # ⚠️ 这里必须用 `tuning.i("字面量")`：audit_coverage 靠它判断「参数有没有真读」。
-#    动态 `tuning.i(key)` 会被判成空转（15 个 CTX_* 全被标红）。
+#    动态 `tuning.i(key)` 会被判成空转（18 个块级 CTX_* 全被标红）。
 _LIMITS = {
     "CTX_PERSONA": tuning.i("CTX_PERSONA"),
     "CTX_EXPRESSION": tuning.i("CTX_EXPRESSION"),
@@ -66,6 +73,8 @@ _LIMITS = {
     "CTX_STYLE_TOTAL": tuning.i("CTX_STYLE_TOTAL"),
     "CTX_LONG_DOC_EVIDENCE": tuning.i("CTX_LONG_DOC_EVIDENCE"),
     "CTX_LONG_DOC_LIBRARY": tuning.i("CTX_LONG_DOC_LIBRARY"),
+    # 整份 prompt 的观测上限（2026-11-27）：只记账/告警，不裁剪
+    "CTX_SOFT_CAP": tuning.i("CTX_SOFT_CAP"),
     # 字符口径（scale=1.0），见 BUDGET 末尾注释
     "CTX_PROFILE": tuning.i("CTX_PROFILE"),
     "CTX_EVIDENCE": tuning.i("CTX_EVIDENCE"),
@@ -139,6 +148,25 @@ def observe_lines(block: str, lines: list, *, source: str = "") -> list:
     if out and limit:
         _note(block, total, limit)
     return out
+
+
+def observe_prompt_total(chars: int, *, source: str = "") -> int:
+    """统计**整份 prompt**（所有 system+user 块）的字符数。
+
+    2026-11-27（外部审计）：「live 总池 2200」只约束 `BLOCK_BUDGET` 里的动态块，
+    persona/protocol/post_rules/tools/history 走 `observe`，默认只统计不裁 ——
+    所以「整份 prompt ≤2200」从来不是事实。这里把整份长度显式记账，
+    超 `CTX_SOFT_CAP` 打一条告警（同一 block 10 分钟内只打一次），
+    让 `/测函数 预算` 能看到真相，而不是继续假装 2200 是总闸。
+    """
+    n = max(0, int(chars or 0))
+    limit = _LIMITS.get("CTX_SOFT_CAP", 0)
+    if not limit:
+        return n
+    _note("prompt_total", n, limit)
+    if n > limit:
+        _warn("prompt_total", n, limit, source)
+    return n
 
 
 def note_style_total(parts) -> int:

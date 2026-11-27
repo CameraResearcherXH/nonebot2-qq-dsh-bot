@@ -15,6 +15,11 @@
 5. `--runtime`：每个设计键都必须有真实读点（AST，排除 UNWIRED）；
    线上 .env 覆盖后仍要满足「单块上限 ≥ 该块设计目标」「风格合计 ≥ 分项和」
    「PROMPT_BUDGET ≥ 常态目标」。
+6. **叙述型事实**（2026-11-27 新增，默认模式就跑）：文档里的说法必须和代码一致 ——
+   `tuning.UNWIRED` 的数量/键名、`mood_judge` 是否还有硬编码步长、
+   `ctx_budget` 的 13 token / 5 字符分类、`style_total` 字符上限 1095、
+   全局锚点 `GLOBAL_SHARE`、静默锚点 35min、私聊 `PRIVATE_MAX_HANZI`。
+   这些以前只写在正文里、永远绿，是文档腐烂的主要来源。
 
 退出码：有 FAIL = 1（CI 用）。--strict 时警告也算失败。
 
@@ -147,7 +152,11 @@ def check_mood(sec: list[tuple[int, str]]) -> list[str]:
         (("半衰期",), [str(D.MOOD["half_life_group_min"]) + "min",
                        str(D.MOOD["half_life_private_min"] // 60) + "h",
                        str(D.MOOD["half_life_global_min"] // 60) + "h"]),
-        (("观测步长",), [str(D.MOOD["step_1"]), str(D.MOOD["step_2"])]),
+        # 2026-11-26（v2.5）：档位从 5 档扩到 7 档，step_3 必须一起校验，
+        # 否则「代码加了 ±3、常量还是 2」会假绿（2026-11-26 审计修复）。
+        (("观测档位",), ["-3", "+3"]),
+        (("观测步长",), [str(D.MOOD["step_1"]), str(D.MOOD["step_2"]),
+                         str(D.MOOD["step_3"])]),
         (("人设敏感度",), [str(D.MOOD["sensitivity_min"]),
                            str(D.MOOD["sensitivity_max"])]),
         (("饱和",), [str(D.MOOD["saturation"])]),
@@ -159,7 +168,8 @@ def check_mood(sec: list[tuple[int, str]]) -> list[str]:
                          str(D.ANCHOR["idle_min"])]),
         (("锚点增益",), [str(D.ANCHOR["gain"]),
                          str(D.ANCHOR["deadband"]),
-                         str(D.ANCHOR["max_move"])]),
+                         str(D.ANCHOR["max_move"]),
+                         str(D.ANCHOR["weight"])]),
         # 快速通道 / 强负面护栏已于 ADR-038 删除（2026-11-25）：
         # 文档 §3.1 里那一行改成「已删除」，不再要求出现 0.45 / 0.25 / 1.5。
     ]
@@ -316,6 +326,31 @@ def check_self() -> list[str]:
         bad.append("AFFINITY_TARGETS 含未定义 target")
     if len(D.ENUMS["target"]) != 5:
         bad.append("target 枚举不是 5 值")
+    # 2026-11-27（外部审计）：ctx_total() 是 token 值之和，不是字符。
+    # 用 ctx_budget.limit_chars 反算实际字符和，两份映射漂了要报出来。
+    try:
+        from services import ctx_budget as _cb
+        _blocks = ("persona", "expression", "protocol", "state", "profile",
+                   "summary", "evidence", "rhythm", "history", "post_rules",
+                   "anchor", "white_moon")
+        _real = sum(_cb.limit_chars(b) for b in _blocks) + _cb.limit_chars("style")
+        if D.ctx_total_chars() != _real:
+            bad.append(
+                "ctx_total_chars()=%d 与 ctx_budget 实际字符和 %d 不一致"
+                % (D.ctx_total_chars(), _real))
+        # 2026-11-27（外部审计）：long_doc 的 6000/3000 是**字符**，不是 token。
+        # 以前 ctx_budget 对这两个键 ×1.5 → 9000/4500，和 DESIGN 的 6000/3000 对不上。
+        _le = _cb.limit_chars("long_doc_evidence")
+        _ll = _cb.limit_chars("long_doc_library")
+        if _le != D.BUDGET["evidence_long"]:
+            bad.append("long_doc 证据块 %d 字 ≠ DESIGN %d 字（单位/换算漂了）"
+                       % (_le, D.BUDGET["evidence_long"]))
+        if _ll != D.BUDGET["library_long"]:
+            bad.append("long_doc 图书馆块 %d 字 ≠ DESIGN %d 字（单位/换算漂了）"
+                       % (_ll, D.BUDGET["library_long"]))
+    except Exception as e:
+        bad.append("ctx_total_chars 校验失败: %s: %s" % (type(e).__name__, e))
+
     long_total = (D.budget_total() - D.BUDGET["evidence"]
                   + D.BUDGET["evidence_long"] + D.BUDGET["library_long"])
     if long_total > D.BUDGET["hard_cap"]:
@@ -434,6 +469,92 @@ def check_terms(text: str) -> list[str]:
             for t in REQUIRED_TERMS if t not in body]
 
 
+# ---------------------------------------------------------------- 叙述型事实
+def check_narrative(text: str) -> list[str]:
+    """校验「叙述型事实」：文档里的说法必须和代码现状一致。
+
+    为什么要有（2026-11-27 第二轮外部审计）：
+      默认模式只校验 §3 的**数字**，于是
+      「`tuning.UNWIRED` 已清空」「`_step` 是待收口的双真相」「730 字符」
+      这类**叙述**永远绿 —— 文档因此在同一天里腐烂了好几处。
+      这里把「能被代码证伪的句子」变成断言：代码是真相，文档必须跟着说。
+    """
+    out: list[str] = []
+    tun = (ROOT / "core" / "tuning.py").read_text(encoding="utf-8", errors="ignore")
+    mj = (ROOT / "services" / "mood_judge.py").read_text(encoding="utf-8", errors="ignore")
+
+    # ① tuning.UNWIRED 的数量/键名
+    m = re.search(r"^UNWIRED\s*=\s*frozenset\(\{(.*?)\}\)", tun, re.S | re.M)
+    keys = re.findall(r"['\"]([A-Z0-9_]+)['\"]", m.group(1)) if m else []
+    if not keys:
+        if "已清空" not in text:
+            out.append("tuning.UNWIRED 是空的，但 DESIGN 没写「已清空」")
+    else:
+        if "已清空" in text and "只剩" not in text:
+            out.append("tuning.UNWIRED 还有 %d 个（%s），DESIGN 却写「已清空」"
+                       % (len(keys), ", ".join(keys)))
+        for k in keys:
+            if k not in text:
+                out.append("tuning.UNWIRED 里的 %s 没在 DESIGN 登记" % k)
+
+    # ② mood_judge 的步长是否还有硬编码副本
+    hard = re.search(r"_step\s*=\s*0\.(?:40|22|10)\b", mj)
+    if hard and "待收口" not in text:
+        out.append("mood_judge.py 仍有硬编码 `_step = 0.4x/0.22/0.10`，"
+                   "DESIGN 必须标「待收口」")
+    if not hard and "待收口" in text and "已收口" not in text:
+        out.append("mood_judge.py 已从 tuning 读步长，DESIGN 仍写「待收口」→ 改成「已收口」")
+
+    # ③ ctx_budget 的 token / 字符口径数量
+    try:
+        from services import ctx_budget as cb
+    except Exception as e:                      # pragma: no cover
+        out.append("check_narrative 无法导入 ctx_budget：%s" % e)
+        return out
+    n15 = sum(1 for _k, (_n, s) in cb.BUDGET.items() if float(s) == 1.5)
+    n10 = sum(1 for _k, (_n, s) in cb.BUDGET.items() if float(s) == 1.0)
+    if ("%d 个 token 口径" % n15) not in text:
+        out.append("ctx_budget 实际 %d 个 token 口径 ×1.5，DESIGN 没写对"
+                   "（应出现「%d 个 token 口径」）" % (n15, n15))
+    if ("%d 个字符口径" % n10) not in text:
+        out.append("ctx_budget 实际 %d 个字符口径 ×1.0，DESIGN 没写对"
+                   "（应出现「%d 个字符口径」）" % (n10, n10))
+
+    # ④ 风格合计的**字符**上限（730 token ×1.5）
+    lim = cb.limit_chars("style_total")
+    if lim and str(lim) not in text:
+        out.append("style_total 运行时字符上限是 %d（730×1.5），DESIGN 没写这个数"
+                   "（只写 730 会被读成字符）" % lim)
+
+    # ⑤ 全局锚点的 GLOBAL_SHARE
+    if "GLOBAL_SHARE" not in text:
+        out.append("全局锚点乘了 GLOBAL_SHARE，DESIGN 没提（按文档算会差一半以上）")
+
+    # ⑥ 静默锚点的分钟数
+    m = re.search(r"'MOOD_ANCHOR_THINK_AGE_SEC':\s*(\d+)", tun)
+    if m:
+        mins = int(m.group(1)) // 60
+        if ("%dmin" % mins) not in text:
+            out.append("静默锚点 THINK_AGE=%ss（约 %dmin），DESIGN 没写这个数"
+                       % (m.group(1), mins))
+
+    # ⑦ 私聊字数：红线只覆盖群聊，文档必须单独提
+    if "PRIVATE_MAX_HANZI" not in text:
+        out.append("私聊生成/发送仍用 PRIVATE_MAX_HANZI，DESIGN 的红线必须区分群聊/私聊")
+
+    # ⑧ 意图层闸门（2026-11-27）：默认必须关，且文档写明「评测 ≥85% 才开」
+    m = re.search(r"'ATMO_GATE':\s*(\d+)", tun)
+    if m and int(m.group(1)) != 0:
+        out.append("tuning 的 ATMO_GATE 默认不是 0 —— 意图层闸门必须先离线评测再开")
+    if "ATMO_GATE" not in text:
+        out.append("意图层闸门 ATMO_GATE 没在 DESIGN 登记（默认关 + 评测门槛）")
+    if "eval_intent" not in text:
+        out.append("DESIGN 没写意图层的离线评测脚本 scripts/eval_intent.py")
+    if "85%" not in text:
+        out.append("DESIGN 没写意图层开闸门的门槛（准确率/召回 ≥85%）")
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--strict", action="store_true", help="警告也算失败")
@@ -456,6 +577,8 @@ def main() -> int:
     fails += check_units(text)
     fails += check_target()
     fails += check_terms(text)
+    # 2026-11-27：叙述型事实（UNWIRED/双真相/单位/全局锚点/私聊字数）
+    fails += check_narrative(text)
     warns = check_duplicates()
     rt_notes: list[str] = []
     if args.runtime:
@@ -467,7 +590,7 @@ def main() -> int:
           + ("（含 --runtime 接线）" if args.runtime else "（仅文档↔常量）"))
     print("=" * 70)
     print("设计目标 budget_total=%d（有工具 %d / custom %d / 多目标 %d）｜"
-          "运行时上限合计 ctx_total=%d｜风格 %d（custom %d）"
+          "运行时上限 token 值之和 ctx_total=%d（实际字符 6540/7170）｜风格 %d（custom %d）"
           % (D.budget_total(), D.budget_total(tools=True),
              D.budget_total(custom=True), D.budget_total(multitarget=True),
              D.ctx_total(), D.style_total(), D.style_total(custom=True)))

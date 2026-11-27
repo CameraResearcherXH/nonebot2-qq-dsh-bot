@@ -225,8 +225,12 @@ MMR：λ=0.7，避免 3 句都是同一长度/同一语气
 ```
 
 ✅ 已实现（2026-11-25）：`services/mmr.py` 通用选择器；
-`style_vault.samples(..., diverse=True)` 与 `memdb.style_samples_of()` 都走 MMR，
+**唯一实现**在 `style_vault.samples(..., diverse=True)`（数据源 `data/style_corpus/*.jsonl`），
 白月光 `_raw_examples()` 取 3 句时默认启用（`STYLE_MMR_*`）。
+
+> ⚠️ 2026-11-27：`memdb.style_samples_of()` 是同一套逻辑的第二份实现（数据源是
+> sqlite 影子表，从没接线）→ **已删**，避免两份真相；sqlite 里的 `style_samples`
+> 表仍由 `style_vault` 双写，留作以后的检索侧。
 
 ### 5.4 保留策略（补 S8）
 

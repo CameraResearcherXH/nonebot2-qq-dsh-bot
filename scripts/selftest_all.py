@@ -763,7 +763,11 @@ async def t_profiles():
     _a2 = profiles.bump_affinity(_qa, -0.10, reason="被恶心")
     check(S, _a1 > _a0 and _a2 < _a1, f"好感度能涨能跌（{_a0:.2f}→{_a1:.2f}→{_a2:.2f}）")
     _a3 = profiles.bump_affinity(_qa, 999, reason="想一次顶满")
-    check(S, _a3 - _a2 <= 0.10 + 1e-6, f"单次好感最多动 0.10（实际 {_a3 - _a2:.2f}）")
+    # 2026-11-26（ADR-043）：单次上限从 ±0.10 提到 AFF_V1_CAP=0.15
+    # （0.30×AFF_W_MAX=0.126 + 事件项，旧的 0.10 会把「一见钟情」削平）
+    _cap = float(getattr(profiles, "AFF_V1_CAP", 0.10))
+    check(S, _a3 - _a2 <= _cap + 1e-6,
+          f"单次好感最多动 {_cap:.2f}（实际 {_a3 - _a2:.2f}）")
     check(S, isinstance(profiles.get_profile(_qa).get("affinity_log"), list),
           "好感涨落有流水（可以回溯为什么变）")
     profiles.add_bond_note(_qa, "他记得我说过的话", emotion="touched")
@@ -997,23 +1001,46 @@ async def t_agent():
     AC._post_json = _fake
     r = await AC.recall("测试")
     check(S, r["source"] == "recall" and r["facts"] == ["来自 recall"], "优先走结构化端点")
-    # recall 端点 404 → 先退 smart-query（RAG v3 的真实路由）
+    # recall 端点 404 → 第一兜底 rag_search（2026-11-26：smart-query 会卡 >70s）
     AC._RECALL_ENDPOINT_MISSING = False
     AC._LIBRARY_DEAD_UNTIL = 0.0
 
     async def _fake2(url, payload, timeout):
         if url.endswith(AC.RECALL_ENDPOINT):
             return None
-        # 必须是「像聊天摘录」的答案，否则会被 _looks_like_chat 判成通用问答
-        return {"success": True, "answer": "阿明: 上次那个蛋糕是街角那家"}
+        if "tool_name=rag_search" in url:
+            return {"success": True,
+                    "output": "**片段 1** (来源: /app/documents/a.txt)\n"
+                              "阿明: 上次那个蛋糕是街角那家"}
+        return {"success": True, "answer": "来自 query"}
     AC._post_json = _fake2
     AC._CACHE.clear()          # recall 有 10 分钟缓存，用例之间必须隔离
     r = await AC.recall("测试")
+    check(S, r["source"] == "rag_tool"
+          and r["facts"] == ["阿明: 上次那个蛋糕是街角那家"],
+          f"结构化端点不可用 → 退回 rag_search（{r['source']} / {r['facts']}）")
+
+    # rag_search 也挂 → 再退 smart-query
+    async def _fake2b(url, payload, timeout):
+        if url.endswith(AC.RECALL_ENDPOINT) or "tool_name=rag_search" in url:
+            return None
+        # 必须是「像聊天摘录」的答案，否则会被 _looks_like_chat 判成通用问答
+        return {"success": True, "answer": "阿明: 上次那个蛋糕是街角那家"}
+    AC._post_json = _fake2b
+    AC._LIBRARY_DEAD_UNTIL = 0.0
+    AC._CACHE.clear()
+    r = await AC.recall("测试")
     check(S, r["source"] in ("smart", "query")
           and r["facts"] == ["阿明: 上次那个蛋糕是街角那家"],
-          f"结构化端点不可用 → 退回 smart-query（{r['source']}）")
+          f"rag_search 也挂 → 退回 smart-query（{r['source']}）")
+
     # 宋词语料 → 判成「不是聊天」，直接停用 6 小时
     async def _fake3(url, payload, timeout):
+        if "tool_name=rag_search" in url:
+            return {"success": True,
+                    "output": "**片段 1** (来源: /app/documents/467.json)\n"
+                              "\"{\\\"title\\\":\\\"x\\\",\\\"author\\\":\\\"y\\\","
+                              "\\\"paragraphs\\\":[\\\"z\\\"]}\""}
         # 必须是「有答案但不是聊天」：带「参考来源:」的会被 is_no_answer 当空结果，
         # 走不到「语料不是聊天 → 暂停 6h」这条分支。
         return {"answer": "宋词是一种中国文学体裁，始于唐代，盛于宋代，句子长短不一。"}
@@ -3129,7 +3156,8 @@ async def t_timing():
     check(S, "什么时候用" in llm_src, "菜单里每项都写了「什么时候用」")
     check(S, "[[HISTORY|" in llm_src, "菜单含「往上翻 N 条」")
     check(S, "def _history_slice" in llm_src, "_history_slice 存在")
-    check(S, "SEARCH|LIBRARY|SING|WHO|HISTORY" in llm_src, "_REQ_RE 支持 HISTORY")
+    check(S, "SEARCH|LIBRARY|ARCHIVE|SING|WHO|HISTORY" in llm_src,
+          "_REQ_RE 支持 HISTORY（含 ARCHIVE）")
     # 2026-11-19：改成集合常量 _NO_COMPRESS = {"HISTORY", "TOOLS", ...}
     check(S, '"HISTORY", "TOOLS"' in llm_src,
           "翻历史/工具目录不做压缩（压缩会丢时间线/格式）")
@@ -4837,7 +4865,7 @@ async def t_net():
             import httpx
             async with httpx.AsyncClient(timeout=10) as c:
                 r = await c.get(f"{base.rstrip('/')}/api/tasks/status",
-                                params={"secret": os.getenv("API_SECRET", "my_super_secret_key_123")})
+                                params={"secret": os.getenv("API_SECRET", "CHANGE_ME_API_SECRET")})
                 j = r.json()
                 check(S, "online" in j, f"服务器 /api/tasks/status 可用，online={j.get('online')}")
                 check(S, j.get("online") is True, f"算力机心跳在线（{j.get('heartbeat_age_sec')}s 前）",
@@ -5177,7 +5205,9 @@ async def t_night():
           "有已读水位")
     check(S, "llm_mod.later_seen_until(gid)" in chat_src,
           "chat 会拦住已读过的消息")
-    check(S, "not event.is_tome()" in chat_src.split("later_seen_until(gid)")[0][-200:],
+    _later_head = chat_src.split("later_seen_until(gid)")[0][-200:]
+    check(S, ("not _at_me(event)" in _later_head
+              or "not event.is_tome()" in _later_head),
           "只拦非 @ 的（@ 她一定要回）")
     # 翻历史也会读到「刚到的消息」→ 同样要标水位（2026-11-12 真机重复回）
     _hist_block = L_src.split('elif kind == "HISTORY"')[1].split("elif kind ==")[0]
@@ -5838,15 +5868,16 @@ async def t_scene():
               "交错发言（中间插一句）不拆线程")
 
         # 时间断档不该拆线程 / 不该掉出窗口（用户 2026-11-19：
-        # 「A：英伟达跌了吗」……10 分钟后「B：对啊，都是老黄的锅」）
+        # 「A：新番看了吗」……10 分钟后「B：对啊，都是原作的锅」）
+        # ⚠️ 只测「上下文窗口」；心情/好感不看对话，只看她的 [[THINK]]（ADR-038）。
         g7 = "936601574"
         gs.clear(g7)
         _now7 = time.time()
         gs.observe(g7, mid="t1", qq="101", name="阿明",
-                   text="你们最近发现英伟达股票跌了吗", names=names,
+                   text="昨晚那部新番看了吗", names=names,
                    ts=_now7 - 700)
         gs.observe(g7, mid="t2", qq="102", name="小柚子",
-                   text="对啊，都是老黄的锅", names=names, ts=_now7 - 60)
+                   text="对啊，都是原作的锅", names=names, ts=_now7 - 60)
         check(S, len(gs.recent_messages(g7, 20)) == 2,
               "隔 10 分钟的消息仍在同一个窗口里")
         check(S, len(gs.snapshot(g7, bot_qq="999")["threads"]) == 1,
@@ -6411,8 +6442,9 @@ async def t_moodjudge():
         check(S, _r.get("ok") and _r.get("word") == "憋着一口气",
               f"判读名词（{_r.get('word')}）")
         # 2026-11-20 定稿：判读给的是**涨幅 delta**，不是当前心情值
-        # 2026-11-25：模型给的是 value，delta 由 impact 本地推导（±0.10 / ±0.22）
-        check(S, _r.get("impact") == -2 and _r.get("delta") == -0.22,
+        # 2026-11-26：档位从 5 档扩到 7 档（±3），所以 |value|=0.4567 现在落到 ±3
+        # → 步长 0.40（旧断言写的 -2/-0.22 是 5 档时代的口径）
+        check(S, _r.get("impact") == -3 and _r.get("delta") == -0.40,
               f"涨幅按 impact 推导（impact={_r.get('impact')} Δ={_r.get('delta')}）")
         check(S, "value" not in _r,
               "判读结果不再给当前心情值（只给涨幅，水平由系统累计）")
@@ -6420,7 +6452,8 @@ async def t_moodjudge():
         # 好感由「Δmood × AFFINITY_GAIN」本地推导（只有 cause=speaker 才算到人头上）。
         check(S, _r.get("cause") in ("speaker", "environment", "self", "other"),
               f"判读给出 cause（{_r.get('cause')}）")
-        check(S, hasattr(MJ, "AFFINITY_GAIN"), "好感系数 AFFINITY_GAIN 可配置")
+        check(S, not hasattr(MJ, "AFFINITY_GAIN"),
+              "AFFINITY_GAIN 已标 LEGACY（无读点，不再靠赋值混接线）")
         _prompt = str((_Client.last.get("json") or {}).get("messages", [{}])[-1].get("content") or "")
         check(S, "心情判读员" in _prompt and "impact" in _prompt,
               "prompt 是「判读员」口径（要 impact，不再要两位小数）")
