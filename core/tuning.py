@@ -342,6 +342,8 @@ DEFAULTS = {
     # 意图字段（topic/asks/need_reply/why/replied/keywords/queries）是否进 prompt。
     # 1 = 只加不减（默认）；0 = 退回 2026-11-26 的四行气氛块。
     'ATMO_INTENT': 1,
+    # 2026-11-27：意图类型（提问/吐槽/梗/陈述/安慰）—— 只加一行，不加请求
+    'ATMO_KIND': 1,
     # 主动插话闸门：need_reply=no 时这一轮不插话。**默认 0**，
     # 必须先跑 scripts/eval_intent.py，need_reply 准确率 ≥85% 再开。
     'ATMO_GATE': 0,
@@ -582,6 +584,13 @@ DEFAULTS = {
     'VISION_MAX_SIDE': 1568,
     'VISION_TIMEOUT': 40.0,
     'VISION_VERIFY_MAX_PER_HOUR': 20,
+    # ---------- 图片结构化报告 ImageReport（2026-11-27，docs/addressing-design §7.6）----------
+    # 1 = 走「一次产出、三处复用」（质量/文字/画面合成一份 report）；0 = 退回旧路径
+    'VISION_REPORT': 1,
+    # 第二家视觉（GLM）：always / on_miss（trace 没命中且 qwen 没给专名才问）/ off
+    'VISION_GLM_MODE': 'on_miss',
+    # report 里的文字**进 prompt**最多多少字（全文留在缓存里）
+    'VISION_TEXT_MAX': 60,
 }
 
 
@@ -739,6 +748,7 @@ DOCS = {
     'ATMO_TIMEOUT': '读气氛调用超时（秒），超时只丢这一块，不拖慢回复',
     'ATMO_MAX_CHARS': '气氛+意图块最多多少字（进 prompt 的上限）',
     'ATMO_INTENT': '气氛块是否追加意图字段（在聊/在问什么/该不该接；1=开，0=退回四行）',
+    'ATMO_KIND': '气氛块是否追加「这句是：提问/吐槽/梗/陈述/安慰」（只加一行）',
     'ATMO_GATE': '主动插话闸门：need_reply=no 时不插话（默认 0；离线评测≥85% 才开）',
     'ARCHIVE_ENABLED': '个人档案库开关（1=开；本地 sqlite，只存旧事，不依赖 RAG）',
     'ARCHIVE_MIN_AGE_DAYS': '档案库只收多少天以前的旧事（默认 30；近期记忆走 memdb）',
@@ -883,6 +893,9 @@ DOCS = {
     'VISION_MAX_SIDE': '最长边缩到多少（越大越清楚、请求越大；默认 1568）',
     'VISION_TIMEOUT': '视觉模型超时（秒）',
     'VISION_VERIFY_MAX_PER_HOUR': '视觉核对每小时最多几次',
+    'VISION_REPORT': '图片结构化报告（1=一次产出三处复用；0=退回旧识图路径）',
+    'VISION_GLM_MODE': '第二家视觉模型策略：always（每家都问）/ on_miss（默认，只在没认出专名时问）/ off',
+    'VISION_TEXT_MAX': '图片里的文字**进 prompt**最多多少字（全文留在缓存，防 token 爆）',
 }
 
 
@@ -1040,6 +1053,7 @@ FILES = {
     'ATMO_TIMEOUT': 'services/atmosphere.py',
     'ATMO_MAX_CHARS': 'services/atmosphere.py',
     'ATMO_INTENT': 'services/atmosphere.py',
+    'ATMO_KIND': 'services/atmosphere.py',
     # ATMO_GATE 由 plugins/chat 的插话循环读（atmosphere.gate_on() 内部用）
     'ATMO_GATE': 'services/atmosphere.py',
     'ARCHIVE_ENABLED': 'services/archive.py',
@@ -1185,6 +1199,9 @@ FILES = {
     'VISION_MAX_SIDE': 'plugins/vision_agent/__init__.py',
     'VISION_TIMEOUT': 'plugins/vision_agent/__init__.py',
     'VISION_VERIFY_MAX_PER_HOUR': 'services/vision_verify.py',
+    'VISION_REPORT': 'services/vision_report.py',
+    'VISION_GLM_MODE': 'services/vision_verify.py',
+    'VISION_TEXT_MAX': 'services/vision_report.py',
 }
 
 

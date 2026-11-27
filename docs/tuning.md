@@ -37,13 +37,13 @@
 | 用量监测 | 4 |
 | 回复审核 | 14 |
 | 表达 / 语气 | 7 |
-| 视觉 | 19 |
+| 视觉 | 22 |
 | 画图 | 2 |
 | 语音 / 音乐 | 31 |
 | 世界书 | 4 |
 | 安全 / 工具 | 9 |
-| 其他 | 123 |
-| **合计** | **486** |
+| 其他 | 126 |
+| **合计** | **492** |
 
 ## 回复 / 限流 / 主动插话
 
@@ -421,9 +421,12 @@
 | `VIDEO_MAX_KEY_FRAMES` | `12` | 字幕密集处额外取的高清关键帧上限（配合均匀抽帧一起看） | `services/video_understand.py` |
 | `VISION_CACHE_MAX` | `800` | 最多存多少张图 | `services/vision_verify.py` |
 | `VISION_COOLDOWN` | `300` | 被动识图冷却（识别成本，跟"要不要开口"是两回事） | `plugins/vision_agent/__init__.py` |
+| `VISION_GLM_MODE` | `on_miss` | 第二家视觉模型策略：always（每家都问）/ on_miss（默认，只在没认出专名时问）/ off | `services/vision_verify.py` |
 | `VISION_LLM_MAX_PER_HOUR` | `12` | 注意这是**频率闸门**，不是「该不该说」的判断 —— 判断在模型那边。 | `plugins/vision_agent/__init__.py` |
 | `VISION_MAX_ATTEMPTS` | `6` | 总尝试次数上限 | `plugins/vision_agent/__init__.py` |
 | `VISION_MAX_SIDE` | `1568` | 最长边缩到多少（越大越清楚、请求越大；默认 1568） | `plugins/vision_agent/__init__.py` |
+| `VISION_REPORT` | `1` | 图片结构化报告（1=一次产出三处复用；0=退回旧识图路径） | `services/vision_report.py` |
+| `VISION_TEXT_MAX` | `60` | 图片里的文字**进 prompt**最多多少字（全文留在缓存，防 token 爆） | `services/vision_report.py` |
 | `VISION_TIMEOUT` | `40` | 视觉模型超时（秒） | `plugins/vision_agent/__init__.py` |
 | `VISION_VERIFY_MAX_PER_HOUR` | `20` | 视觉核对每小时最多几次 | `services/vision_verify.py` |
 
@@ -502,7 +505,10 @@
 | `ARCHIVE_MIN_AGE_DAYS` | `30` | 档案库只收多少天以前的旧事（默认 30；近期记忆走 memdb） | `services/archive.py` |
 | `ARCHIVE_TOP` | `4` | 档案库一次最多回几条 | `services/archive.py` |
 | `ATMO_ENABLED` | `1` | 接话前是否读群气氛（1=开；只作提示，不改心情/好感） | `services/atmosphere.py` |
-| `ATMO_MAX_CHARS` | `240` | 气氛块最多多少字（进 prompt 的上限） | `services/atmosphere.py` |
+| `ATMO_GATE` | `0` | 主动插话闸门：need_reply=no 时不插话（默认 0；离线评测≥85% 才开） | `services/atmosphere.py` |
+| `ATMO_INTENT` | `1` | 气氛块是否追加意图字段（在聊/在问什么/该不该接；1=开，0=退回四行） | `services/atmosphere.py` |
+| `ATMO_KIND` | `1` | 气氛块是否追加「这句是：提问/吐槽/梗/陈述/安慰」（只加一行） | `services/atmosphere.py` |
+| `ATMO_MAX_CHARS` | `400` | 气氛+意图块最多多少字（进 prompt 的上限） | `services/atmosphere.py` |
 | `ATMO_MSGS` | `8` | 读气氛看最近多少句（默认 8，和主模型上下文同源同条数） | `services/atmosphere.py` |
 | `ATMO_TIMEOUT` | `5` | 读气氛调用超时（秒），超时只丢这一块，不拖慢回复 | `services/atmosphere.py` |
 | `ATMO_TTL` | `90` | 同一窗口的气氛缓存多久（秒），避免连发时重复调用 | `services/atmosphere.py` |
@@ -534,7 +540,7 @@
 | `LLM_MAX_TOKENS` | `0` | 全局输出 token 覆盖（>0 时压过各角色默认；0=不覆盖） | `services/providers.py` |
 | `LONG_DOC_ENABLED` | `1` | 长答模式总开关（1=用户明确要长答时放开输出/证据预算；0=回滚成普通回复） | `services/long_doc.py` |
 | `LONG_DOC_EVIDENCE` | `8` | 长答模式检索候选条数（普通模式按 RET_EVIDENCE_MAX） | `services/long_doc.py` |
-| `LONG_DOC_MAX_TOKENS` | `2000` | 长答模式单次生成的最大 token | `services/long_doc.py` |
+| `LONG_DOC_MAX_TOKENS` | `4000` | 长答模式单次生成的最大 token（默认 4000，含 thinking） | `services/long_doc.py` |
 | `LONG_DOC_PIECES` | `3` | 长答模式真正进 prompt 的证据篇数（DESIGN：3 篇） | `services/long_doc.py` |
 | `LONG_DOC_PIECE_CHARS` | `1900` | 长答模式每篇证据最多多少**字符**（DESIGN：1900） | `services/long_doc.py` |
 | `MAX_BUBBLES` | `2` | ⚠️ LEGACY（2026-11-26 合并进 OUT_BUBBLES_MAX）：一条回复最多拆几个气泡 | `` |
@@ -601,7 +607,7 @@
 | `RET_W_STRENGTH` | `0.6` | 打分：提取强度权重 | `services/memdb.py` |
 | `RET_W_STRUCT` | `1.2` | 打分：人/时间/情绪命中权重 | `services/memdb.py` |
 | `RET_W_TAG` | `0.8` | 打分：标签重合权重 | `services/memdb.py` |
-| `ROLEPLAY_MAX_TOKENS` | `4000` | 主聊天单次输出 token 上限（含 thinking；推理模型别低于 4000） | `services/providers.py` |
+| `ROLEPLAY_MAX_TOKENS` | `4000` | 主聊天单次输出 token 上限（默认 4000，含 thinking；推理模型别低于 4000） | `services/providers.py` |
 | `SEGMENT_HISTORY_KEEP` | `24` | 保留多少个「处理过的段」给上下文/翻历史 | `services/segments.py` |
 | `SEGMENT_MAX_MSGS` | `40` | 群聊分段：最多攒多少条（防刷屏） | `services/segments.py` |
 | `SEGMENT_MAX_SEC` | `30` | 群聊分段：最长攒多久必须处理（默认 30 秒） | `services/segments.py` |

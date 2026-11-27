@@ -292,6 +292,39 @@ def main() -> int:
           _al.clean_outgoing("<voice>你听我说</voice>") == "你听我说",
           repr(_al.clean_outgoing("<voice>你听我说</voice>")))
 
+    # ---------- ⑬ ImageReport 单一事实源 + 意图类型（2026-11-27 P0） ----------
+    from services import vision_report as _vr
+    _rec = {"scene": "一个粉发少女在喝茶", "text": "禁止转载", "kind": "图片",
+            "sources": {"qwen": {}, "trace": {}}, "verified": False}
+    _r = _vr.build(_rec, b"", cost_ms=1234)
+    check("report 有场景/文字/来源/cost",
+          bool(_r["scene"]) and bool(_r["text_blocks"])
+          and _r["sources"] == ["qwen", "trace"] and _r["cost_ms"] == 1234,
+          str(_r.get("sources")))
+    check("文字标 source=vlm（P0 只当线索）",
+          _r["text_blocks"][0]["source"] == "vlm",
+          str(_r["text_blocks"][0]))
+    check("report 渲染出画面质量行", "图里文字" in _vr.render_line(_r),
+          _vr.render_line(_r))
+    _bf = _vr.brief(_r, 40)
+    check("brief 给上下文用（[图片] 开头、≤80 字）",
+          _bf.startswith("[图片]") and len(_bf) <= 80, _bf)
+    check("有字 + @/称呼 才送审核",
+          _vr.should_audit({**_r, "text_blocks": [{"text": "@小明 你看",
+                                                  "source": "vlm"}]})
+          and not _vr.should_audit(_r), "")
+    check("图片文字进 prompt 有上限（VISION_TEXT_MAX）",
+          len(_vr.text_of(_r)) <= max(1, _vr.TEXT_MAX), str(_vr.TEXT_MAX))
+
+    _k = _atmo._parse('{"mood":"日常","kind":"吐槽"}')
+    check("kind 白名单（吐槽→vent）", _atmo.kind_of(_k) == "vent",
+          _atmo.kind_of(_k))
+    check("kind 渲染成一行（带接法）",
+          "这句是" in _atmo.render(_k, 8) and "共情" in _atmo.render(_k, 8),
+          _atmo.render(_k, 8)[-40:])
+    check("kind 非法值留空",
+          _atmo.kind_of(_atmo._parse('{"mood":"日常","kind":"???"}')) == "", "")
+
     # ---------- ⑪ 离线评测脚本本身能跑（不花钱） ----------
     sys.path.insert(0, str(ROOT / "scripts"))
     import eval_intent as _ei

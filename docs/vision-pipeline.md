@@ -1,6 +1,8 @@
 > ⚠️ **as-built 快照（2026-11-24）**：描述当时的实现，不是目标设计。
 > 现行设计以 [DESIGN.md](DESIGN.md) 为准；差异见 [design-audit-2026-11-25.md](design-audit-2026-11-25.md)。
 > 已知：识图当时链路；v2 改为媒体分支 + 云端源，不建本地角色库。
+> **2026-11-27**：`ImageReport` 单一事实源（视觉 2~6 次 → 1 次、文字只信 OCR、
+> 清晰度数值化）见 [addressing-design.md §7.6](addressing-design.md)，本文只描述现状。
 
 # 识图链路：画面描述 + 搜图源 → 角色扮演模型总结
 

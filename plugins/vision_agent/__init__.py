@@ -664,6 +664,7 @@ async def process_image(bot: Bot, event: MessageEvent, img_url: str = "",
         _mark_image_result(session_key, event, False)
         return
 
+    _t_vision = time.monotonic()
     mime = _sniff_mime(image_data)
     logger.info(f"[VISION] 图片 {len(image_data) / 1024:.0f} KB, mime={mime}")
 
@@ -736,9 +737,31 @@ async def process_image(bot: Bot, event: MessageEvent, img_url: str = "",
     logger.info(f"✅ [VISION] 识别成功: {desc[:60]}")
     _mark_image_result(session_key, event, True)
 
+    # 👇 2026-11-27（P0）：合成 ImageReport —— 质量/文字/画面一份产出，
+    #    角色扮演 / 收件人判定 / 记忆三处复用（docs/addressing-design §7.6）。
+    #    任何异常都退回旧行为，绝不影响回复。
+    _rep = {}
+    try:
+        from services import vision_report as _vr
+        if _vr.ENABLED:
+            # 用 `_vl_data`（GIF 已抽帧拼图）算质量：原图是 GIF，cv2 解不出来
+            _rep = _vr.build(rec, _vl_data,
+                             cost_ms=int((time.monotonic() - _t_vision) * 1000))
+            _q = (f"{_rep.get('sharpness') or 0:.0f}({_rep.get('quality')})"
+                  if _rep.get("quality") else "—")
+            logger.info(
+                f"[VISION] report sha={_rep.get('sha1') or '?'} sharp={_q}"
+                f" text={('vlm:%d字' % len(_vr.text_of(_rep))) if _rep.get('has_text') else '无'}"
+                f" glm={os.getenv('VISION_GLM_MODE', 'on_miss')}"
+                f" cost={_rep.get('cost_ms')}ms")
+    except Exception as e:
+        logger.debug(f"[VISION] 生成 report 失败（退回旧行为）: {type(e).__name__}: {e}")
+        _rep = {}
+
     # 缓存描述（同图复用 + 给 vision_source 工具用）
     try:
-        _rec = {"desc": desc, "url": str(seg.data.get("url") or ""), "at": time.time()}
+        _rec = {"desc": desc, "url": str(seg.data.get("url") or ""),
+                "at": time.time(), "report": _rep}
         _files = [str(x.data.get("file") or "") for x in event.get_message()
                   if x.type == "image"]
         for _f in _files:
@@ -765,6 +788,14 @@ async def process_image(bot: Bot, event: MessageEvent, img_url: str = "",
         )
     else:
         fake_text = f"{VISION_TAG} 群号:{gid} | 发送者QQ:{uid} | 发送者昵称:{nickname} | 图片内容:{desc}"
+    # 👇 清晰度/文字来源：让「糊不糊」由数值决定，不靠视觉模型感觉
+    try:
+        from services import vision_report as _vr2
+        _qline = _vr2.render_line(_rep)
+        if _qline:
+            fake_text += "\n" + _qline
+    except Exception:
+        pass
 
     # 👇 2026-11-20：这张图是**发给谁**的。
     #    真机翻车：情侣 A @ 完 B 发了个「抱抱」表情，她接话「抱了上去」——
@@ -808,11 +839,23 @@ async def process_image(bot: Bot, event: MessageEvent, img_url: str = "",
     if _extra_text:
         fake_text += f"\n（他同时说：「{_extra_text}」）"
     
+    # 👇 2026-11-27：上下文/收件人用 report 的摘要；「有没有字 + 字里有没有 @/称呼」
+    #    决定这张图要不要送审核（每张都送 = 每张多一次审核调用）。
+    _brief = f"[图片] {desc[:80]}"
+    _need_audit = False
+    try:
+        from services import vision_report as _vr3
+        if _rep:
+            _brief = _vr3.brief(_rep, 60)
+            _need_audit = bool(_vr3.should_audit(_rep))
+    except Exception:
+        pass
+
     # 👇 也写进群聊上下文：否则后续对话她完全不记得「刚才有人发了张图」，
     #    只靠一次性的 [图片识别结果] 推入队列，聊两句就忘了。
     if isinstance(event, GroupMessageEvent):
         try:
-            recent_group_msgs[gid].append(f"{nickname}: [图片] {desc[:80]}")
+            recent_group_msgs[gid].append(f"{nickname}: {_brief}")
             # ⚠️ msgs 和 ts 是两个 deque，必须同步 append，否则后面按时间配对全错位
             from plugins.chat import recent_group_ts as _rgts
             _rgts[gid].append(time.time())
@@ -826,12 +869,12 @@ async def process_image(bot: Bot, event: MessageEvent, img_url: str = "",
             from services import group_scene as _gs
             _gs.observe(
                 gid, mid=str(getattr(event, "message_id", "") or ""),
-                qq=uid, name=nickname, text=f"[图片] {desc[:60]}",
+                qq=uid, name=nickname, text=_brief,
                 reply_mid=str(getattr(getattr(event, "reply", None),
                                       "message_id", "") or ""),
                 is_bot=False,
                 bot_qq=identity_mod.canonical(str(getattr(event, "self_id", "") or "")),
-                no_audit=True,
+                no_audit=not _need_audit,
             )
         except Exception:
             pass

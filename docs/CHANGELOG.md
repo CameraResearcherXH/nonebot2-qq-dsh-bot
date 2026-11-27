@@ -1,5 +1,45 @@
 # 更新日志
 
+## 2026-11-27（第四十五轮：收发件人 v2 设计定稿 + P0 落地）
+
+**1. 设计先行（用户要求「先落文档，检查没问题再写代码」）**
+
+- `docs/addressing-design.md` 新增 **§7 v2**（v1 原样保留）：大纲 + 4 张图 +
+  收件人四级/动作矩阵、话题漂移、意图类型、ImageReport、自检、预算、开关、验收；
+- 写完后做了一次**锐评**，初稿 10 处想当然的地方全部改掉（§7.12.1 有表），其中三条最关键：
+  1. `level` **只作用于「主动插话」**——正常回复时消息已入队，拦不了（`need_reply` 是流水线内算的）；
+  2. 初稿 L0 里「自动补一句回答 / 换个开头重说」不是规则能做的 → L0 只做机械修正；
+  3. 「P0 就删视觉 prompt 的逐字抄」会让截图类消息**变瞎子**（服务器还没 OCR）→ 推迟到 P1；
+- `docs/vision-pipeline.md` 顶部加一行指向 §7.6（不新增文档）。
+
+**2. P0 代码（等价重构 + 只加一行，默认不改变现有行为）**
+
+| 改动 | 文件 | 说明 |
+|---|---|---|
+| 新增 `ImageReport` | `services/vision_report.py` | OpenCV 算清晰度/文字区域占比；`build/render_line/brief/should_audit`；不调模型、不写盘 |
+| 识图接入 | `plugins/vision_agent/__init__.py` | 一次产出 report，三处复用：`fake_text`（加「画面质量」一行）/ 群聊上下文摘要 / 缓存；审核只在「有字 + 字里有 @/称呼」时才送 |
+| 第二家视觉按需 | `services/vision_verify.py` | `VISION_GLM_MODE=on_miss`：trace 命中或 qwen 已给专名就不再问 GLM（`always` 可回退） |
+| 意图类型 | `services/atmosphere.py` | 同一次调用多出 `kind`（ask/vent/meme/statement/comfort/command），渲染成一行「这句是：…」；白名单校验 |
+| 参数 | `core/tuning.py` | `VISION_REPORT=1`、`VISION_GLM_MODE=on_miss`、`VISION_TEXT_MAX=60`、`ATMO_KIND=1` |
+| 校验 | `scripts/check_runtime_wiring.py` | 新增 9 条断言（report 字段/文字来源/brief/审核门槛/kind 白名单与渲染） |
+
+**3. 真机验证（21:18 上线，21:26 取样）**
+
+```text
+[VISION] report sha=2dff6ee668c9cc73 sharp=7940(clear) text=无 glm=on_miss cost=11126ms
+[ATMO] 100000016 气氛=日常｜类型=ask｜意图=yes（带⭐且在直接问她）｜直接回应她的问话，别绕开
+[ATMO] 100000016 气氛=日常｜类型=statement｜意图=no（最后两条都不是对她说的）
+prompt 里：· 这句是：ask（正面答，别绕）
+```
+
+- `check_tuning` PASS、`check_runtime_wiring` **62 PASS**、清单 **126/126**、0 Traceback；
+- **实测基线：单张图识图 11.1s**（trace + 视觉 + 搜图）→ 这正是 §7.8 里「先量基线再定目标」的原因，
+  P1 要把「文字」从视觉模型挪到 RapidOCR、并把 GLM 调用次数压到 0~1。
+
+**4. 本轮没做（按设计文档的 P1/P2）**
+
+L0 机械自检、L2 观望、话题漂移（要先用 trace 标定阈值）、RapidOCR、异步自检回填。
+
 ## 2026-11-27（第四十四轮：输出上限 4000 / 仓库与服务器对账 / 脱敏后首次提交）
 
 **1. 主聊天输出上限 1200 → 4000（用户：「不要 think 占满输出」）**
@@ -33,7 +73,7 @@
 - `test.py` 的 `API_SECRET` 改为读环境变量；
 - `.env` / `.env.working` / `data/` / `node.env` 继续 gitignore（只提交 `.env.example`，其中全部为空值）；
 - `.gitignore` 新增根目录噪音清单（`3a_zh.txt` `d3.txt` `e1.txt` `v1.txt` `jy.tex` `help.txt`
-  `t_*_zh.txt` `test.py`）和 `patches/*.tar.gz`。；
+  `t_*_zh.txt` `test.py`）和 `patches/*.tar.gz`；
 - ⚠️ **发行前扫描发现 `scripts/subscribe.txt`（68KB，base64 里是真实 vmess/ss 节点 + UUID）
   在上一版发行仓里就已经存在**。本次已从发行仓删除，并加进 `make_dist` 排除清单 +
   `.gitignore`；**那批节点凭据建议尽快轮换**（历史 commit 里仍能看到）。

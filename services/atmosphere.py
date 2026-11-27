@@ -54,6 +54,8 @@ MAX_CHARS = max(120, tuning.i("ATMO_MAX_CHARS"))
 # 意图字段（topic/asks/need_reply/...）是否渲染进 prompt。默认 1 = 只加不减：
 # 老的四行照样在，新的四行追加在后面。
 INTENT = bool(tuning.i("ATMO_INTENT"))
+# 意图类型（提问/吐槽/梗/陈述/安慰）是否渲染 —— 只加一行，不加请求
+KIND = bool(tuning.i("ATMO_KIND"))
 # 插话闸门：默认 0（关）。只有 scripts/eval_intent.py 在 204 条 trace 上
 # 跑到 need_reply 准确率 ≥85% 之后，才由用户拍板打开。
 GATE = bool(tuning.i("ATMO_GATE"))
@@ -90,7 +92,9 @@ _PROMPT_HEAD = (
     "6) queries 是给检索用的**短关键词**，不要整句、不要引号；"
     "memory=她自己的旧事；library=久远往事/书/资料；web=需要现查的事实"
     "（人名/价格/新闻/版本），不需要就留空；\n"
-    "7) 看不出来的字段就留空字符串/空数组，不要硬编。\n"
+    "7) kind 判「这句是什么」：真的在要答案=ask；抱怨/丧/自嘲=vent；玩梗/接龙=meme；"
+    "陈述/播报=statement；在安慰人/哄人/道歉=comfort；指令/玩法=command；\n"
+    "8) 看不出来的字段就留空字符串/空数组，不要硬编。\n"
     "只输出 JSON，不要解释、不要 markdown：\n"
     '{"mood":"压抑/低落/尴尬/日常/轻松/热闹（挑一个）",'
     '"who":"最需要被照顾的人名（没有就空）",'
@@ -102,6 +106,7 @@ _PROMPT_HEAD = (
     '"need_reply":"yes/no/unsure",'
     '"why":"为什么该/不该接，15 字内",'
     '"replied":"yes/no",'
+    '"kind":"ask/vent/meme/statement/comfort/command（挑一个）",'
     '"keywords":["最多 3 个短词"],'
     '"queries":{"memory":"","library":"","web":""}}'
 )
@@ -179,6 +184,31 @@ def build_prompt(lines: list, text: str = "") -> str:
     return head + body
 
 
+_KIND = {
+    "ask": "ask", "提问": "ask", "问": "ask",
+    "vent": "vent", "吐槽": "vent", "抱怨": "vent", "丧": "vent",
+    "meme": "meme", "梗": "meme", "玩梗": "meme", "接梗": "meme",
+    "statement": "statement", "陈述": "statement", "播报": "statement",
+    "comfort": "comfort", "安慰": "comfort", "哄": "comfort",
+    "command": "command", "指令": "command",
+}
+
+# 每种类型给一句「怎么接」（≤16 字，进 prompt 用）
+_KIND_TIP = {
+    "ask": "正面答，别绕",
+    "vent": "先共情，别给方案",
+    "meme": "顺着梗接，别解释",
+    "statement": "可以只附和一句",
+    "comfort": "接情绪，短一点",
+    "command": "当指令处理",
+}
+
+
+def kind_of(data: dict) -> str:
+    """意图类型（白名单外的值一律当空）。"""
+    return _KIND.get(str((data or {}).get("kind") or "").strip().lower(), "")
+
+
 _YN = {
     "yes": "yes", "y": "yes", "是": "yes", "要": "yes", "该": "yes",
     "true": "yes", "1": "yes",
@@ -219,6 +249,7 @@ def _parse(text: str) -> dict:
         "need_reply": _yn(obj.get("need_reply")),
         "why": _clip(obj.get("why"), 30),
         "replied": _yn(obj.get("replied")),
+        "kind": _KIND.get(str(obj.get("kind") or "").strip().lower(), ""),
         "keywords": [],
         "queries": {},
     }
@@ -278,6 +309,9 @@ def render(data: dict, n: int = 0) -> str:
     if INTENT:
         if d.get("topic"):
             lines.append(f"· 在聊：{d['topic']}")
+        _kd = kind_of(d)
+        if KIND and _kd:
+            lines.append(f"· 这句是：{_kd}（{_KIND_TIP.get(_kd, '')}）")
         # 只有真在问事时才写这一行：没问事却写「还没人答」是噪音（真机 17:54 抓到）。
         if d.get("asks"):
             _r = ("，已经有人答了" if d.get("replied") == "yes"
@@ -407,6 +441,7 @@ async def read(gid: str, *, exclude_mids=(), replied_mids=(),
         logger.info(
             f"[ATMO] {gid} 气氛={data.get('mood') or '?'}"
             f"｜{data.get('who') or '—'}：{data.get('feel') or '—'}"
+            f"｜类型={kind_of(data) or '?'}"
             f"｜意图={need_reply_of(data) or '?'}"
             f"（{data.get('why') or '—'}）｜{data.get('tip') or '—'}")
         return dict(data)

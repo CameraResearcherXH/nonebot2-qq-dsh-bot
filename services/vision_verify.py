@@ -1054,7 +1054,16 @@ async def recognize(image_bytes: bytes, vl_call, *, url: str = "", hint: str = "
 
     glm_parsed = {}
     glm_raw = ""
-    if GLM_VISION:
+    # 2026-11-27（P0）：第二家视觉改「按需」——trace 命中或 qwen 已给出专名时不再问，
+    # 省掉一半视觉调用。VISION_GLM_MODE=always 可退回旧行为。
+    # 走 tuning（不是 os.getenv）：audit_coverage 只认 tuning 读点
+    _glm_mode = (tuning.raw("VISION_GLM_MODE") or "on_miss").strip().lower()
+    _need_glm = bool(GLM_VISION) and (
+        _glm_mode == "always"
+        or (_glm_mode == "on_miss" and not trace_ok
+            and not (qwen.get("work") or qwen.get("char")))
+    )
+    if _need_glm:
         try:
             from . import glm
             if glm.available():
@@ -1177,7 +1186,7 @@ async def recognize(image_bytes: bytes, vl_call, *, url: str = "", hint: str = "
             lines.append("qwen识图：（没结果）")
         if glm_parsed:
             lines.append(_fmt_one("GLM识图", glm_parsed))
-        elif GLM_VISION:
+        elif _need_glm:
             lines.append("GLM识图：（不可用或没结果）")
     if trace_ok:
         ep = anime.get("episode")
