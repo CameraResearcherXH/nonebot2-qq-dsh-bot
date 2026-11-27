@@ -749,10 +749,14 @@ async def process_image(bot: Bot, event: MessageEvent, img_url: str = "",
                              cost_ms=int((time.monotonic() - _t_vision) * 1000))
             _q = (f"{_rep.get('sharpness') or 0:.0f}({_rep.get('quality')})"
                   if _rep.get("quality") else "—")
+            _txt = "无"
+            if _rep.get("has_text"):
+                _txt = "%s:%d字" % (_rep.get("text_source") or "vlm",
+                                    len(_vr.text_of(_rep)))
             logger.info(
                 f"[VISION] report sha={_rep.get('sha1') or '?'} sharp={_q}"
-                f" text={('vlm:%d字' % len(_vr.text_of(_rep))) if _rep.get('has_text') else '无'}"
-                f" glm={os.getenv('VISION_GLM_MODE', 'on_miss')}"
+                f" text={_txt}"
+                f" 2nd={os.getenv('VISION_SECOND_MODE', 'off')}"
                 f" cost={_rep.get('cost_ms')}ms")
     except Exception as e:
         logger.debug(f"[VISION] 生成 report 失败（退回旧行为）: {type(e).__name__}: {e}")

@@ -51,10 +51,15 @@ ROLES = {
     "roleplay": ("ROLEPLAY", "deepseek"),
     "judge": ("JUDGE", "deepseek"),
     "audit": ("AUDIT", "deepseek"),
-    "vision": ("VISION", "glm"),
-    # 视觉备用 provider：主 provider 额度用尽/限流时自动换这家（默认 qwen）。
+    # 2026-11-27 用户拍板：「GLM 额度用完了，之后尽量靠 qwen 视觉，我们先用 qwen」。
+    # 所以主视觉默认 qwen；GLM 变成「可选」——想用就写 VISION_PROVIDER=glm。
+    "vision": ("VISION", "qwen"),
+    # 第二视觉证据源（可选）：**默认关闭**（不配 VISION_SECOND_PROVIDER 就不调）。
+    # 想要两家对拍就配 VISION_SECOND_PROVIDER=glm|openai|xxx + 对应 key/model。
+    "vision_second": ("VISION_SECOND", ""),
+    # 视觉备用 provider：主 provider 额度用尽/限流时自动换这家（默认 glm）。
     # 只配 `VISION_FALLBACK_PROVIDER/_MODEL/_BASE_URL/_API_KEY`，不影响主视觉。
-    "vision_fallback": ("VISION_FALLBACK", "qwen"),
+    "vision_fallback": ("VISION_FALLBACK", "glm"),
     "expression": ("EXPRESSION", "deepseek"),
     "conv_state": ("CONV_STATE", "deepseek"),
     "profile": ("PROFILE", "deepseek"),
@@ -137,7 +142,14 @@ def spec(name: str) -> dict:
 def provider_of(role: str) -> str:
     role = str(role or "").strip().lower()
     prefix, default = ROLES.get(role, (role.upper(), "deepseek"))
-    return (_env(f"{prefix}_PROVIDER") or _env("LLM_PROVIDER") or default).lower()
+    explicit = _env(f"{prefix}_PROVIDER")
+    if explicit:
+        return explicit.lower()
+    if not default:
+        # 默认值为空 = 该角色默认关闭（如 vision_second），
+        # 不能拿 LLM_PROVIDER 兜底，否则用户配了主模型就被动多调一家视觉。
+        return ""
+    return (_env("LLM_PROVIDER") or default).lower()
 
 
 def output_limit(role: str, default: int = 0) -> int:
@@ -212,6 +224,13 @@ def resolve(role: str) -> dict:
 
     prefix, _default = ROLES.get(role, (role.upper(), "deepseek"))
     name = provider_of(role)
+    if not name:
+        # 未配置的角色（如 vision_second）：返回空壳，调用方据此跳过，
+        # 绝不 fallback 到 LLM_API_KEY —— 那会拿主模型的 key 去请求一个没配的端点。
+        out = {"provider": "", "base_url": "", "api_key": "", "model": "",
+               "max_tokens": 0, "max_tokens_field": "max_tokens"}
+        _CACHE[role] = out
+        return dict(out)
     sp = spec(name)
 
     base = (_env(f"{prefix}_BASE_URL")
@@ -260,6 +279,8 @@ def status() -> str:
     lines = ["▍模型分配"]
     for role in ROLES:
         p = resolve(role)
+        if not p["provider"]:
+            continue          # 未启用的可选角色（vision_second）不占版面
         lines.append(
             f"· {role:11s} {p['provider']:9s} {p['model']:22s} "
             f"{'key✓' if p['api_key'] else 'key✗'} {p['base_url']}")

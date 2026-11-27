@@ -16,6 +16,8 @@
   ③ 每小时核验次数上限：防止有人刷图把 tavily 额度打光
 """
 from core import tuning
+from . import ocr_rapid as ocr_mod
+import asyncio
 import hashlib
 import json
 import os
@@ -87,9 +89,35 @@ TRACE_MAX_PER_DAY = tuning.i("TRACE_MAX_PER_DAY")
 TRACE_MOE_URL = "https://api.trace.moe/search"
 ANILIST_GQL = "https://graphql.anilist.co"
 
-# GLM 视觉作为**第二个证据源**（不是否决器）：
-# 两个模型的结果都列进 report 交给 DeepSeek 综合判断，而不是不一致就丢掉。
-GLM_VISION = os.getenv("GLM_VISION", "true").lower() == "true"
+# 第二视觉证据源（2026-11-27 从「写死 GLM」改成「可配 provider」）：
+#   用户拍板：GLM 额度用完，先靠 qwen；但保留「可选第二家」的能力。
+#   配置方法：VISION_SECOND_PROVIDER=glm / openai / 自定义名（+ _MODEL/_API_KEY/_BASE_URL）。
+#   **不配 = 关闭**，不会因为主模型有 key 就误调第二家。
+# 模式：
+#   on_miss  = trace 没命中且 qwen 没给出专名时才问（默认，省一半调用）
+#   always   = 每张图都问（两家对拍，最贵）
+#   off      = 关
+_SECOND_MODE = (os.getenv("VISION_SECOND_MODE")
+                or os.getenv("VISION_GLM_MODE")
+                or tuning.raw("VISION_SECOND_MODE")
+                or "on_miss").strip().lower()
+
+
+def _second_target() -> dict:
+    """第二视觉源配置；没配齐 / 和主视觉完全同一家 → {}。"""
+    try:
+        from . import providers
+        p = providers.resolve("vision_second")
+        if not all(str(p.get(k) or "").strip()
+                   for k in ("provider", "base_url", "api_key", "model")):
+            return {}
+        main = providers.resolve("vision")
+        if (p["base_url"] == main["base_url"] and p["model"] == main["model"]):
+            return {}       # 同一家同一个模型，问两遍纯浪费
+        return p
+    except Exception as e:
+        logger.debug(f"[VISION] 第二视觉源解析失败（忽略）: {type(e).__name__}: {e}")
+        return {}
 
 # 第四层：定向追问。前三层都没给出专名时，换一个**明确的问法**再问一次视觉模型。
 # 为什么有效：问「这是什么」模型倾向描述画面，问「这是谁」它才被迫给名字；
@@ -115,14 +143,26 @@ TARGETED_PROMPT = (
 #    原因：DeepSeek 拿到只有画面的描述，只能自己瞎猜角色（用户：「猜角色为什么
 #    一定要 deepseek 猜，还浪费时间」）。识图模型是 LLM，它有知识，让它顺手给猜测，
 #    标好「猜」让 DeepSeek 参考即可 —— 比让 DeepSeek 从零猜准得多，也快得多。
+# 文字行（2026-11-27 P1）：装了 RapidOCR 之后，全文交给 OCR（确定性、不改写），
+# 视觉模型只负责「有没有字 + 最关键一句」，省 output token、也不再产出改写版原文。
+# OCR 关闭时退回旧行为（逐字照抄），保证没装依赖的部署不掉能力。
+_TEXT_LINE_FULL = (
+    "文字：图里若有文字就**逐字照抄原话**（最多 150 字，不要总结、不要改写、不要翻译）；"
+    "没有文字写「无」\n"
+)
+_TEXT_LINE_OCR = (
+    "文字：图里若有文字，只抄最关键的 1 句（≤30 字，不要逐字抄全文、不要翻译；"
+    "另有 OCR 负责全文）；没有文字写「无」\n"
+)
+_TEXT_LINE = _TEXT_LINE_OCR if ocr_mod.ENABLED else _TEXT_LINE_FULL
+
 VISION_PROMPT_STRUCT = (
     "看这张图，严格按下面六行输出，不要任何多余内容、不要分点解释：\n"
     "标记：如果画面是成人/擦边/血腥/恶心内容写「NSFW」；否则写「正常」\n"
     "类型：如果是截图/聊天记录/文档/表格/网页这类「以文字为主」的图写「文字图」；否则写「图片」\n"
     "画面：只写你真正看到的（发色、发型、服装、动作、构图、道具），"
     "不超过 60 字，不要写作品名或人名\n"
-    "文字：图里若有文字就**逐字照抄原话**（最多 150 字，不要总结、不要改写、不要翻译）；"
-    "没有文字写「无」\n"
+    + _TEXT_LINE +
     "作品：认得出就写作品名；认不出但能联想到最像的，写「X（猜）」；完全没头绪写「不确定」\n"
     "角色：同上。哪怕只有三成把握也写出来，格式「名字（猜）」；完全没头绪写「不确定」"
 )
@@ -138,7 +178,9 @@ GIF_PROMPT_STRUCT = (
     "类型：表情包 / 动漫截图 / 实拍 / 截图 / 其他（选一个）\n"
     "画面：用**一句话总结整段动画在演什么**（谁/什么 + 做了什么 + 从什么变成什么 + 笑点），"
     "不超过 60 字。**不要逐格描述**（不要写「第一帧…第二帧…」「左上…右下…」）\n"
-    "文字：图里若有文字就**逐字照抄原话**（最多 60 字，不要总结）；没有写「无」\n"
+    "文字：" + ("只抄最关键的 1 句（≤20 字，不要逐字抄，另有 OCR）；没有写「无」\n"
+               if ocr_mod.ENABLED else
+               "图里若有文字就**逐字照抄原话**（最多 60 字，不要总结）；没有写「无」\n") +
     "角色：认得出就写「作品·角色」；认不出但能联想到最像的，写「X（猜）」；"
     "完全没头绪写「不确定」\n"
 )
@@ -928,7 +970,7 @@ async def _gif_summary(vl_call) -> str:
     return t.strip("「」\"'。")[:80]
 
 
-def _fmt_one(tag: str, parsed: dict) -> str:
+def _fmt_one(tag: str, parsed: dict, *, with_text: bool = True) -> str:
     """一行「谁看到了什么」。"""
     if not parsed:
         return f"{tag}：（没有结果）"
@@ -938,9 +980,10 @@ def _fmt_one(tag: str, parsed: dict) -> str:
     text = str(parsed.get("text") or "").strip()
     name = "·".join(x for x in (work, char) if x)
     body = scene or "（没描述）"
-    # 👇 OCR 文字必须原样带进多源报告：截图/聊天记录的信息全在文字里，
+    # 👇 文字必须原样带进多源报告：截图/聊天记录的信息全在文字里，
     #    只给「一张截图」等于没给（2026-11-13 实测：她拿不到文字只能瞎猜话题）
-    if text:
+    #    2026-11-27：OCR 有结果时这里不再重复视觉模型的改写版（下面单独一行给原文）
+    if text and with_text:
         body += f"｜图里文字：{text}"
     return f"{tag}：{body}" + (f"（{name}）" if name else "")
 
@@ -1004,6 +1047,20 @@ async def recognize(image_bytes: bytes, vl_call, *, url: str = "", hint: str = "
 
     sources = {}
 
+    # ②' OCR 与视觉模型并行（2026-11-27 P1）：
+    #     OpenCV 先判「有没有字」（毫秒级），有字才把 OCR 丢线程池，
+    #     和 VL 调用同时跑 —— 基本不额外增加回复延迟。
+    _ocr_task = None
+    if ocr_mod.ENABLED:
+        try:
+            from . import vision_report as _vr_q
+            _img_q = vl_bytes or image_bytes
+            if _vr_q.quality_of(_img_q).get("has_text"):
+                _ocr_task = asyncio.create_task(ocr_mod.read_async(_img_q))
+        except Exception as e:
+            logger.debug(f"[VISION] OCR 启动失败（忽略）: {type(e).__name__}: {e}")
+            _ocr_task = None
+
     # ② trace.moe（只对动漫截图有效）
     #    GIF 走「均分三帧分别搜」—— 直接把动图丢给它，它只会拿第一帧乱猜。
     anime = {}
@@ -1052,32 +1109,45 @@ async def recognize(image_bytes: bytes, vl_call, *, url: str = "", hint: str = "
         logger.warning(f"[VISION] qwen 视觉调用异常: {type(e).__name__}: {e}")
     qwen = parse_structured(qwen_raw) if qwen_raw.strip() else {}
 
-    glm_parsed = {}
-    glm_raw = ""
-    # 2026-11-27（P0）：第二家视觉改「按需」——trace 命中或 qwen 已给出专名时不再问，
-    # 省掉一半视觉调用。VISION_GLM_MODE=always 可退回旧行为。
-    # 走 tuning（不是 os.getenv）：audit_coverage 只认 tuning 读点
-    _glm_mode = (tuning.raw("VISION_GLM_MODE") or "on_miss").strip().lower()
-    _need_glm = bool(GLM_VISION) and (
-        _glm_mode == "always"
-        or (_glm_mode == "on_miss" and not trace_ok
+    # ②'' OCR 收尾：VL 调用这十几秒里它早就跑完了，这里只是取结果
+    ocr_blocks = []
+    if _ocr_task is not None:
+        try:
+            ocr_blocks = await _ocr_task or []
+        except Exception as e:
+            logger.debug(f"[VISION] OCR 取结果失败（忽略）: {type(e).__name__}: {e}")
+            ocr_blocks = []
+        if ocr_blocks:
+            logger.info(f"[VISION] 🔤 OCR {len(ocr_blocks)} 块："
+                        f"{ocr_mod.text_of(ocr_blocks, 60)}")
+        else:
+            logger.info("[VISION] OCR 没读出字（文字退回视觉模型）")
+
+    alt_parsed = {}
+    alt_raw = ""
+    # 2026-11-27：第二视觉源改成**可配 provider**（默认关闭）。
+    # 之前写死 GLM，GLM 额度用完后这里每张图都白等一次失败。
+    _second = _second_target()
+    _second_name = str((_second or {}).get("provider") or "第二家")
+    _need_alt = bool(_second) and _SECOND_MODE != "off" and (
+        _SECOND_MODE == "always"
+        or (_SECOND_MODE == "on_miss" and not trace_ok
             and not (qwen.get("work") or qwen.get("char")))
     )
-    if _need_glm:
+    if _need_alt:
         try:
-            from . import glm
-            if glm.available():
-                # GIF 已经抽帧拼成静态图（vl_bytes），别把动图原样喂给 GLM（报 1210）
-                glm_raw = await glm.describe_image(vl_bytes or image_bytes, prompt,
-                                                  max_tokens=400)
-                if glm_raw.strip():
-                    glm_parsed = parse_structured(glm_raw)
+            from . import vlm
+            # GIF 已经抽帧拼成静态图（vl_bytes），别把动图原样喂过去
+            alt_raw = await vlm.describe(
+                "vision_second", vl_bytes or image_bytes, prompt, max_tokens=400) or ""
+            if alt_raw.strip():
+                alt_parsed = parse_structured(alt_raw)
         except Exception as e:
-            logger.debug(f"[VISION] GLM 视觉失败（忽略）: {e}")
+            logger.debug(f"[VISION] 第二视觉源失败（忽略）: {type(e).__name__}: {e}")
     # 👇 GIF：把「逐格描述」压成一句话。模型经常无视「不要逐格」的指令，
     #    这里在**进报告之前**兜一层，DeepSeek 只看到总结（用户 2026-11-20）。
     if is_gif:
-        for _p in (qwen, glm_parsed):
+        for _p in (qwen, alt_parsed):
             if not isinstance(_p, dict):
                 continue
             _raw_scene = str(_p.get("scene") or "")
@@ -1089,15 +1159,15 @@ async def recognize(image_bytes: bytes, vl_call, *, url: str = "", hint: str = "
                             f"→ 总结 {len(_p['scene'])} 字")
         # 清洗完还在逐格罗列 → 再问一次「一句话总结」（同一张网格图，很便宜）
         _cur_scene = (str((qwen or {}).get("scene") or "").strip()
-                      or str((glm_parsed or {}).get("scene") or "").strip())
+                      or str((alt_parsed or {}).get("scene") or "").strip())
         if _cur_scene and _gif_need_summary(_cur_scene):
             _sum = await _gif_summary(vl_call)
             if _sum:
                 logger.info(f"[VISION] GIF 二次总结：{_sum}")
                 if isinstance(qwen, dict):
                     qwen["scene"] = _sum
-                if isinstance(glm_parsed, dict) and glm_parsed:
-                    glm_parsed["scene"] = _sum
+                if isinstance(alt_parsed, dict) and alt_parsed:
+                    alt_parsed["scene"] = _sum
 
     extra = []
     if _extra_task is not None:
@@ -1112,36 +1182,41 @@ async def recognize(image_bytes: bytes, vl_call, *, url: str = "", hint: str = "
 
     if qwen:
         sources["qwen"] = qwen
-    if glm_parsed:
-        sources["glm"] = glm_parsed
+    if alt_parsed:
+        sources["second"] = alt_parsed
+    if ocr_blocks:
+        sources["ocr"] = {"blocks": len(ocr_blocks)}
 
-    if not qwen and not glm_parsed and not trace_ok:
+    if not qwen and not alt_parsed and not trace_ok:
         return {}
 
     # ④ trace 番名被否决？（纯色帧/撞脸会误命中，两个视觉模型都能投反对票）
-    if trace_ok and re.search(r"是否本番\s*[:：]\s*不是", qwen_raw + glm_raw):
+    if trace_ok and re.search(r"是否本番\s*[:：]\s*不是", qwen_raw + alt_raw):
         logger.info(f"[VISION] 视觉模型否决了 trace.moe 给的《{anime.get('work')}》")
         trace_ok = False
         chars = []
 
     # ⑤ 汇总：画面用 qwen 优先，专名取多数一致
-    scene = (qwen.get("scene") or glm_parsed.get("scene") or "").strip()
-    # 👇 OCR 文字：两个模型都可能给出，取**较长**的那个
-    #    （短的那个通常是被 max_tokens 截断的半截，不是更好）
+    scene = (qwen.get("scene") or alt_parsed.get("scene") or "").strip()
+    # 👇 文字：**OCR 优先**（确定性、原文照抄）；OCR 没跑/没读到才退回视觉模型，
+    #    视觉模型两家都给了就取**较长**的那份（短的多半被 max_tokens 截断）。
     _t_q = str((qwen or {}).get("text") or "").strip()
-    _t_g = str((glm_parsed or {}).get("text") or "").strip()
-    ocr_text = _t_q if len(_t_q) >= len(_t_g) else _t_g
-    kind = str((qwen or {}).get("kind") or (glm_parsed or {}).get("kind") or "").strip()
+    _t_g = str((alt_parsed or {}).get("text") or "").strip()
+    _t_ocr = ocr_mod.text_of(ocr_blocks)
+    _t_vlm = _t_q if len(_t_q) >= len(_t_g) else _t_g
+    ocr_text = _t_ocr or _t_vlm
+    text_source = "ocr" if _t_ocr else ("vlm" if _t_vlm else "")
+    kind = str((qwen or {}).get("kind") or (alt_parsed or {}).get("kind") or "").strip()
     if ocr_text:
-        logger.info(f"[VISION] 🔤 OCR 拿到 {len(ocr_text)} 字：{ocr_text[:60]}")
+        logger.info(f"[VISION] 🔤 文字({text_source}) {len(ocr_text)} 字：{ocr_text[:60]}")
     if trace_ok:
         work = anime["work"]
-        char = _pick_majority([qwen.get("char"), glm_parsed.get("char")], allowed=chars)
+        char = _pick_majority([qwen.get("char"), alt_parsed.get("char")], allowed=chars)
         if not char and len(chars) == 1:
             char = chars[0]
     else:
-        work = _pick_majority([qwen.get("work"), glm_parsed.get("work")])
-        char = _pick_majority([qwen.get("char"), glm_parsed.get("char")])
+        work = _pick_majority([qwen.get("work"), alt_parsed.get("work")])
+        char = _pick_majority([qwen.get("char"), alt_parsed.get("char")])
 
     # ⑥ 文本核验：trace 已经用图比对过就不必再搜文本了
     v = {}
@@ -1166,28 +1241,33 @@ async def recognize(image_bytes: bytes, vl_call, *, url: str = "", hint: str = "
         lines.append("（这是一张**动图**：已抽 6 帧拼成网格给视觉模型看过，"
                      "下面是**总结**；评论时可以提「动图里…」）")
         _gsc = (str((qwen or {}).get("scene") or "").strip()
-                or str((glm_parsed or {}).get("scene") or "").strip())
-        _alt = str((glm_parsed or {}).get("scene") or "").strip()
+                or str((alt_parsed or {}).get("scene") or "").strip())
+        _alt = str((alt_parsed or {}).get("scene") or "").strip()
         if _gsc and _alt and _alt[:12] != _gsc[:12]:
             _gsc = f"{_gsc}（另一模型：{_alt[:40]}）"
         lines.append(f"动图内容：{_gsc or '（没描述出来）'}")
-        _kt = str((qwen or {}).get("kind") or (glm_parsed or {}).get("kind") or "").strip()
+        _kt = str((qwen or {}).get("kind") or (alt_parsed or {}).get("kind") or "").strip()
         if _kt:
             lines.append(f"类型：{_kt}")
         if ocr_text:
-            lines.append(f"图里文字：{ocr_text[:120]}")
+            _src = "OCR 原文" if _t_ocr else "识图模型，可能不准"
+            lines.append(f"图里文字（{_src}）：{ocr_text[:120]}")
         _nm = "·".join(x for x in (work, char) if x)
         if _nm:
             lines.append(f"识别：{_nm}")
     else:
         if qwen:
-            lines.append(_fmt_one("qwen识图", qwen))
+            lines.append(_fmt_one("qwen识图", qwen, with_text=not _t_ocr))
         else:
             lines.append("qwen识图：（没结果）")
-        if glm_parsed:
-            lines.append(_fmt_one("GLM识图", glm_parsed))
-        elif _need_glm:
-            lines.append("GLM识图：（不可用或没结果）")
+        if alt_parsed:
+            lines.append(_fmt_one(f"{_second_name}识图", alt_parsed, with_text=not _t_ocr))
+        elif _need_alt:
+            lines.append(f"{_second_name}识图：（不可用或没结果）")
+        # 👇 最终文字单独一行：OCR 原文优先（视觉模型的「逐字抄」会改写，只当线索）
+        if ocr_text:
+            _src = "OCR 原文" if _t_ocr else "识图模型，可能不准"
+            lines.append(f"图里文字（{_src}）：{ocr_text[:200]}")
     if trace_ok:
         ep = anime.get("episode")
         _at = anime.get("at")
@@ -1256,7 +1336,7 @@ async def recognize(image_bytes: bytes, vl_call, *, url: str = "", hint: str = "
 
     # 专名是识图模型猜的（没有 trace.moe/联网佐证）→ 明确告诉 DeepSeek 别当真
     if not trace_ok and not (v.get("verdict") == "一致"):
-        if ((qwen or {}).get("guess") or (glm_parsed or {}).get("guess")):
+        if ((qwen or {}).get("guess") or (alt_parsed or {}).get("guess")):
             lines.append(
                 "（带「猜」的专名是识图模型凭印象给的，**把握不大**："
                 "可以顺着说「这是XX吧」，但别当成事实讲，也别为它编细节）"
@@ -1266,11 +1346,11 @@ async def recognize(image_bytes: bytes, vl_call, *, url: str = "", hint: str = "
 
     # ⑧ 缓存 + 记忆
     # guess：专名是识图模型猜的（不是 trace.moe 比对出来的）→ 描述里标「仅猜测」
-    _guess = bool((qwen or {}).get("guess") or (glm_parsed or {}).get("guess")) and not trace_ok
+    _guess = bool((qwen or {}).get("guess") or (alt_parsed or {}).get("guess")) and not trace_ok
     # trace 只是「疑似命中」→ 角色名不写进 desc：desc 会进群聊上下文和长期记忆，
     # 认错一次就会被当成事实翻出来很久（用户 2026-11-19：不确定就别回角色名）。
     _uncertain = bool(trace_ok and (anime.get("confidence") or "high") != "high")
-    _nsfw = str((qwen or {}).get("nsfw") or (glm_parsed or {}).get("nsfw") or "")
+    _nsfw = str((qwen or {}).get("nsfw") or (alt_parsed or {}).get("nsfw") or "")
     if _nsfw:
         logger.info("[VISION] ⚠️ 识图模型标记为 NSFW，描述里加提示，别让她认真分析画面")
     desc = compose(scene, work, ("" if _uncertain else char),
@@ -1300,6 +1380,10 @@ async def recognize(image_bytes: bytes, vl_call, *, url: str = "", hint: str = "
         "guess": _guess,
         "nsfw": _nsfw,
         "text": ocr_text,
+        # 文字来源：ocr = 原文照抄（可信）；vlm = 识图模型改写版（只当线索）
+        "text_source": text_source,
+        # OCR 分块（含置信度/坐标）→ vision_report 直接复用，不再二次识字
+        "ocr_blocks": ocr_blocks,
         "kind": kind,
         "desc": desc,
         "report": report,
@@ -1311,7 +1395,8 @@ async def recognize(image_bytes: bytes, vl_call, *, url: str = "", hint: str = "
             if trace_ok else (v.get("verdict") or "未核验")
         ),
         "corrected": bool(v.get("corrected")),
-        "source": "trace.moe" if trace_ok else ("glm+qwen" if glm_parsed else "qwen"),
+        "source": "trace.moe" if trace_ok else (
+            f"{_second_name}+qwen" if alt_parsed else "qwen"),
         "episode": anime.get("episode") if trace_ok else None,
         "confidence": anime.get("confidence") if trace_ok else "",
     }

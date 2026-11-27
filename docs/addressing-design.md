@@ -368,8 +368,8 @@ process_image → vision_verify.recognize()
 | 字段 | 产出方 | 备注 |
 |---|---|---|
 | `sharpness/quality/has_text/text_ratio` | **OpenCV** | 确定性、毫秒级、不幻觉 |
-| `text_blocks` | VLM 的文字行（P0）/ OCR（P1 起） | P0 标 `source=vlm`；P1 起 `ocr` 才算事实 |
-| `kind/scene/emotion_tone` | 视觉模型（1 次） | P0 **保留**文字行，P1 才删 |
+| `text_blocks` | **RapidOCR（P1 起）**，VLM 兜底 | `source=ocr` 原文照抄、可当事实；`source=vlm` 只当线索 |
+| `kind/scene/emotion_tone` | 视觉模型（1 次） | P1 起文字行改成「只抄最关键 1 句」（全文交给 OCR） |
 | `char/work/char_conf` | trace + 视觉（+按需第二家） | |
 | `partial` | 管线 | 超时/降级为 true |
 
@@ -378,7 +378,8 @@ process_image → vision_verify.recognize()
 ```text
 图片 bytes
   → OpenCV：sharpness(Laplacian) + text_ratio(形态学) ──┐
-  → 视觉 1 次（画面 / 类型 / 文字）───────────────────┤
+  → 有字才 OCR：RapidOCR（线程池，与视觉并行）─────────┤
+  → 视觉 1 次（画面 / 类型 / 关键 1 句）────────────────┤
   → 按需：专名缺失才问第二家 ────────────────────────┤
                                                      ▼
                  ImageReport（**复用现有 fingerprint 缓存**，只扩字段）
@@ -409,11 +410,16 @@ should_audit = report["has_text"] and re.search(r"@|「.{1,8}」", report_text)
 
 只有「图里有字，且字里出现 @ 或引号里的称呼」才送审；其余保持 `no_audit=True`。
 
-### 7.6.6 P0 的取舍（锐评 #5）
+### 7.6.6 P0 的取舍（锐评 #5）与 P1 的收尾
 
 **P0 不删视觉 prompt 里的「文字」行**。理由：服务器还没有 OCR 引擎，
 删了之后「聊天截图 / 题目截图」会直接变成瞎子，要等 P1 装 RapidOCR 才补得回来。
 P0 只做：OpenCV 质量数值化 + GLM 第二意见改按需 + report 结构 + 标签复用。
+
+**P1（2026-11-27 已落地）**：RapidOCR 实测能在 2 vCPU 轻量服务器上跑（见 §7.13），
+所以视觉 prompt 的文字行从「逐字照抄 150 字」改成「只抄最关键 1 句（≤30 字）」，
+全文由 OCR 给原文。这样同时省 output token、也避免 VLM 改写原文被当事实。
+OCR 关闭（`VISION_OCR=0`）时自动退回「逐字照抄」，能力不掉。
 
 ## 7.7 自检：L0 机械修正 + 异步 LLM 自检
 
@@ -454,7 +460,7 @@ P0 只做：OpenCV 质量数值化 + GLM 第二意见改按需 + report 结构 +
 | 环节 | 现在 | P0 | 说明 |
 |---|---|---|---|
 | 视觉（每图） | 2~6 次 VLM | 典型 1，P95 ≤2 | GLM 改按需；文字行保留 |
-| OCR | 0（旁路工具） | 0 | P1 才装 RapidOCR（不占模型预算） |
+| OCR | 0（旁路工具） | 0（本地推理，不占模型预算） | P1 已装 RapidOCR；只在线程池跑、有字才跑 |
 | atmosphere | 1 次 | 1 次（出 +8 token） | 加 `kind` |
 | 主生成 | 1 次 | 1 次（prompt 净增 ≤60 字） | 两行短句 |
 | L0 自检 | 无 | <10ms | 纯规则 |
@@ -470,7 +476,10 @@ P0 只做：OpenCV 质量数值化 + GLM 第二意见改按需 + report 结构 +
 | 开关 | 代码默认 | 作用 | 回滚 |
 |---|---|---|---|
 | `VISION_REPORT` | **1** | 走 ImageReport 单次产出（等价重构） | 0 = 旧 `recognize` 路径 |
-| `VISION_GLM_MODE` | `on_miss` | `always` / `on_miss` / `off` | 改回 `always` |
+| `VISION_OCR` | **1** | 图里的字优先用 RapidOCR（原文照抄） | 0 = 退回视觉模型识字 |
+| `OCR_RAPID_MAX_SIDE` / `OCR_RAPID_MIN_CONF` / `OCR_RAPID_TIMEOUT` / `OCR_RAPID_THREADS` | 1024 / 0.5 / 8s / 2 | RapidOCR 精度/耗时取舍 | 调小 `OCR_RAPID_MAX_SIDE` 换速度 |
+| `VISION_SECOND_MODE` | `on_miss` | 第二视觉源策略（**不配 `VISION_SECOND_PROVIDER` 就关闭**） | `off` |
+| `VISION_GLM_MODE` | `on_miss` | ⚠️ 旧名，只做 .env 兼容 | 用 `VISION_SECOND_MODE` |
 | `ATMO_KIND` | **1** | atmosphere 输出 `kind`（只加一行） | 0 |
 | `ADDR_LEVEL_ACTION` | **0** | L2 观望真正生效 | 0 = 今天的行为 |
 | `ADDR_TOPIC_SHIFT` | **0** | 话题漂移检测 | 0 |
@@ -481,7 +490,8 @@ P0 只做：OpenCV 质量数值化 + GLM 第二意见改按需 + report 结构 +
 
 ```text
 [ADDR] gid=… level=L2 kind=statement shift=1 → 观望
-[VISION] report sha=… sharp=38 text=vlm:12字 glm=on_miss cost=1.8s partial=false
+[VISION] report sha=… sharp=38 text=ocr:12字 2nd=off cost=1.8s partial=false
+[VISION] 🔤 OCR 4 块：Daily Report 2026-11-27 / token used …（OCR 与 VL 并行，不额外等）
 [SELFCHECK] L0 hit=protocol；flag=unanswered
 [SELFCHECK-ASYNC] aligned=1 in=2 rep=2 → hint 已写
 ```
@@ -510,7 +520,8 @@ P0 只做：OpenCV 质量数值化 + GLM 第二意见改按需 + report 结构 +
 | 阶段 | 内容 | 默认 | 风险 |
 |---|---|---|---|
 | **P0** | ImageReport（质量数值化 + GLM 按需 + 标签复用 + 缓存扩字段）+ `kind` + L0 机械自检 | `VISION_REPORT=1`、`VISION_GLM_MODE=on_miss`、`ATMO_KIND=1`、`REPLY_SELFCHECK=0` | 低（等价重构 + 纯规则） |
-| **P1** | RapidOCR 接入（装依赖）→ 再把「文字」从 VLM prompt 删掉 + 话题漂移（标定阈值后开） | `OCR_ENGINE=rapidocr`、`ADDR_TOPIC_SHIFT=1` | 中（装依赖 / 阈值误判） |
+| **P1** | ✅ RapidOCR 已接入（2026-11-27，见 §7.13）：OCR 与 VL 并行、视觉文字行改「关键 1 句」；第二视觉源改可配 provider（默认 qwen，GLM 可选） | `VISION_OCR=1`、`VISION_SECOND_MODE=on_miss`（不配 provider 即关闭） | 低（已实测 2 vCPU 可带动） |
+| **P1-b** | 待做：话题漂移（`ADDR_TOPIC_SHIFT`，需先用 trace 标定阈值） | `ADDR_TOPIC_SHIFT=1` | 中（阈值误判） |
 | **P2** | L2 观望 + 异步自检回填 | `ADDR_LEVEL_ACTION=1`、`REPLY_SELFCHECK_ASYNC=1` | 中（影响回复率，盯指标） |
 
 **明确不做（本轮）**：
@@ -550,3 +561,80 @@ P0 只做：OpenCV 质量数值化 + GLM 第二意见改按需 + report 结构 +
 | 6 | 不与既有机制打架 | ✅ 不动 `stay_silent` / `_FAILED_TURN` / 40 字 2 泡 / `view_frequency` | `test_regressions.py` |
 | 7 | 可观测 | ✅ 4 行日志 + `/测函数` | 真机抽查 |
 | 8 | 可回滚 | ✅ 7 个开关，无数据迁移 | 逐个关掉复测 |
+
+## 7.13 P1 落地记录（2026-11-27 22:00）
+
+### 7.13.1 RapidOCR 在轻量服务器上带得动吗
+
+用户问「轻量服务器可以带动吗」——**可以**。实测机器：2 vCPU / 3.5GB / 根分区剩 3.5GB。
+
+| 指标 | 实测 |
+|---|---|
+| 首次加载 | 0.5s（懒加载：第一张「有字」的图才吃内存） |
+| 常驻内存 | ≈350MB（onnxruntime 会话），峰值 ≈490MB |
+| 单图（长边 1024） | 0.7~2.7s（群截图 2.0s / 窄条 2.6s / 照片 1.0s） |
+| 磁盘 | 依赖 + 模型 ≈400MB |
+| 准确率 | 群截图 4/4 块全对；测试图里塞的 `OCR_TEST_MARKER_42` 也被原样读出（确认是 OCR，不是模型幻觉） |
+
+结论：能带动。bot 200MB + napcat 500MB + OCR 350MB，机器仍有 1.5GB 余量；
+但 2 vCPU 上 OCR 会和事件循环抢核，所以**必须**线程池 + 串行锁 + 超时（见下）。
+
+### 7.13.2 接入方式（不增加主链路延迟）
+
+```text
+process_image
+  → OpenCV quality_of()（毫秒）→ has_text?
+        ├─ 有：asyncio.create_task(ocr.read_async())  ┐
+        └─ 无：跳过                                   ├─ 并行
+  → qwen VL 调用（10s 量级）─────────────────────────┘
+  → await OCR 结果（此时早已跑完）
+  → rec["text"] = OCR 原文（没有才用 VLM）；rec["ocr_blocks"] 进 report/缓存
+```
+
+- `services/ocr_rapid.py`：单例懒加载、`asyncio.to_thread`、串行锁（上一张没完就跳过本张，
+  不排队拖慢回复）、8s 超时、置信度 <0.5 丢弃；没装/加载失败/超时一律返回 `[]`（fail-open）。
+- `services/vision_verify.py`：OCR 与 VL 并行；文字合并顺序 **OCR > VLM 较长的那个**；
+  视觉 prompt 文字行从「逐字照抄 150 字」改成「只抄最关键 1 句（≤30 字）」，省 output token；
+  `VISION_OCR=0` 时自动退回旧 prompt（逐字照抄）。
+- `services/vision_report.py`：`text_blocks[].source` 区分 `ocr` / `vlm`，
+  `render_line` 写「图里文字 N 字（OCR）」或「（识图模型读的，可能不准）」。
+
+### 7.13.3 视觉模型：默认 qwen，第二家变成「可选」
+
+用户拍板：**GLM 额度用完了，之后先靠 qwen 视觉；但保留可选视觉模型的能力。**
+
+| 角色 | 默认 | 说明 |
+|---|---|---|
+| `vision`（主） | **qwen**（`qwen3-vl-plus`） | 实测约 10s；GLM 想用就写 `VISION_PROVIDER=glm` |
+| `vision_fallback`（额度兜底） | glm | 主 provider 1113/429 时自动换；没配 key 自动跳过 |
+| `vision_second`（第二证据源） | **关闭** | 不配 `VISION_SECOND_PROVIDER` 就不调；配了才按 `VISION_SECOND_MODE` 问 |
+
+改动：
+- `services/providers.py`：`vision` 默认 glm→qwen；新增 `vision_second`（默认空 = 关闭，
+  且**不拿 `LLM_PROVIDER` 兜底**，避免用户配了主模型就被动多调一家视觉）；
+- `services/vlm.py`（新）：任意 role 的通用视觉调用（OpenAI 兼容，Pillow 压到 1280/JPEG85，
+  失败静默返回空）——第二视觉源不再写死 `services/glm.py`；
+- `services/vision_verify.py`：`GLM_VISION` → `_second_target()`；日志/报告里的「GLM识图」
+  改成实际 provider 名；`VISION_GLM_MODE` 只保留为旧 .env 兼容名。
+
+### 7.13.4 依赖与镜像
+
+- `requirements.txt`：`onnxruntime==1.18.1`（**不能装 1.32**：它强制 numpy>=2，
+  imageutils 要求 numpy<2）、`pyclipper`、`Shapely`、`tqdm`。
+- `Dockerfile`：`pip install --no-deps rapidocr_onnxruntime==1.4.4` ——
+  rapidocr 声明依赖 `opencv-python`（带 GUI，容器缺 libGL 会 import 崩），
+  会覆盖 `opencv-python-headless`，所以本体单独 `--no-deps` 装。
+- `.env`：`VISION_OCR=1`、`OCR_RAPID_MAX_SIDE=1024`、`OCR_RAPID_MIN_CONF=0.5`、
+  `OCR_RAPID_TIMEOUT=8`、`OCR_RAPID_THREADS=2`、`VISION_SECOND_MODE=on_miss`。
+  （`OCR_MAX_SIDE / OCR_UPSCALE_MIN_W / OCR_MAX_CROPS / OCR_TIMEOUT` 是 `ocr_lite`
+  旁路工具的参数，和 RapidOCR 不是一回事，见 `services/ocr.py`。）
+
+### 7.13.5 验证结果
+
+| 项 | 结果 |
+|---|---|
+| `scripts/check_tuning.py` | PASS（顺带删掉旧「OpenCV 增强 + 裁剪送模型」遗留键） |
+| `scripts/audit_coverage.py --strict` | 0 结构性硬伤 |
+| `scripts/check_runtime_wiring.py` | 62 PASS / 0 FAIL |
+| 端到端（真图 + 真 qwen） | `text_source=ocr`、4 块、report 出现「图里文字（OCR 原文）」 |
+| 启动日志 | 无 Traceback；`[OCR] RapidOCR 已加载` 在首张有字图时出现 |

@@ -9,7 +9,8 @@
 设计（见 docs/addressing-design.md §7.6）：
   · **质量/有没有字** 用 OpenCV 算（确定性、毫秒级、不幻觉）；
   · **画面/类型/情绪** 由视觉模型给一次；
-  · **文字** P0 仍来自视觉模型（标 source=vlm，只当线索）；P1 装 RapidOCR 后改 ocr；
+  · **文字** 优先 RapidOCR（source=ocr，原文照抄）；OCR 不可用才退回视觉模型
+    （source=vlm，会改写，只当线索）；
   · 产出一次，三处复用：角色扮演 prompt / 收件人判定（group_scene）/ 记忆。
 
 边界：
@@ -121,14 +122,24 @@ def quality_of(data: bytes) -> dict:
 
 
 def build(rec: dict, data: bytes = b"", *, cost_ms: int = 0,
-          partial: bool = False) -> dict:
-    """把「视觉模型结果 + OpenCV 质量」合成一份 ImageReport。
+          partial: bool = False, quality: dict | None = None) -> dict:
+    """把「视觉结果 + OCR + OpenCV 质量」合成一份 ImageReport。
 
     `rec` 是 `services/vision_verify.recognize()` 的返回（scene/work/char/text/kind/…）。
+    P1（2026-11-27）：`rec["ocr_blocks"]` 存在时文字直接用 OCR 原文（source=ocr），
+    视觉模型的改写版只在 OCR 没结果时兜底（source=vlm）。
     """
     rec = rec or {}
-    q = quality_of(data)
+    q = quality if isinstance(quality, dict) and quality else quality_of(data)
     text = str(rec.get("text") or "").strip()
+    blocks = [b for b in (rec.get("ocr_blocks") or []) if isinstance(b, dict)]
+    if blocks:
+        text_source = "ocr"
+    elif text:
+        blocks = [{"text": text, "conf": None, "source": "vlm"}]
+        text_source = "vlm"
+    else:
+        text_source = ""
     rep = {
         "sha1": hashlib.sha1(data).hexdigest()[:16] if data else "",
         "w": q.get("w", 0), "h": q.get("h", 0),
@@ -136,9 +147,10 @@ def build(rec: dict, data: bytes = b"", *, cost_ms: int = 0,
         "quality": q.get("quality", ""),
         "has_text": q.get("has_text", bool(text)),
         "text_ratio": q.get("text_ratio", 0.0),
-        # P0：文字来自视觉模型 → source=vlm（只当线索）；P1 换成 ocr 才算事实
-        "text_blocks": ([{"text": text, "conf": None, "source": "vlm"}]
-                        if text else []),
+        # P1：文字优先来自 RapidOCR（source=ocr，原文照抄）；
+        #     视觉模型的文字只是兜底（source=vlm，可能改写，只当线索）
+        "text_blocks": blocks,
+        "text_source": text_source,
         "kind": str(rec.get("kind") or ""),
         "scene": str(rec.get("scene") or ""),
         "char": str(rec.get("char") or ""),
@@ -181,7 +193,8 @@ def render_line(rep: dict) -> str:
         bits.append(f"清晰（{sharp:.0f}）")
     txt = text_of(rep)
     if txt:
-        bits.append(f"图里文字 {len(txt)} 字（识图模型读的，可能不准）")
+        tag = "OCR" if rep.get("text_source") == "ocr" else "识图模型读的，可能不准"
+        bits.append(f"图里文字 {len(txt)} 字（{tag}）")
     elif rep.get("has_text"):
         bits.append("图里有字但没读清")
     return ("【画面质量】" + "；".join(bits)) if bits else ""

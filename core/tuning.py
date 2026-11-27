@@ -121,6 +121,9 @@ DEFAULTS = {
     'HARNESS_MAX_OUTPUT': 3000,
 
     # ---------- 图片文字（OpenCV 增强，2026-11-27）----------
+    # ⚠️ 这组是 `services/ocr.py`（plugins/ocr_lite 的旁路工具）用的：
+    #    OpenCV 增强/裁剪文字块 → 视觉模型读字。
+    #    识图主链路的本地 OCR（RapidOCR）用 OCR_RAPID_*，两套互不影响。
     'OCR_MAX_SIDE': 2200,
     'OCR_UPSCALE_MIN_W': 1400,
     'OCR_MAX_CROPS': 3,
@@ -587,10 +590,24 @@ DEFAULTS = {
     # ---------- 图片结构化报告 ImageReport（2026-11-27，docs/addressing-design §7.6）----------
     # 1 = 走「一次产出、三处复用」（质量/文字/画面合成一份 report）；0 = 退回旧路径
     'VISION_REPORT': 1,
-    # 第二家视觉（GLM）：always / on_miss（trace 没命中且 qwen 没给专名才问）/ off
+    # 第二视觉源：always / on_miss（trace 没命中且主视觉没给专名才问）/ off。
+    # 2026-11-27 起「第二家」不再写死 GLM：要配 VISION_SECOND_PROVIDER 才会启用。
+    'VISION_SECOND_MODE': 'on_miss',
+    # 旧名（兼容历史 .env）；新代码只读 VISION_SECOND_MODE
     'VISION_GLM_MODE': 'on_miss',
     # report 里的文字**进 prompt**最多多少字（全文留在缓存里）
     'VISION_TEXT_MAX': 60,
+    # ---------- 本地 OCR（P1，2026-11-27，rapidocr_onnxruntime / services/ocr_rapid.py）----------
+    # 1 = 图里的字优先用 RapidOCR（原文照抄，不改写）；0 = 退回视觉模型识字
+    'VISION_OCR': 1,
+    # 送进 RapidOCR 前的最长边（截图 1024 够读；调大更准也更慢）
+    'OCR_RAPID_MAX_SIDE': 1024,
+    # 单块置信度下限（低于它当噪声丢掉）
+    'OCR_RAPID_MIN_CONF': 0.5,
+    # 单图超时（秒）：超时就当没读到，退回视觉模型的文字
+    'OCR_RAPID_TIMEOUT': 8.0,
+    # onnxruntime 线程数（2 vCPU 别超过 2，会抢事件循环）
+    'OCR_RAPID_THREADS': 2,
 }
 
 
@@ -691,10 +708,10 @@ DOCS = {
     'HIST_LONG_AT': '历史里超过多少字算长消息',
     'HIST_TOTAL_BUDGET': '历史总字数预算',
     'IMAGE_DEDUP_HOURS': '群友：「这肥鱼魔了」。60 秒 DEDUP 拦不住这种跨 20 分钟的复读。',
-    'OCR_MAX_SIDE': '图片文字增强：增强后最长边上限（像素）',
-    'OCR_UPSCALE_MIN_W': '图片文字增强：宽度不足这个值就放大（小字靠这个救）',
-    'OCR_MAX_CROPS': '图片文字增强：最多裁几个文字块送模型（越多越贵）',
-    'OCR_TIMEOUT': '图片文字增强：单次视觉调用超时（秒）',
+    'OCR_MAX_SIDE': '图片文字增强（ocr_lite）：增强后最长边上限（像素）',
+    'OCR_UPSCALE_MIN_W': '图片文字增强（ocr_lite）：宽度不足这个值就放大（小字靠这个救）',
+    'OCR_MAX_CROPS': '图片文字增强（ocr_lite）：最多裁几个文字块送模型（越多越贵）',
+    'OCR_TIMEOUT': '图片文字增强（ocr_lite）：单次视觉调用超时（秒）',
     'LIBRARY_COOLDOWN': '同一梗/素材的冷却时间（秒）',
     'PIPELINE_BUDGET': '回复前动态取数（心情/档案/记忆/图书馆）的总预算（秒）',
     'LLM_DAILY_BUDGET': '每日 token 预算（0 = 不刹车）；到 100% 她回一句固定话术然后当天不再消耗',
@@ -894,8 +911,15 @@ DOCS = {
     'VISION_TIMEOUT': '视觉模型超时（秒）',
     'VISION_VERIFY_MAX_PER_HOUR': '视觉核对每小时最多几次',
     'VISION_REPORT': '图片结构化报告（1=一次产出三处复用；0=退回旧识图路径）',
-    'VISION_GLM_MODE': '第二家视觉模型策略：always（每家都问）/ on_miss（默认，只在没认出专名时问）/ off',
+    'VISION_SECOND_MODE': '第二视觉源策略：always / on_miss（默认，只在没认出专名时问）/ off；'
+                          '要配 VISION_SECOND_PROVIDER 才会启用',
+    'VISION_GLM_MODE': '⚠️ LEGACY：旧名，新代码只读 VISION_SECOND_MODE',
     'VISION_TEXT_MAX': '图片里的文字**进 prompt**最多多少字（全文留在缓存，防 token 爆）',
+    'VISION_OCR': '图里的字是否优先用 RapidOCR（1=原文照抄；0=退回视觉模型识字）',
+    'OCR_RAPID_MAX_SIDE': 'RapidOCR 前把图缩到最长边多少（1024 够读截图；越大越准也越慢）',
+    'OCR_RAPID_MIN_CONF': 'RapidOCR 单块置信度下限（低于它当噪声丢掉）',
+    'OCR_RAPID_TIMEOUT': 'RapidOCR 单图超时秒数（超时退回视觉模型的文字）',
+    'OCR_RAPID_THREADS': 'onnxruntime 线程数（2 vCPU 建议 2；调大会抢事件循环）',
 }
 
 
@@ -996,10 +1020,6 @@ FILES = {
     'HIST_LONG_AT': 'services/llm.py',
     'HIST_TOTAL_BUDGET': 'services/llm.py',
     'IMAGE_DEDUP_HOURS': 'plugins/vision_agent/__init__.py',
-    'OCR_MAX_SIDE': 'services/ocr.py',
-    'OCR_UPSCALE_MIN_W': 'services/ocr.py',
-    'OCR_MAX_CROPS': 'services/ocr.py',
-    'OCR_TIMEOUT': 'services/ocr.py',
     'LIBRARY_COOLDOWN': 'services/llm.py',
     'PIPELINE_BUDGET': 'services/reply_pipeline.py',
     'LLM_DAILY_BUDGET': 'services/llm_usage.py',
@@ -1200,8 +1220,17 @@ FILES = {
     'VISION_TIMEOUT': 'plugins/vision_agent/__init__.py',
     'VISION_VERIFY_MAX_PER_HOUR': 'services/vision_verify.py',
     'VISION_REPORT': 'services/vision_report.py',
-    'VISION_GLM_MODE': 'services/vision_verify.py',
+    'VISION_SECOND_MODE': 'services/vision_verify.py',
     'VISION_TEXT_MAX': 'services/vision_report.py',
+    'VISION_OCR': 'services/ocr_rapid.py',
+    'OCR_MAX_SIDE': 'services/ocr.py',
+    'OCR_UPSCALE_MIN_W': 'services/ocr.py',
+    'OCR_MAX_CROPS': 'services/ocr.py',
+    'OCR_TIMEOUT': 'services/ocr.py',
+    'OCR_RAPID_MAX_SIDE': 'services/ocr_rapid.py',
+    'OCR_RAPID_MIN_CONF': 'services/ocr_rapid.py',
+    'OCR_RAPID_TIMEOUT': 'services/ocr_rapid.py',
+    'OCR_RAPID_THREADS': 'services/ocr_rapid.py',
 }
 
 
@@ -1817,6 +1846,8 @@ LEGACY = {
     # 2026-11-27：MOOD_MAX_DELTA 移出 LEGACY —— mood_judge 护栏 / mood.apply_delta
     # 仍在真实使用，标 LEGACY 会误导调参的人。
     'MOOD_HALF_LIFE_HOURS',
+    # 2026-11-27：第二视觉源改成可配 provider，旧开关名只做 .env 兼容读取。
+    'VISION_GLM_MODE',
 }
 
 # ============ 决策层（2026-11-25，a/节奏） ============

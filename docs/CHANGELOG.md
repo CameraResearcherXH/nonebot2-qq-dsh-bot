@@ -1,5 +1,47 @@
 # 更新日志
 
+## 2026-11-27（第四十六轮：P1 RapidOCR 落地 + 视觉默认 qwen）
+
+**1. 用户问「轻量服务器带得动 OCR 吗」→ 先实测再决定**
+
+服务器 2 vCPU / 3.5GB，实测 RapidOCR（PP-OCRv4 mobile）：
+
+| 指标 | 实测 |
+|---|---|
+| 首次加载 | 0.5s（懒加载，第一张有字的图才吃内存） |
+| 常驻 / 峰值内存 | ≈350MB / ≈490MB |
+| 单图（长边 1024） | 0.7~2.7s（群截图 2.0s） |
+| 磁盘 | 依赖 + 模型 ≈400MB |
+| 准确率 | 群截图 4/4 块全对（测试图里 `OCR_TEST_MARKER_42` 被原样读出，确认不是幻觉） |
+
+结论：带得动，装了。
+
+**2. OCR 接入（不增加主链路延迟）**
+
+| 改动 | 文件 | 说明 |
+|---|---|---|
+| 新增 OCR 模块 | `services/ocr_rapid.py` | 单例懒加载；线程池 + 串行锁（上一张没完就跳过）+ 8s 超时；置信度<0.5 丢弃；任何失败返回 `[]`（fail-open） |
+| OCR 与视觉并行 | `services/vision_verify.py` | OpenCV 判「有字」才起 OCR 任务，和 qwen 调用同时跑；文字合并 **OCR > VLM**；`rec["ocr_blocks"]` 进 report/缓存 |
+| 视觉 prompt 减负 | `services/vision_verify.py` | 文字行从「逐字照抄 150 字」→「只抄最关键 1 句（≤30 字）」；`VISION_OCR=0` 自动退回旧 prompt |
+| report 标来源 | `services/vision_report.py` | `text_blocks[].source=ocr/vlm`；prompt 行写「（OCR）」或「（识图模型读的，可能不准）」 |
+| 依赖 | `requirements.txt` / `Dockerfile` | `onnxruntime==1.18.1`（1.32 会强拉 numpy>=2，imageutils 要 <2）；rapidocr 本体 `--no-deps` 装，避免它把 opencv-headless 换成带 GUI 的 opencv-python |
+
+**3. 视觉默认改 qwen，第二家变成「可选」**
+
+- 用户拍板：GLM 额度用完，先靠 qwen；但保留可选视觉模型的能力。
+- `services/providers.py`：`vision` 默认 glm→**qwen**；新增 `vision_second`（默认空 = 关闭，
+  不拿 `LLM_PROVIDER` 兜底）；`vision_fallback` 默认 qwen→glm。
+- 新增 `services/vlm.py`：任意 role 的通用视觉调用（OpenAI 兼容）；第二视觉源不再写死 `glm.py`。
+- `VISION_GLM_MODE` → `VISION_SECOND_MODE`（旧名保留兼容）；日志/报告里的「GLM识图」改成实际 provider 名。
+- `.env` 新增：`VISION_OCR=1`、`OCR_RAPID_MAX_SIDE=1024`、`OCR_RAPID_MIN_CONF=0.5`、`OCR_RAPID_TIMEOUT=8`、`OCR_RAPID_THREADS=2`、`VISION_SECOND_MODE=on_miss`。
+- ⚠️ 新增的是 `services/ocr_rapid.py`：`services/ocr.py` 已存在（ocr_lite 旁路工具），没有覆盖它。
+
+**4. 验证**
+
+- `check_tuning` PASS、`audit_coverage --strict` 0 硬伤、`check_runtime_wiring` **62 PASS / 0 FAIL**；
+- 端到端（真图 + 真 qwen）：`text_source=ocr`、4 块、report 出现「图里文字（OCR 原文）」；
+- 启动 0 Traceback；`[OCR] RapidOCR 已加载（threads=2 max_side=1024）`。
+
 ## 2026-11-27（第四十五轮：收发件人 v2 设计定稿 + P0 落地）
 
 **1. 设计先行（用户要求「先落文档，检查没问题再写代码」）**

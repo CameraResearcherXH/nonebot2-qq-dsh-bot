@@ -1,0 +1,22 @@
+# OCR 依赖（P1，2026-11-27）——单独一个文件，**不要合并进 requirements.txt**。
+#
+# 为什么分开：
+#   往 requirements.txt 加一行 → Dockerfile 的 pip 依赖层缓存整体失效 →
+#   pip 重新解析整棵依赖树（实测在 aioboto3 的旧版本上回溯好几分钟）。
+#   单独文件只在 OCR 变化时重建这一层。
+#
+# 安装（两步，顺序不能反）：
+#   pip install -r requirements-ocr.txt
+#   pip install --no-deps rapidocr_onnxruntime==1.4.4
+#
+# 为什么 rapidocr 要 --no-deps：
+#   它声明依赖 opencv-python（带 GUI，容器缺 libGL 会 import 崩），
+#   会覆盖 requirements.txt 里的 opencv-python-headless。
+#
+# 为什么锁 onnxruntime 1.18.1：
+#   1.32 会强制 numpy>=2，而 nonebot-plugin-imageutils 要求 numpy<2。
+
+onnxruntime==1.18.1
+pyclipper>=1.3.0
+Shapely>=2.0.0
+tqdm>=4.60

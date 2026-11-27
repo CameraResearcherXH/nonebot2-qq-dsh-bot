@@ -80,6 +80,17 @@ COPY requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --prefer-binary --retries 5 --timeout 60 -r requirements.txt dashscope
 
+# OCR（P1，2026-11-27）：
+#   ① 依赖单独一个文件（**不要合并进 requirements.txt**：加一行会让上面那层缓存
+#      整体失效、重新解析整棵依赖树，实测在 aioboto3 旧版本上回溯好几分钟）；
+#   ② 本体 --no-deps：rapidocr 声明 opencv-python（带 GUI，容器缺 libGL 会 import 崩），
+#      会覆盖 requirements 里的 opencv-python-headless。
+COPY requirements-ocr.txt .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --prefer-binary --retries 5 --timeout 60 -r requirements-ocr.txt \
+    && pip install --no-deps --prefer-binary --retries 5 --timeout 60 \
+    rapidocr_onnxruntime==1.4.4
+
 # Playwright 的 chromium（gspanel 原神面板出图用）
 #   镜像里 apt 装的 chromium 是给 steam_judger（selenium）用的；
 #   playwright 需要自己协议匹配的内核，这里预装，避免第一次查面板时才去下载（会卡 1~2 分钟）。

@@ -216,8 +216,27 @@ def redact_nicknames(dest: Path) -> list:
     return hits
 
 
+def _version_ips(dest: Path) -> set:
+    """从 requirements*.txt 收集「长得像 IP 的版本号」（如 opencv 4.10.0.84）。
+
+    2026-11-27 踩过：`opencv-python-headless==4.10.0.84` 被当成公网 IP
+    换成了 `==127.0.0.1`，发行版直接装不上。
+    """
+    out = set()
+    for p in dest.rglob("requirements*.txt"):
+        try:
+            t = p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        # requirements 文件里出现的四段数字基本都是版本号（注释里也有
+        # 「实测 4.13.0.92 60.4MB」这种），整份文件全部保留，不当 IP 换。
+        out |= set(re.findall(r"\b\d+\.\d+\.\d+\.\d+\b", t))
+    return out
+
+
 def redact_hosts(dest: Path) -> list:
     hits = []
+    keep_ips = _version_ips(dest)
     for p in dest.rglob("*"):
         if not p.is_file() or p.suffix.lower() in BINARY_EXT:
             continue
@@ -233,7 +252,7 @@ def redact_hosts(dest: Path) -> list:
         # 公网 IPv4 一律换掉（源码/文档/生成的 node.env.example 都可能带出来）
         for _m in list(_IPV4.finditer(new)):
             _ip = _m.group(0)
-            if _is_private_ip(_ip):
+            if _is_private_ip(_ip) or _ip in keep_ips:
                 continue
             hits.append((p.relative_to(dest).as_posix(), "公网 IP", "[REDACTED]"))
             new = new.replace(_ip, "127.0.0.1")
