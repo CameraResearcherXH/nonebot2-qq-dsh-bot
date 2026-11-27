@@ -50,6 +50,18 @@ plugins_backup/
 *.working
 *.old
 *.orig
+backup_*
+*.tgz
+
+# ---- 模型权重（2026-11-27）----
+# loras/ 是 SDXL 画图 LoRA（712MB），只有算力机的 node.py 用；
+# bot 容器不读它，打进镜像会让 export 层直接 "no space left on device"。
+loras/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
 
 # ---- AI 助手的本地数据 ----
 .codebuddy/

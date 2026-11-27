@@ -6,9 +6,12 @@ pyquery>=2.1.0
 typing_extensions
 aiofiles
 dashscope
-boto3
-botocore
-aioboto3
+# 2026-11-27：pin 死 + 删掉 aioboto3 —— 不 pin 时 pip 要在 boto3/botocore 上千个
+# 版本上回溯（aioboto3 会 pin aiobotocore，冲突后把 boto3 所有版本试一遍，
+# 实测一次构建 20 分钟还没结束）。项目代码没有 import boto3/aioboto3，
+# 这两个只是第三方插件的可选依赖（selftest 里缺失会自动 stub）。
+boto3==1.43.117
+botocore==1.43.117
 python-multipart
 nonebot_plugin_apscheduler
 aiohttp>=3.9.0
