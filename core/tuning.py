@@ -113,8 +113,9 @@ DEFAULTS = {
     # ---------- 回复 / 限流 / 主动插话 ----------
     'BURST_MSG_COUNT': 4,
     'BURST_WINDOW_SEC': 30.0,
-    # 戳一戳屏蔽：同一个人 POKE_WINDOW_HOURS 内戳超过 POKE_MAX_PER_WINDOW 次就不回
-    'POKE_MAX_PER_WINDOW': 3,
+    # 戳一戳屏蔽：同一个人 POKE_WINDOW_HOURS 内最多回 POKE_MAX_PER_WINDOW 次，
+    # 第 N+1 次起不回也不戳回（2026-11-27 用户：3 次还是太多，2 小时内回 1 次刚好）
+    'POKE_MAX_PER_WINDOW': 1,
     'POKE_WINDOW_HOURS': 2.0,
     # DeepSeek Harness 桥：单次最长秒数 / 回 QQ 的最大字数
     'HARNESS_TIMEOUT': 300.0,
