@@ -575,8 +575,10 @@ async def build(
     logger.info(
         f"[PIPE] {session_key} {cost:.1f}s｜拉了 {','.join(k for k in STAGE_ORDER if k in stages) or '无'}"
         f"｜{len(text_out)} 字｜{stages}")
+    # intent：L0 自检要用 kind（vent 禁方案词）——2026-11-27 从「只渲染进 prompt」
+    # 改成也返回结构化结果，chat 就不用再调一次 atmosphere。
     return {"text": text_out, "stages": stages, "summary": summary,
-            "replied": replied, "cost": cost}
+            "replied": replied, "cost": cost, "intent": dict(_intent or {})}
 
 
 def dump_text() -> str:

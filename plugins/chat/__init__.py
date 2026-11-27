@@ -280,6 +280,8 @@ speaker_recent = defaultdict(lambda: defaultdict(lambda: deque(maxlen=6)))
 # 上一句/上一批说话人（短句兜底）
 last_text_map = {}
 last_text_at = {}
+# 最近 3 条**她自己实际发出去的话**（L0 复读检测用，2026-11-27）
+recent_self_texts = defaultdict(lambda: deque(maxlen=3))
 
 # 她"主动说过话"的时间戳（群聊刹车用）
 bot_reply_times = defaultdict(list)
@@ -5153,6 +5155,7 @@ async def _session_worker(bot: Bot, session_key: str):
             #        要回的那句再按顺序拉 心情/档案/总结/记忆/图书馆/是否回过」。
             # 这一段就是那个「按顺序拉」，产出交给 call_llm 当最高 recency 的数据块。
             _staged = ""
+            _intent_now: dict = {}
             try:
                 from services import reply_pipeline
                 _pl = await reply_pipeline.build(
@@ -5167,6 +5170,9 @@ async def _session_worker(bot: Bot, session_key: str):
                     moon_target_qq=_moon_target_qq,
                 )
                 _staged = str((_pl or {}).get("text") or "")
+                # L0 自检要用 kind（vent 禁方案词）：流水线已经调过 atmosphere，
+                # 直接复用它的结构化结果，别再花一次调用。
+                _intent_now = dict((_pl or {}).get("intent") or {})
                 # 只有标题、一个块都没拿到 → 退回静态拼装，别让空流水线把
                 # 记忆/图书馆/心情全跳过（否则她这轮什么参考都没有）。
                 if _staged.strip() == reply_pipeline.PIPE_HEADER:
@@ -5637,6 +5643,71 @@ async def _session_worker(bot: Bot, session_key: str):
             #    真机踩过：图片回复「你满意了？我还没说话呢」，
             #    22 秒后插话又回「你满意了？我满意了」→ 群友「这肥鱼魔了」。
             _new_text = "".join(i["value"] for i in items if i["kind"] == "text").strip()
+
+            # 👇 2026-11-27 L0 规则自检（docs/addressing-design.md §7.7.1）
+            #    只做机械动作：复读不发 / vent 删方案句 / 其余只打标记。
+            #    放在 dedup 之前：L0 先拦「跨 10 分钟复读」，dedup 继续拦「60s 内近似」。
+            try:
+                from services import selfcheck as _sc
+                if _sc.ENABLED and _new_text:
+                    _now0 = time.time()
+                    _recent_self = [
+                        _t for _ts, _t in (recent_self_texts.get(session_key) or ())
+                        if _now0 - _ts < _sc.WINDOW_SEC
+                    ]
+                    # ⚠️ 这里必须用「最后一条原话」，不能用 `text`：
+                    #    这个作用域里的 `text` 是 build_prompt 拼好的整段
+                    #    （含「这一段群聊共 N 条…」系统提示），拿它判
+                    #    「对方有没有数字/问句」会天天误报（真机 23:19 抓到）。
+                    _ask0 = ""
+                    try:
+                        if _seg_records:
+                            _ask0 = str((_seg_records[-1] or {}).get("text") or "").strip()
+                    except Exception:
+                        _ask0 = ""
+                    _l0 = _sc.check(
+                        _new_text,
+                        kind=str((_intent_now or {}).get("kind") or ""),
+                        ask_text=_ask0,
+                        recent=_recent_self,
+                        is_group=isinstance(ev, GroupMessageEvent),
+                    )
+                    if _l0.get("flags"):
+                        logger.info(
+                            f"[SELFCHECK] {session_key} "
+                            f"flags={','.join(_l0['flags'])}"
+                            + (f"｜{_l0.get('reason')}" if _l0.get("reason") else ""))
+                    _sc.note(session_key, _new_text, _l0,
+                             ask_text=_ask0,
+                             kind=str((_intent_now or {}).get("kind") or ""))
+                    if _l0.get("drop"):
+                        logger.info(f"[SELFCHECK] 复读 → 这条不发：{_new_text[:40]}")
+                        continue
+                    _fixed = str(_l0.get("text") or "").strip()
+                    if _fixed and _fixed != _new_text:
+                        # vent 删掉方案句 → 回写到第一个文字泡（不动表情/语音）
+                        logger.info(
+                            f"[SELFCHECK] vent 删方案句：{_new_text[:40]}"
+                            f" → {_fixed[:40]}")
+                        _done = False
+                        _new_items = []
+                        for _i in items:
+                            if _i.get("kind") == "text":
+                                _new_items.append(
+                                    {**_i, "value": (_fixed if not _done else "")})
+                                _done = True
+                            else:
+                                _new_items.append(_i)
+                        items = [
+                            x for x in _new_items
+                            if not (x.get("kind") == "text"
+                                    and not str(x.get("value") or "").strip())
+                        ]
+                        _new_text = _fixed
+            except Exception as _sce:
+                logger.debug(f"[SELFCHECK] 自检异常（忽略）: "
+                             f"{type(_sce).__name__}: {_sce}")
+
             _prev_text = last_text_map.get(session_key) or ""
             _prev_at = float(last_text_at.get(session_key) or 0)
             if (_new_text and _prev_text
@@ -6075,8 +6146,15 @@ async def _session_worker(bot: Bot, session_key: str):
                 bot_reply_times[gid] = bot_reply_times[gid][-30:]
 
             # 更新上一句（短句兜底）
-            last_text_map[session_key] = text
-            last_text_at[session_key] = time.time()
+            # ⚠️ 2026-11-27 修 bug：以前存的是**对方原话** `text`，
+            #    而 dedup 拿它跟「她的新回复」比 → 几乎永远不命中。
+            #    改成存她实际发出去的 `said`；同时写进 recent_self_texts 给 L0 复读用。
+            _said_join = "；".join(
+                str(x) for x in said if str(x or "").strip()).strip()
+            if _said_join:
+                last_text_map[session_key] = _said_join
+                last_text_at[session_key] = time.time()
+                recent_self_texts[session_key].append((time.time(), _said_join))
 
             # 2026-11-20 审计 G4：以前只更新 session_last_reply，
             # 循环里的局部 last 不动 → 第二条起 wait 恒为负，REPLY_INTERVAL 失效。

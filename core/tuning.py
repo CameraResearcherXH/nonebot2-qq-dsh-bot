@@ -117,6 +117,17 @@ DEFAULTS = {
     # 第 N+1 次起不回也不戳回（2026-11-27 用户：3 次还是太多，2 小时内回 1 次刚好）
     'POKE_MAX_PER_WINDOW': 1,
     'POKE_WINDOW_HOURS': 2.0,
+    # ---------- L0 规则自检（2026-11-27，docs/addressing-design.md §7.7.1）----------
+    # 1 = 发送前跑纯规则自检（复读拦截 / 长度标记 / 未答标记 / vent 禁方案词）
+    'REPLY_SELFCHECK': 1,
+    # 复读对比「最近几条自己消息」
+    'SELFCHECK_RECENT_N': 3,
+    # 只看这个窗口内的自己消息（秒）
+    'SELFCHECK_WINDOW_SEC': 600.0,
+    # 3-gram Jaccard ≥ 这个值判复读
+    'SELFCHECK_SIM': 0.8,
+    # 群聊文字泡超过多少汉字只标记（不截断，上游走合并转发）
+    'SELFCHECK_LONG_HANZI': 40,
     # DeepSeek Harness 桥：单次最长秒数 / 回 QQ 的最大字数
     'HARNESS_TIMEOUT': 300.0,
     'HARNESS_MAX_OUTPUT': 3000,
@@ -638,6 +649,11 @@ DOCS = {
     'BURST_WINDOW_SEC': '高刷检测窗口（秒）',
     'POKE_MAX_PER_WINDOW': '戳一戳屏蔽：窗口内最多回几次（超过就不回）',
     'POKE_WINDOW_HOURS': '戳一戳屏蔽的统计窗口（小时）',
+    'REPLY_SELFCHECK': 'L0 规则自检（1=发送前跑复读/长度/未答/vent 禁方案词；0=关）',
+    'SELFCHECK_RECENT_N': '复读对比最近几条自己消息',
+    'SELFCHECK_WINDOW_SEC': '复读只看这个窗口内的自己消息（秒）',
+    'SELFCHECK_SIM': '3-gram Jaccard ≥ 这个值判复读',
+    'SELFCHECK_LONG_HANZI': '群聊文字泡超过多少汉字只标记（不截断）',
     'HARNESS_TIMEOUT': 'Harness 桥单次调用最长秒数',
     'HARNESS_MAX_OUTPUT': 'Harness 桥回给 QQ 的最大字数',
     'CHAT_HISTORY_TURNS': '对话历史轮数',
@@ -950,6 +966,11 @@ FILES = {
     'BURST_WINDOW_SEC': 'plugins/chat/__init__.py',
     'POKE_MAX_PER_WINDOW': 'services/poke_guard.py',
     'POKE_WINDOW_HOURS': 'services/poke_guard.py',
+    'REPLY_SELFCHECK': 'services/selfcheck.py',
+    'SELFCHECK_RECENT_N': 'services/selfcheck.py',
+    'SELFCHECK_WINDOW_SEC': 'services/selfcheck.py',
+    'SELFCHECK_SIM': 'services/selfcheck.py',
+    'SELFCHECK_LONG_HANZI': 'services/selfcheck.py',
     'HARNESS_TIMEOUT': 'services/harness.py',
     'HARNESS_MAX_OUTPUT': 'services/harness.py',
     'CHAT_HISTORY_TURNS': 'services/llm.py',

@@ -292,6 +292,29 @@ def main() -> int:
           _al.clean_outgoing("<voice>你听我说</voice>") == "你听我说",
           repr(_al.clean_outgoing("<voice>你听我说</voice>")))
 
+    # ---------- ⑫-b L0 规则自检（2026-11-27，§7.7.1） ----------
+    from services import selfcheck as _sc
+    _old = "十皇是什么机制我这边真没查到，纳什男爵这版本也没对上线"
+    check("L0：跨窗口整条复读 → 不发",
+          _sc.check(_old, recent=[_old]).get("drop") is True, "")
+    check("L0：正常新回复不误杀",
+          _sc.check("这版本我确实没跟上，你截个技能说明给我",
+                    recent=[_old]).get("drop") is False, "")
+    _v = _sc.check("别急，你可以试试先冷静一下，然后再跟他说", kind="vent")
+    check("L0：vent 删掉方案句、保留共情",
+          "vent_plan" in _v.get("flags", [])
+          and "你可以" not in str(_v.get("text"))
+          and str(_v.get("text")).startswith("别急"), str(_v))
+    check("L0：纯共情回复不动",
+          _sc.check("抱抱，难受就先别想了", kind="vent").get("flags") == [], "")
+    check("L0：问句只回语气词 → 标记 unanswered",
+          "unanswered" in _sc.check("嗯", ask_text="男爵怎么打？").get("flags", []), "")
+    check("L0：对方有数字而回复没有 → 标记 missing_ref",
+          "missing_ref" in _sc.check("不知道", ask_text="纳什男爵 3 星怎么打").get("flags", []), "")
+    check("L0：群聊超 40 汉字 → 只标记 long（不截断）",
+          "long" in _sc.check("字" * 45, is_group=True).get("flags", [])
+          and _sc.check("字" * 45, is_group=True).get("text") == "字" * 45, "")
+
     # ---------- ⑬ ImageReport 单一事实源 + 意图类型（2026-11-27 P0） ----------
     from services import vision_report as _vr
     _rec = {"scene": "一个粉发少女在喝茶", "text": "禁止转载", "kind": "图片",

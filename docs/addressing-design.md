@@ -423,11 +423,11 @@ OCR 关闭（`VISION_OCR=0`）时自动退回「逐字照抄」，能力不掉�
 
 ## 7.7 自检：L0 机械修正 + 异步 LLM 自检
 
-> **状态（2026-11-27）：设计已定，代码未落地。**
-> `REPLY_SELFCHECK` / `REPLY_SELFCHECK_ASYNC` 还没进 `core/tuning.py`，
-> `plugins/chat` 生成后也没有 selfcheck 钩子。当前只有出站清洗
-> （`clean_outgoing()` 剥 `<sticker:>` / `<reply:>` / `|||`，覆盖本节 L0 的第 1 条）。
-> 本节其余检查（复读 / 长度 / 未答标记）都还是 TODO。
+> **状态（2026-11-27 23:20）：L0 已落地；异步 L1 仍未做。**
+> `services/selfcheck.py` + `plugins/chat` 的 send 前钩子已接上（`REPLY_SELFCHECK=1`）：
+> 复读拦截（跨 10 分钟、最近 3 条、3-gram Jaccard ≥0.8）、长度/未答/数字缺失只打标记、
+> vent 机械删方案句（删完不足 4 汉字则保留原文）。
+> 异步 LLM 自检（7.7.2）仍只有设计，`REPLY_SELFCHECK_ASYNC` 还没进 tuning。
 
 锐评 #6：`atmosphere` 一次调用实测 1.5s 量级，**300ms 的同步 LLM 自检不现实**。
 所以拆成两条：
@@ -527,7 +527,7 @@ OCR 关闭（`VISION_OCR=0`）时自动退回「逐字照抄」，能力不掉�
 |---|---|---|---|
 | **P0** | ✅ ImageReport（质量数值化 + 第二视觉源按需 + 标签复用 + 缓存扩字段）+ `kind`；**L0 机械自检当时没落**（见 §7.7 状态） | `VISION_REPORT=1`、`VISION_SECOND_MODE=on_miss`、`ATMO_KIND=1` | 低（等价重构 + 纯规则） |
 | **P1-a** | ✅ RapidOCR（2026-11-27，见 §7.13）+ 视觉默认 qwen + 第二视觉源可配 | `VISION_OCR=1` | 低（已实测 2 vCPU 可带动） |
-| **P1-c** | **待做：L0 机械自检**（复读 / 长度 / 未答标记；`clean_outgoing` 已覆盖协议残留） | `REPLY_SELFCHECK=1` | 低（纯规则，<10ms） |
+| **P1-c** | ✅ L0 机械自检（2026-11-27）：复读拦截 / 长度·未答·数字缺失标记 / vent 删方案句；`clean_outgoing` 覆盖协议残留 | `REPLY_SELFCHECK=1` | 低（纯规则，<10ms） |
 | **P1** | ✅ RapidOCR 已接入（2026-11-27，见 §7.13）：OCR 与 VL 并行、视觉文字行改「关键 1 句」；第二视觉源改可配 provider（默认 qwen，GLM 可选） | `VISION_OCR=1`、`VISION_SECOND_MODE=on_miss`（不配 provider 即关闭） | 低（已实测 2 vCPU 可带动） |
 | **P1-b** | 待做：话题漂移（`ADDR_TOPIC_SHIFT`，需先用 trace 标定阈值） | `ADDR_TOPIC_SHIFT=1` | 中（阈值误判） |
 | **P2** | L2 观望 + 异步自检回填 | `ADDR_LEVEL_ACTION=1`、`REPLY_SELFCHECK_ASYNC=1` | 中（影响回复率，盯指标） |

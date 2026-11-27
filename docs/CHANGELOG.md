@@ -1,5 +1,48 @@
 # 更新日志
 
+## 2026-11-27（第四十七轮：L0 规则自检落地 + 戳一戳 1 次）
+
+**1. 戳一戳限流：2 小时 3 次 → 1 次（用户拍板）**
+
+- `POKE_MAX_PER_WINDOW` 默认 3→1：窗口内只回 1 次，第 2 次起不回也不戳回；
+- 实测 `note()` 第 1 次 `(True,1)`、第 2 次 `(False,2)`。
+
+**2. L0 规则自检（docs/addressing-design.md §7.7.1，之前只写在文档里）**
+
+| 检查 | 判据 | 动作 |
+|---|---|---|
+| 整条复读 | 与最近 3 条自己消息（10 分钟内）3-gram Jaccard ≥0.8 | **这条不发** |
+| 长度异常 | 群聊文字泡 >40 汉字 | 只标记（上游已合并转发，不截断） |
+| 问句未答 | 对方有「？」且回复只有「嗯/哈哈/草/？」 | 只标记 `unanswered` |
+| 数字/专名缺失 | 对方有数字/英文专名，回复一个都没有 | 只标记 `missing_ref` |
+| vent 禁方案词 | `kind=vent` 且含「建议你/你可以/首先/其次/不妨/你应该/试试看」 | **机械删掉含禁词的句子**；删完不足 4 汉字则保留原文（fail-open） |
+
+- 新增 `services/selfcheck.py`（纯规则，<10ms，任何异常返回原回复）；
+- `plugins/chat`：send 前钩子（dedup 之前）；`reply_pipeline.build` 返回值新增 `intent`，
+  复用 atmosphere 已算好的 `kind`，不额外调模型；
+- 新增 tuning：`REPLY_SELFCHECK=1`、`SELFCHECK_RECENT_N=3`、`SELFCHECK_WINDOW_SEC=600`、
+  `SELFCHECK_SIM=0.8`、`SELFCHECK_LONG_HANZI=40`；
+- badcase 落 `data/selfcheck.jsonl`（离线看命中率）。
+
+**3. 顺手修的真 bug：dedup 一直在跟「对方原话」比**
+
+`last_text_map[session_key] = text` 存的是**对方原话**，而 dedup 拿它跟「她的新回复」比 →
+几乎永远不命中。改成存她实际发出去的 `said`，并同步写 `recent_self_texts` 给 L0 复读用。
+
+**4. 外部智能体 4 条复核（2 真 / 1 半 / 1 错）**
+
+- 真：kind 只是提示不是路由（L0 先补硬约束，kind 分叉暂不做）；
+- 真：自检层没接上（本轮已落 L0；文档 §7.7 状态同步更正）；
+- 半：VLM 仍写「关键 1 句」是**故意兜底**，OCR 有结果时它不进 report，不会冲突；
+- 错：`ATMO_TIMEOUT` 是 5s 且**并行**跑（`create_task`），不阻塞主链路。
+
+**5. 验证**
+
+- `check_runtime_wiring` **69 PASS / 0 FAIL**（新增 7 条 L0 断言）；
+- `check_tuning` PASS、`audit_coverage --strict` 0 硬伤；
+- 真机：`[SELFCHECK] flags=missing_ref` 落盘；修复「ask 误用整段 prompt」后新记录 `flags=[]`；
+- napcat 发送正常，0 Traceback。
+
 ## 2026-11-27（第四十六轮：P1 RapidOCR 落地 + 视觉默认 qwen）
 
 **1. 用户问「轻量服务器带得动 OCR 吗」→ 先实测再决定**
