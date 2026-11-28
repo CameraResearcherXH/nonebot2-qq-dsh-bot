@@ -170,6 +170,8 @@ BURST_MSG_COUNT = tuning.i("BURST_MSG_COUNT")
 # 同一会话 REPLY_DEDUP_SEC 秒内，新回复和上一句相似度 ≥ REPLY_DEDUP_RATIO 就不发。
 REPLY_DEDUP_SEC = tuning.f("REPLY_DEDUP_SEC")
 REPLY_DEDUP_RATIO = tuning.f("REPLY_DEDUP_RATIO")
+# 2026-11-28：本轮已用 send 工具发过 → 主流程不再发正文（防一条消息回两次）
+TOOL_SEND_SUPPRESS = bool(tuning.i("TOOL_SEND_SUPPRESS"))
 
 # ================= 被讨厌就闭嘴 =================
 # 真机踩过：群友连着说「这逼鱼真烦人」「能不能关了先」，
@@ -240,6 +242,11 @@ session_workers = {}
 # 本轮是否已经通过 `send` 工具发过东西（2026-11-25）：
 #   用来判断「她潜水」到底是「不想说」还是「已经用工具回过了」。
 _LAST_TOOL_SEND = defaultdict(float)
+# 2026-11-28 用户：「艾特和引用后不仅会指向回复一次，我们的硬逻辑又回复一次」。
+#   真机 08:57：@她 → 模型调 send(pending=1) 发了运势卡片 → 生成结束后主流程
+#   又把 items 发了两句 → 一条消息回了两次。
+#   这里记「本轮（call_llm 之前清零）工具是否已经发过」，主流程据此不再发正文。
+_TOOL_SENT_TURN = defaultdict(float)
 # 被 @ 了却潜水：只记一笔，方便 `docker logs | grep AT-MISS` 复盘。
 _AT_SILENT = defaultdict(int)
 recent_group_msgs = defaultdict(lambda: deque(maxlen=MAX_GROUP_RECENT))
@@ -5187,6 +5194,8 @@ async def _session_worker(bot: Bot, session_key: str):
             # 私聊先挂「正在输入」，等模型回来再取消（失败静默）
             await _typing(bot, ev, True)
             _t_llm = time.monotonic()
+            # 2026-11-28：本轮开始前清零「工具已发」标记（call_llm 内部会调 send）
+            _TOOL_SENT_TURN[session_key] = 0.0
             try:
                 reply, is_query_image = await call_llm(
                     session_key, text_for_llm, group_context=ctx,
@@ -5610,6 +5619,27 @@ async def _session_worker(bot: Bot, session_key: str):
 
             items = parsed["items"]
             if not items:
+                continue
+
+            # 👇 2026-11-28 用户：「艾特和引用后不仅会指向回复一次，我们的硬逻辑
+            #    又回复一次」。真机 08:57：@她「鱼宝今日运势」→ 模型调
+            #    send(pending=1) 发了运势卡片 → 生成结束后主流程又把正文发了两句，
+            #    同一条消息看到三次发送。这里：本轮工具已经发过 → 正文不再重复发，
+            #    只记进上下文（避免她「忘了自己说过」）。
+            if TOOL_SEND_SUPPRESS and _TOOL_SENT_TURN.get(session_key):
+                _dup_text = "".join(
+                    i["value"] for i in items if i["kind"] == "text").strip()
+                logger.info(
+                    f"[DUP] {session_key} 本轮已用 send 工具发过 → "
+                    f"正文不再重复发（{_dup_text[:40]}）")
+                try:
+                    _dgid = str(getattr(ev, "group_id", "") or "")
+                    if _dup_text and _dgid:
+                        _append_self_line(_dgid, _dup_text, time.time())
+                except Exception:
+                    pass
+                last = time.monotonic()
+                session_last_reply[session_key] = last
                 continue
 
             # 👇 [[LONG]] 长文：私聊才需要标记（合并成一条走转发卡片）。
@@ -8680,6 +8710,8 @@ async def _tool_send(args: dict) -> str:
         _sk = (f"group_{ev.group_id}" if isinstance(ev, GroupMessageEvent)
                else f"private_{ev.user_id}")
         _LAST_TOOL_SEND[_sk] = time.time()
+        # 本轮已经用工具发过 → 主流程不再重复发正文（见 _TOOL_SENT_TURN 注释）
+        _TOOL_SENT_TURN[_sk] = time.time()
     except Exception:
         pass
     return "发出去了" + _st_note

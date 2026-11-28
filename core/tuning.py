@@ -128,6 +128,8 @@ DEFAULTS = {
     'SELFCHECK_SIM': 0.8,
     # 群聊文字泡超过多少汉字只标记（不截断，上游走合并转发）
     'SELFCHECK_LONG_HANZI': 40,
+    # 本轮已用 send 工具发过消息 → 主流程不再发正文（防「一条消息回两次」）
+    'TOOL_SEND_SUPPRESS': 1,
     # DeepSeek Harness 桥：单次最长秒数 / 回 QQ 的最大字数
     'HARNESS_TIMEOUT': 300.0,
     'HARNESS_MAX_OUTPUT': 3000,
@@ -654,6 +656,7 @@ DOCS = {
     'SELFCHECK_WINDOW_SEC': '复读只看这个窗口内的自己消息（秒）',
     'SELFCHECK_SIM': '3-gram Jaccard ≥ 这个值判复读',
     'SELFCHECK_LONG_HANZI': '群聊文字泡超过多少汉字只标记（不截断）',
+    'TOOL_SEND_SUPPRESS': '本轮已用 send 工具发过 → 主流程不再发正文（1=开，0=老行为）',
     'HARNESS_TIMEOUT': 'Harness 桥单次调用最长秒数',
     'HARNESS_MAX_OUTPUT': 'Harness 桥回给 QQ 的最大字数',
     'CHAT_HISTORY_TURNS': '对话历史轮数',
@@ -971,6 +974,7 @@ FILES = {
     'SELFCHECK_WINDOW_SEC': 'services/selfcheck.py',
     'SELFCHECK_SIM': 'services/selfcheck.py',
     'SELFCHECK_LONG_HANZI': 'services/selfcheck.py',
+    'TOOL_SEND_SUPPRESS': 'plugins/chat/__init__.py',
     'HARNESS_TIMEOUT': 'services/harness.py',
     'HARNESS_MAX_OUTPUT': 'services/harness.py',
     'CHAT_HISTORY_TURNS': 'services/llm.py',
