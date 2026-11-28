@@ -1,5 +1,44 @@
 # 更新日志
 
+## 2026-11-28（第五十三轮：构建源全部参数化 —— 墙内也能 build）
+
+**用户反馈**：墙内机器 `docker compose up -d --build` 连撞三堵墙：
+
+1. `failed to resolve source metadata for docker.io/docker/dockerfile:1`
+   —— Dockerfile 第一行 `# syntax=docker/dockerfile:1` 让 BuildKit 先去 Docker Hub
+   拉「Dockerfile 前端镜像」，而墙内连 `registry-1.docker.io` 都是 dial timeout；
+2. `FROM python:3.11-slim` 同样来自 Docker Hub，拉不到；
+3. 好不容易过了上面两步，`apt-get install chromium` 从 `deb.debian.org` 拉了
+   **5705 秒（95 分钟）还没完** —— chromium + chromium-driver 合计 ~400MB。
+
+**改动**
+
+| 位置 | 改动 |
+|---|---|
+| Dockerfile 第 1 行 | **删掉** `# syntax=docker/dockerfile:1`（`RUN --mount=type=cache` 由引擎内置前端支持，Docker 18.09+） |
+| Dockerfile | 新增 `ARG PYTHON_IMAGE` + `FROM ${PYTHON_IMAGE}` |
+| Dockerfile | 新增 `ARG APT_MIRROR`，在 apt 层把 `deb.debian.org` 替换成它 |
+| Dockerfile | 新增 `ARG PIP_INDEX_URL` / `PIP_TRUSTED_HOST`，三处 `pip install` 显式带 `--index-url/--trusted-host` |
+| Dockerfile | 新增 `ARG PLAYWRIGHT_DOWNLOAD_HOST`（空值必须 `unset`，playwright 拿到空串会拼坏 URL） |
+| docker-compose.yml | `bot.build` 从 `build: .` 改成带 5 个 args，全部 `${VAR:-默认值}` |
+| .env.example | 新增「0. 构建源」段 |
+
+**默认值一律保持海外最优**（`pypi.org` / `deb.debian.org`），线上香港机器不用改任何东西；
+墙内 build 在 `.env` 里填：
+
+```ini
+PYTHON_IMAGE=docker.m.daocloud.io/library/python:3.11-slim
+APT_MIRROR=https://mirrors.aliyun.com
+PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+PIP_TRUSTED_HOST=mirrors.aliyun.com
+PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright
+```
+
+**坑（写进注释了）**：`python:3.11-slim` 现在是 Debian **trixie**，用 deb822 格式的
+`/etc/apt/sources.list.d/debian.sources`，只 sed 老的 `/etc/apt/sources.list` 等于没改 ——
+所以替换逻辑同时扫两个文件，且**只替换主机名**（`/debian`、`/debian-security` 路径不变，
+阿里云/清华/中科大 都符合）。
+
 ## 2026-11-28（第五十二轮：NapCat 镜像下架处置 + RAG 分阶段计时）
 
 ### 一、NapCat 镜像已从 Docker Hub 下架

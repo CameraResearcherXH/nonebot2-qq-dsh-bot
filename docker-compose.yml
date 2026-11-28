@@ -12,7 +12,16 @@ x-logging: &default-logging
 services:
   # 你的大肥鱼机器人
   bot:
-    build: .
+    # 构建源全部参数化，默认值 = 海外最优（线上香港机器不用改）；
+    # 墙内 build 时在 .env 里填 APT_MIRROR / PIP_INDEX_URL 等，见 .env.example
+    build:
+      context: .
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.11-slim}
+        APT_MIRROR: ${APT_MIRROR:-}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-pypi.org}
+        PLAYWRIGHT_DOWNLOAD_HOST: ${PLAYWRIGHT_DOWNLOAD_HOST:-}
     container_name: qq-grok-bot
     restart: always
     # ⚠️ host 模式：容器直接用宿主机网络栈。

@@ -1,4 +1,11 @@
-# syntax=docker/dockerfile:1
+# ⚠️ 这里**故意不写** `# syntax=docker/dockerfile:1`：
+#    那行会让 BuildKit 先去 Docker Hub 拉一个「Dockerfile 前端镜像」，
+#    墙内/离线机器连 registry-1.docker.io 都是超时，构建在第一步就死。
+#    本文件只用到 `RUN --mount=type=cache`，引擎内置前端（Docker 18.09+）就支持。
+#
+# 基础镜像也参数化：国内拉不动 python:3.11-slim 时，
+#   .env 里写 PYTHON_IMAGE=docker.m.daocloud.io/library/python:3.11-slim
+ARG PYTHON_IMAGE=python:3.11-slim
 #
 # ⚠️ 3.11 而不是 3.12 —— 这是被依赖链逼出来的，不是随便选的：
 #    · nonebot-plugin-imageutils（petpet 依赖）**所有已发布版本**都锁 Pillow<10，
@@ -10,17 +17,25 @@
 #      源码编译必然失败 → 就是 ResolutionImpossible / build error。
 #    3.11 有完整的 Pillow 9.5 预编译 wheel，imageutils 和 petpet 都是为 Pillow 9 写的。
 #    项目代码全是 3.10+ 语法，3.11 完全兼容。
-FROM python:3.11-slim
+FROM ${PYTHON_IMAGE}
+
+# ---------------------------------------------------------------- 源参数化
+# 三个源都**不写死**，默认值保持「海外最优」，墙内 build 时用 .env / --build-arg 覆盖：
+#   APT_MIRROR                 https://mirrors.aliyun.com
+#   PIP_INDEX_URL              https://mirrors.aliyun.com/pypi/simple/
+#   PIP_TRUSTED_HOST           mirrors.aliyun.com
+#   PLAYWRIGHT_DOWNLOAD_HOST   https://npmmirror.com/mirrors/playwright
+#
+# ⚠️ 为什么默认是 pypi.org 而不是阿里云：
+#    线上服务器在**香港**，走国际线路访问 pypi.org 最快；
+#    反过来访问阿里云/清华要绕回大陆，实测只有 200~900 kB/s（曾误判成「网络慢」）。
+#    墙内机器恰恰相反 —— deb.debian.org 拉 chromium 实测 95 分钟还没完。
+ARG APT_MIRROR=
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG PIP_TRUSTED_HOST=pypi.org
+ARG PLAYWRIGHT_DOWNLOAD_HOST=
 
 # 日志不缓冲（docker logs 能实时看到），不生成 pyc
-#
-# ⚠️ 不设 PIP_INDEX_URL —— 用 pip 默认的官方源 pypi.org。
-#    这台服务器在**香港**，走国际线路，访问 pypi.org 是快的；
-#    反过来访问阿里云/清华这些国内源要绕回大陆，实测只有 200~900 kB/s，
-#    反而成了瓶颈（曾经误判成「网络慢」，其实是源选错了）。
-#    如果哪天服务器迁回国内，再把这两行加回来：
-#       PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
-#       PIP_TRUSTED_HOST=mirrors.aliyun.com \
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     TZ=Asia/Shanghai \
@@ -29,9 +44,13 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# apt 同样保持 Debian 官方源（deb.debian.org）。
-# 以前这里有一段 sed 把源换成 mirrors.aliyun.com —— 那是按「服务器在上海」写的，
-# 香港机器上反而绕路。默认源对香港就是最优，不需要改。
+# apt 源：默认不动（deb.debian.org），给了 APT_MIRROR 才替换。
+# ⚠️ python:3.11-slim 现在是 Debian trixie，用 **deb822** 格式的
+#    /etc/apt/sources.list.d/debian.sources（不是老的 sources.list），
+#    只 sed 老文件等于没改。这里两个都扫。
+#    只替换主机名，路径（/debian、/debian-security）保持不变，
+#    阿里云/清华/中科大 都符合这个规则。
+#    改完会留在镜像层里，后面 playwright 那层的 apt-get update 也会跟着走国内源。
 
 # 系统依赖（只留真正需要的）
 #   tzdata                 时区
@@ -57,7 +76,16 @@ WORKDIR /app
 #   比手动下 Google Chrome + 对应版本 chromedriver 省事，也不用担心版本对不上。
 #   两个包合计约 400MB，是全镜像里最重的一块，能接受再装。
 #   容器里跑浏览器必须 --no-sandbox（插件里已经加了）。
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN set -eux; \
+    if [ -n "${APT_MIRROR}" ]; then \
+        for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do \
+            if [ -f "$f" ]; then \
+                sed -i "s|https\?://deb\.debian\.org|${APT_MIRROR}|g" "$f"; \
+            fi; \
+        done; \
+        grep -rn "URIs\|^deb " /etc/apt/sources.list.d/ /etc/apt/sources.list 2>/dev/null || true; \
+    fi; \
+    apt-get update && apt-get install -y --no-install-recommends \
         tzdata \
         ffmpeg \
         fonts-wqy-microhei \
@@ -78,7 +106,9 @@ COPY requirements.txt .
 # --retries / --timeout：国际线路偶发抖动，放宽后能自己扛过去。
 # 不再 --upgrade pip：基础镜像自带的 pip 已经够新，省一次下载。
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --prefer-binary --retries 5 --timeout 60 -r requirements.txt dashscope
+    pip install --prefer-binary --retries 5 --timeout 60 \
+        --index-url "${PIP_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}" \
+        -r requirements.txt dashscope
 
 # OCR（P1，2026-11-27）：
 #   ① 依赖单独一个文件（**不要合并进 requirements.txt**：加一行会让上面那层缓存
@@ -87,9 +117,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 #      会覆盖 requirements 里的 opencv-python-headless。
 COPY requirements-ocr.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --prefer-binary --retries 5 --timeout 60 -r requirements-ocr.txt \
+    pip install --prefer-binary --retries 5 --timeout 60 \
+        --index-url "${PIP_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}" \
+        -r requirements-ocr.txt \
     && pip install --no-deps --prefer-binary --retries 5 --timeout 60 \
-    rapidocr_onnxruntime==1.4.4
+        --index-url "${PIP_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}" \
+        rapidocr_onnxruntime==1.4.4
 
 # Playwright 的 chromium（gspanel 原神面板出图用）
 #   镜像里 apt 装的 chromium 是给 steam_judger（selenium）用的；
@@ -99,7 +132,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 # ⚠️ 先 apt-get update：上面那层装完 chromium 就把 lists 删了，
 #    而 playwright install-deps 只 apt-get install、不会自己 update。
-RUN apt-get update \
+# ⚠️ 墙内机器要把浏览器下载也指到国内镜像（npmmirror），否则这一步又是几十分钟：
+#      PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright
+#    空值必须 unset —— playwright 拿到空字符串会拼出坏 URL。
+RUN if [ -z "${PLAYWRIGHT_DOWNLOAD_HOST}" ]; then unset PLAYWRIGHT_DOWNLOAD_HOST; fi; \
+    apt-get update \
     && playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
 
