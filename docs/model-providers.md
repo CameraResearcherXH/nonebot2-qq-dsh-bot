@@ -97,19 +97,26 @@ low 是为时间不超时考虑的。」
 
 `REASONING_EFFORT`（默认 `low`）只对**推理型模型**注入，普通 chat 模型不受影响：
 
-| 取值 | OpenAI / DeepSeek 系 | GLM | Qwen |
-|---|---|---|---|
-| `low`（默认） | `reasoning_effort: low` | `thinking: {type: disabled}`（GLM 无 low 档，直接关） | `enable_thinking: false` |
-| `medium` / `high` | 原样透传 | `thinking: {type: enabled}` | `enable_thinking: true` |
-| `off` | 降到最低档 | 关 | 关 |
-| `auto` | 不注入（老行为） | 不注入 | 不注入 |
+| 取值 | OpenAI / DeepSeek 系 | GLM-5.x（强制思考） | GLM-4.x | Qwen3 |
+|---|---|---|---|---|
+| `low`（默认） | `reasoning_effort: low` | `thinking:{type:enabled}` + `reasoning_effort: low` | `thinking:{type:disabled}` | `enable_thinking: false` |
+| `medium` | `medium` | `reasoning_effort: high` | `thinking:{type:enabled}` | `enable_thinking: true` |
+| `high` | `high` | `reasoning_effort: max` | `thinking:{type:enabled}` | `enable_thinking: true` |
+| `off` | 最低档 | `reasoning_effort: low`（关不掉） | 关 | 关 |
+| `auto` | 不注入（老行为） | 不注入 | 不注入 | 不注入 |
+
+> **GLM-5.3-Flash 是强制思考模型**：`thinking.type` 只支持 `enabled`，**不能关闭**；
+> 但它有 `reasoning_effort: low|high|max`（默认 `max`，实测 900 token 要 ~23s）。
+> 所以对 GLM-5.x 不能传 `disabled`（会被忽略/报错），正确做法是
+> `thinking:{type:enabled}` + `reasoning_effort:low`。
+> 参考1 通道（`services/glm.py`）也走同一套，可用 `GLM_REASONING_EFFORT` 单独调。
 
 判定「推理型模型」看模型名是否含 `reasoner / r1 / qwq / o1 / o3 / o4 / thinking / flash / deepseek-v4`
 （当前主模型 `deepseek-flash` 就属于这一类，日志会打
 `[LLM] ☁️ 使用角色扮演模型 deepseek-flash 生成最终回复（思考=low，推理模型已注入）`）。
 
-> 为什么 GLM/Qwen 不传 low：这两家只有「开/关」没有等级，传 `reasoning_effort` 反而可能 400。
-> 对它们来说「不超时」最有效的做法就是直接关掉思考。
+> Qwen2.5 不认 `enable_thinking`（传了会 400），所以只对 `qwen3*` 注入。
+> GLM-4.x 没有档位、但能关，所以直接关；GLM-5.x 关不掉，只能降到 `low`。
 
 ## 7. 每日 token 额度与 `/tokenadd`（2026-11-28）
 

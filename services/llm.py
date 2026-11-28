@@ -44,6 +44,8 @@ REASONING_EFFORT = (os.getenv("REASONING_EFFORT", "low") or "low").strip().lower
 _REASONING_MODEL_HINTS = (
     "reasoner", "-r1", "r1-", "qwq", "o1", "o3", "o4",
     "thinking", "flash", "deepseek-v4",
+    # Qwen3 默认开思考（enable_thinking），也要按档位关/开
+    "qwen3",
 )
 
 
@@ -53,21 +55,41 @@ def _is_reasoning_model(model: str) -> bool:
 
 
 def _reasoning_payload() -> dict:
-    """给推理型模型注入「思考等级」；不认识的模型一律不传（避免 400）。"""
+    """给推理型模型注入「思考等级」；不认识的模型一律不传（避免 400）。
+
+    各家参数不一样（2026-11-28 实测 + 官方文档）：
+      · GLM-5.x（5.2 / 5.3）：**强制思考，thinking.type 只能 enabled，不能关**；
+        但支持 `reasoning_effort: low|high|max`（默认 max → 最慢）。
+        所以 low 档 = `thinking:{type:enabled}` + `reasoning_effort:low`。
+      · GLM-4.x：思考可开关、没有档位 → `thinking:{type:disabled}`。
+      · Qwen3：`enable_thinking: bool`（qwen2.5 不认识，传了会 400）。
+      · OpenAI / DeepSeek 系：`reasoning_effort: low|medium|high`。
+    """
     if REASONING_EFFORT in ("", "auto", "default"):
         return {}
     if not _is_reasoning_model(ROLEPLAY_MODEL):
         return {}
+    m = str(ROLEPLAY_MODEL or "").lower()
     try:
         from . import providers
         name = str(providers.resolve("roleplay").get("provider") or "").lower()
     except Exception:
         name = ""
+
     if name == "glm":
-        # GLM 只有开关，没有 low/medium/high → 默认关（省时间）
+        if "glm-5" in m or "5.3" in m or "5.2" in m:
+            # 5.x 关不掉思考 → 用最低档 low（medium→high，high→max）
+            eff = {"low": "low", "off": "low",
+                   "medium": "high", "high": "max"}.get(REASONING_EFFORT, "low")
+            return {"thinking": {"type": "enabled"}, "reasoning_effort": eff}
+        # GLM-4.x：可关就直接关（最快）
         return {"thinking": {"type": "disabled"}}
+
     if name == "qwen":
+        if "qwen3" not in m:
+            return {}          # qwen2.5 不认 enable_thinking
         return {"enable_thinking": REASONING_EFFORT in ("medium", "high")}
+
     if REASONING_EFFORT == "off":
         return {"reasoning_effort": "low"}
     return {"reasoning_effort": REASONING_EFFORT}

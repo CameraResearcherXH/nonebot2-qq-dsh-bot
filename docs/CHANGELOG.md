@@ -1,5 +1,36 @@
 # 更新日志
 
+## 2026-11-28（第五十轮：GLM-5.x 强制思考补丁 —— 用 reasoning_effort 而不是 disabled）
+
+**用户指出**：「GLM-5.3-flash 是强制思考模型，无法关闭，但是也有 low 档位，你看看有没有照顾到。」
+
+**确认**：官方文档 / ModelScope 说明 GLM-5.3-Flash
+`thinking.type` **只支持 enabled，不能关闭**；但支持 `reasoning_effort: low|high|max`
+（默认 `max`，实测 900 token 要 ~23s）。上一轮对 GLM 传 `thinking:{type:disabled}` 是错的。
+
+**修复**
+
+| 模型 | 注入 |
+|---|---|
+| GLM-5.x（5.2 / 5.3） | `thinking:{type:enabled}` + `reasoning_effort: low`（medium→high，high→max，off→low） |
+| GLM-4.x | `thinking:{type:disabled}`（能关就关，最快） |
+| Qwen3 | `enable_thinking: false`（qwen2.5 不认这个参数，不注入） |
+| OpenAI / DeepSeek 系 | `reasoning_effort: low|medium|high` |
+
+- `services/glm.py`（参考1 通道）同步：GLM-5.x 显式传 `reasoning_effort`
+  （`GLM_REASONING_EFFORT`，默认 low），不再吃默认 max 的 23s；
+- 补 `qwen3` 到推理模型识别列表（之前 `qwen3-max` 被判成普通模型，没注入）。
+
+**验证（容器内真 payload）**
+
+```text
+glm-5.3-flash {'thinking': {'type': 'enabled'}, 'reasoning_effort': 'low'}
+glm-4-flash   {'thinking': {'type': 'disabled'}}
+qwen3-max     {'enable_thinking': False}
+deepseek-flash {'reasoning_effort': 'low'}
+auto          {}
+```
+
 ## 2026-11-28（第四十九轮：推理模型默认 low 思考 + 主人 /tokenadd 加额度）
 
 **1. 推理型模型聊天默认 low 思考（防超时）**

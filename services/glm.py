@@ -34,6 +34,10 @@ GLM_TIMEOUT = tuning.f("GLM_TIMEOUT")
 # max_tokens 太小会导致 content 直接为空（实测 20 就是空，30 才出内容）。
 # 参考1 是「说人话」的任务，不需要思考，默认关。
 GLM_THINKING = os.getenv("GLM_THINKING", "false").lower() == "true"
+# 2026-11-28：GLM-5.3-flash **强制思考**（thinking.type 只能 enabled），
+#   默认 reasoning_effort=max，实测 900 token 要 23s。参考1 只是「说人话」，
+#   用 low 档就够；GLM-4 系仍按 GLM_THINKING 开关（它们没有档位）。
+GLM_REASONING_EFFORT = (os.getenv("GLM_REASONING_EFFORT", "low") or "low").strip().lower()
 GLM_MAX_TOKENS = tuning.i("GLM_MAX_TOKENS")
 
 # 模型名降级链：不同账号/套餐上架的模型不一样，写死一个名字会直接 model_not_found。
@@ -102,7 +106,15 @@ async def chat(
             # thinking 会先吃掉一大截 token，给少了 content 会直接是空的
             "max_tokens": max(max_tokens, GLM_MAX_TOKENS) if GLM_THINKING else max_tokens,
         }
-        if GLM_THINKING:
+        _m_low = str(m or "").lower()
+        if "glm-5" in _m_low or "5.3" in _m_low or "5.2" in _m_low:
+            # 5.x 关不掉思考 → 显式给最低档，别让它默认 max（23s）
+            payload["thinking"] = {"type": "enabled"}
+            payload["reasoning_effort"] = {
+                "low": "low", "off": "low",
+                "medium": "high", "high": "max",
+            }.get(GLM_REASONING_EFFORT, "low")
+        elif GLM_THINKING:
             payload["thinking"] = {"type": "enabled"}
         try:
             async with httpx.AsyncClient(timeout=timeout or GLM_TIMEOUT) as c:
