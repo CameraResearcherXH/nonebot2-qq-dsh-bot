@@ -89,8 +89,21 @@ services:
   # ============================================================
 
   # QQ 客户端 (NapCat)
+  #
+  # ⚠️ 2026-11-28：`mlikiowa/napcat-docker` 已从 Docker Hub 下架
+  #   （连同 napcat-framework-docker / napcat-appimage / napcat-node 一起消失，
+  #    NapNeko/NapCat-Docker 仓库也 404 了）。**本机已有镜像仍能正常运行**，
+  #    只是「重新拉取 / 新机器部署」会失败。
+  #
+  #   所以这里做两件事：
+  #     1) 镜像名改成变量，谁有可用的镜像源就在 .env 里写 NAPCAT_IMAGE=...；
+  #     2) pull_policy: missing —— 本地有镜像就不去 pull，`up -d` 不会因为
+  #        拉取失败把已经跑着的容器搞挂。
+  #
+  #   长期方案见 docs/deployment.md「NapCat 镜像下架」一节。
   napcat:
-    image: mlikiowa/napcat-docker:latest
+    image: ${NAPCAT_IMAGE:-mlikiowa/napcat-docker:latest}
+    pull_policy: missing
     container_name: napcat
     restart: always
     network_mode: "host"

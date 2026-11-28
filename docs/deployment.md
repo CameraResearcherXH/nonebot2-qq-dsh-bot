@@ -90,7 +90,8 @@ DEFAULT_PERSONA=我的角色
 
 ```yaml
 napcat:
-  image: mlikiowa/napcat-docker:latest
+  image: ${NAPCAT_IMAGE:-mlikiowa/napcat-docker:latest}
+  pull_policy: missing
   network_mode: "host"
   environment:
     ACCOUNT: "${NAPCAT_ACCOUNT:-}"
@@ -99,6 +100,95 @@ napcat:
     - ./napcat/config:/app/napcat/config
     - ./napcat/qq:/app/.config/QQ
 ```
+
+### ⚠️ NapCat 镜像已下架（2026-11-28）
+
+上游把 `mlikiowa/napcat-docker`（连同 `napcat-framework-docker` / `napcat-appimage` /
+`napcat-node`）从 Docker Hub 删掉了，`NapNeko/NapCat-Docker` 仓库也已 404。
+影响范围很明确：
+
+| 场景 | 结果 |
+|---|---|
+| 本机已经有这个镜像（`docker images \| grep napcat` 有输出） | **照常运行**，不受影响 |
+| `docker compose up -d` 重跑（镜像还在本地） | 正常，`pull_policy: missing` 不会去拉 |
+| 新机器 / `docker rmi` 之后重新部署 | **拉不到镜像**，必须换源或自建 |
+
+**已经跑起来的机器，第一件事是保住镜像**（别 `docker system prune -a`）：
+
+```bash
+# 打成本地 tag，从此不再依赖上游仓库名
+docker tag mlikiowa/napcat-docker:latest napcat-local:v4
+# 然后 .env 里写
+NAPCAT_IMAGE=napcat-local:v4
+```
+
+> `docker save -o napcat.tar mlikiowa/napcat-docker:latest` 再备份一份，换机器时
+> `docker load -i napcat.tar` 即可，彻底不依赖网络。
+
+**新部署的三条路**（按推荐顺序）：
+
+1. **找一个还在缓存该镜像的镜像源**，写进 `.env`。仓库里带了探测脚本（Linux / Windows 各一份）：
+
+   ```bash
+   # Linux / macOS / Git Bash
+   bash scripts/find_napcat_mirror.sh                  # 只探测
+   bash scripts/find_napcat_mirror.sh --write-env      # 探到就写进 .env（自动备份 .bak）
+   bash scripts/find_napcat_mirror.sh --pull           # 拉下来 + 打本地 tag + 导出 tar
+   TAGS="v4.18.3 v4.17.45" bash scripts/find_napcat_mirror.sh   # 指定版本号再探
+   ```
+
+   ```bat
+   rem Windows cmd（.bat 只是入口，真正的探测在 find_napcat_mirror.ps1）
+   scripts\find_napcat_mirror.bat
+   scripts\find_napcat_mirror.bat --write-env
+   scripts\find_napcat_mirror.bat --pull
+   set TAGS=v4.18.3 v4.17.45 & scripts\find_napcat_mirror.bat
+   ```
+
+   **2026-11-28 实测：没有哪个源「处处都能拉」，必须在目标机器上跑脚本确认。**
+   同一天同一个镜像，两个出口给出相反结果：
+
+   | 出口 | `docker.m.daocloud.io` |
+   |---|---|
+   | 开发机（海外出口） | ✅ 200，拿到完整 OCI index（amd64 + arm64 都在） |
+   | 部署机（国内云） | ❌ 403 `DENIED` —— 但同机 `library/alpine` 正常，是**仓库级**限制 |
+
+   其余源在部署机上全部不可用：`docker.1ms.run` 404、`docker.xuanyuan.me` /
+   `docker.1panel.live` 403、`dockerproxy.net` 不可达、`hub.rat.dev` 302。
+
+   所以 `.env.example` 里 `NAPCAT_IMAGE` **留空**，首次部署先跑一次探测脚本
+   （10 秒内出结果，直接把该填的行打给你）：
+
+   ```ini
+   # 脚本探到的结果长这样，复制过去即可：
+   NAPCAT_IMAGE=docker.m.daocloud.io/mlikiowa/napcat-docker:latest
+   # 想钉死不可变版本（tag 被回收也不怕）：
+   # NAPCAT_IMAGE=docker.m.daocloud.io/mlikiowa/napcat-docker@sha256:6c1b1a2736588060f484ea273a190309bdeca32c15d6a9c61325d3499ee091fa
+   ```
+
+   ⚠️ 探测方式有坑，两个都别用：
+   - `docker manifest inspect` —— **没有超时**，源被墙时会卡几分钟（Windows 上就是这么卡住的），
+     而且 CLI 会去连 `auth.docker.io`，这台机器上根本连不上（`curl` 实测 rc=28）；
+   - 裸 `curl -f` —— 这些源先回 `401 + WWW-Authenticate`，会把「有镜像」误判成「没有」。
+
+   脚本走的是完整链路：`401 → 取 token → 再取 manifest`，每个请求 `-m 6/-m 8` 有硬超时；
+   某个源连不上就跳过它剩下的 tag（否则 7 源 × 8 tag × 8s ≈ 8 分钟）。
+   ⚠️ 探到的 `napcat-local:*` 只是本机备用镜像，**不进仓库、不推 registry**。
+
+   **为什么写 `.env` 而不是直接改 `docker-compose.yml`？**
+   compose 里是 `${NAPCAT_IMAGE:-默认值}`，把某个第三方加速站写死进 compose，
+   等于让所有用户都依赖那一个源 —— 上游一删库就又是今天这个局面。`.env` 是每个
+   部署自己的、不进仓库，换源只改一行；脚本的 `--write-env` 就是替你做这件事。
+   （`.bat` 的输出刻意用英文：cmd 的代码页会把 UTF-8 批处理里的中文变成乱码。）
+2. **自建镜像**：拿 NapCat 的 shell/appimage 产物 + QQ NT Linux 包自己写 Dockerfile，
+   推到自己的私有 registry。这一步需要能拿到 NapCat 的发行物，镜像源里
+   `napcat-appimage` 若还有缓存可以 `docker create` 出来 `docker cp` 提取。
+3. **换协议端**：`Lagrange.Core`（`lagrangedev/lagrange.core`）同样说 OneBot v11，
+   反向 WS 配置基本一致，但登录方式（扫码/密码/签名服务）与 NapCat 不同，
+   需要重配 `napcat/config/onebot11_<QQ>.json` 里那份等价配置。
+
+不管走哪条，`./napcat/config`、`./napcat/qq`（登录态）、`.env` 三样先备份 ——
+换协议端时登录态不能复用，得重新扫码。
 
 启动：
 

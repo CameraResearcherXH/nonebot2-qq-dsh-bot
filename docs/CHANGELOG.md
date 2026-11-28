@@ -1,5 +1,161 @@
 # 更新日志
 
+## 2026-11-28（第五十二轮：NapCat 镜像下架处置 + RAG 分阶段计时）
+
+### 一、NapCat 镜像已从 Docker Hub 下架
+
+**用户反馈**：「docker 构建的那个 napcat 版本下架了，用户反馈无法 build napcat 了。」
+
+**确认**：`mlikiowa/napcat-docker` 连同 `napcat-framework-docker` / `napcat-appimage` /
+`napcat-node` 一起从 Docker Hub 消失，`NapNeko/NapCat-Docker` 仓库也已 404
+（`https://github.com/NapNeko/NapCat-Docker` 直接 404）。短名和加速前缀都会拉取失败。
+
+**影响**：本机已有镜像的机器照常运行；新机器 / `docker rmi` 之后重新部署才会失败。
+
+**改动**
+
+- `docker-compose.yml` / `patches/full/docker-compose.yml`：
+  `image: ${NAPCAT_IMAGE:-mlikiowa/napcat-docker:latest}` + `pull_policy: missing`
+  —— 镜像名可覆盖，本地有镜像就不去 pull，`up -d` 不会因为拉取失败把在跑的容器搞挂；
+- `.env.example` 新增 11.4 段：`NAPCAT_ACCOUNT` / `NAPCAT_QUICK_PASSWORD(_MD5)` / `NAPCAT_IMAGE`
+  （前两个之前只存在于 `.env`，示例里一直没写）；
+- `docs/deployment.md` 新增「⚠️ NapCat 镜像已下架」：保命三件事
+  （`docker tag` 成本地 tag、`docker save` 备份、别 `prune -a`）+ 新部署三条路
+  （找还有缓存的镜像源 / 自建镜像 / 换 Lagrange.Core）。
+
+### 二、RAG：80 秒延迟定位到向量通道，加超时 + 熔断
+
+实测 `latency_ms=79678`（80 秒）却看不出卡在哪 → 先加 `meta.timings`
+（`enhance_ms` / `vector_ms` / `keyword_ms` / `rerank_ms`）+ `[HYBRID]` 汇总日志。
+
+**实测结果**（算力机，同一问句跑三次）：
+
+```text
+timings: {'enhance_ms': 0.0, 'vector_ms': 78876.1, 'keyword_ms': 17.7, 'rerank_ms': 0.0}
+timings: {'enhance_ms': 0.0, 'vector_ms': 78056.7, 'keyword_ms': 31.2, 'rerank_ms': 0.0}
+timings: {'enhance_ms': 0.0, 'vector_ms': 80186.2, 'keyword_ms': 24.2, 'rerank_ms': 13229.6}
+```
+
+→ **78~80 秒全在 `vector_store.similarity_search`**，关键词通道只有 10~30ms，
+rerank 13s。中文向量本来就是近随机的（早前已确认 nomic-embed-text 中文很弱），
+为了它等 80 秒毫无意义。
+
+**改动**（`RAG_node/hybrid_retriever_patched.py`）
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `VECTOR_TIMEOUT` | 8 | 向量检索超时（秒），0 = 不限制 |
+| `VECTOR_BREAK_SEC` | 300 | 超时后熔断多久内不再试向量（避免每次问都卡 80 秒、线程堆积） |
+| `RERANK_MAX_CANDIDATES` | 16 | 送进 reranker 的候选上限（26 条 CPU 要 13s） |
+
+- 超时/熔断后 hybrid 只用关键词通道 → 80s 变 ~30ms；
+- `method="vector"` 单独调用时，向量被熔断会**自动降级到关键词通道**，不至于空手；
+- `meta.vector` 暴露 `{ok, degraded, reason, block_s}`，接口里一眼看出向量是不是在熔断中；
+- rerank 分数写回 `metadata.relevance_score`（`return_scores=True`）——
+  之前打出来全是 0 是因为 `rerank_documents()` 只排序、从不写分。
+
+### 三、NapCat：加镜像源探测脚本
+
+`scripts/find_napcat_mirror.sh` + `find_napcat_mirror.ps1` + `find_napcat_mirror.bat`
+（Windows 的 .bat 只是入口，逻辑在 .ps1；输出刻意用英文，避免 cmd 代码页乱码）。
+
+**实测结论（2026-11-28）：没有哪个源「处处都能拉」** —— 同一个镜像在两个出口给出相反结果：
+
+| 源 / 出口 | 开发机（海外） | 部署机（国内云） |
+|---|---|---|
+| `docker.m.daocloud.io` | ✅ 200，完整 OCI index（amd64+arm64） | ❌ 403 `DENIED`（同机 `library/alpine` 正常 → 仓库级限制） |
+| `docker.1ms.run` | 404（全部 tag） | 404 |
+| `docker.xuanyuan.me` / `docker.1panel.live` | 403 | 403 |
+| `dockerproxy.net` | 不可达 | 不可达 |
+| `hub.rat.dev` | 302 跳失效地址 | 302 |
+
+→ 所以 `.env.example` 的 `NAPCAT_IMAGE` **留空**，首次部署先跑一次探测脚本
+（它会打印该填的那一行）；daocloud 只作为候选示例写在注释里，并给出 digest
+钉死写法 `@sha256:6c1b1a27…`（tag 被回收也不怕）。
+
+**探测方式踩了两个坑**（都写进注释了）：
+- `docker manifest inspect` **没有超时**，且 CLI 会连 `auth.docker.io` ——
+  这台机器上那台域名不可达（`curl` 实测 rc=28），于是 Windows 上「卡住不动」；
+- 裸 `curl -f` 会拿到 `401 + WWW-Authenticate`，把「有镜像」误判成「没有」。
+
+正确做法是走 `401 → 取 token → 再取 manifest`，每个请求 `-m 6/-m 8` 硬超时，
+某个源连不上就跳过它剩下的 tag（否则 7 源 × 8 tag × 8s ≈ 8 分钟）。
+
+- `--pull`：拉第一个可用的 → `docker tag ... napcat-local:<tag>` → `docker save` 成离线包
+  （本地备用镜像不进仓库、不推 registry，给用户的仍然是源地址）；
+- `--write-env`：把探到的 `NAPCAT_IMAGE=<源>/mlikiowa/napcat-docker:<版本>` 写进 `.env`
+  （自动备份 `.env.bak`）。
+
+**为什么不写进 `docker-compose.yml`**：compose 里是 `${NAPCAT_IMAGE:-默认值}`，
+把某个第三方加速站写死进 compose 等于让所有用户都依赖那一个源，上游一删库就重演今天的问题。
+`.env` 是每个部署自己的、不进仓库，换源只改一行。
+
+## 2026-11-28（第五十一轮：RAG 关键词通道 —— 中文编码 + 抽词幻觉 + 超时三连修）
+
+**用户贴回实测**：`/health` 正常，但
+
+```text
+GET /search?q=杜甫+月夜&top=3
+→ keywords=["法国","雨果"]，命中 toy_train.txt / ruozhiba.json 里的「法国」
+```
+
+通道是通的，**问句被搞坏了**。三个叠加问题：
+
+| # | 问题 | 后果 |
+|---|---|---|
+| 1 | `http.server` 用 `iso-8859-1` 解请求行，curl 里的裸中文 query 变成 `æ\x9d\x9cç\x94«…` | qwen 拿到乱码就随机编词 → FTS 去搜「法国」 |
+| 2 | `hybrid_retriever` 调 8011 的 `timeout=3`，而 qwen 抽词要几秒 | 超时后静默返回 `[]` → hybrid 退化成纯 vector（**这才是「仍然返回群聊」的主因**） |
+| 3 | rerank 用的是 20 字 `snippet` | 片段太短，reranker 打不出分 |
+
+**修复**
+
+- `scripts/rag_keyword.py`
+  - `_fix_bytes()`：请求行先按 latin-1 还原字节，再试 `utf-8` / `gb18030`
+    （百分号编码的 query 是无损 no-op，不影响容器侧的 `requests`）；
+  - **抽词默认改规则**：按标点切分，2~4 字整词保留、长串退化成二元片段并丢掉
+    以「的了是在吗呢…」开头/结尾的碎片 —— 毫秒级、确定性、不会编实体；
+    qwen 抽词降级为可选（`RAG_KW_LLM=1`），且**只保留原句里出现过的词**；
+  - `/search` 多返回 `q`（回显收到的问句）、`text`（整块原文，给 reranker）、`ms`；
+    新增 `?kw=杜甫,月夜` 直给关键词（排障 / 绕开抽词）；
+  - `/health` 多返回 `docs`（块数），能一眼看出连的是哪个库；
+  - `_deseg()` 还原 `_seg_cn` 插的空格（含中文标点），snippet/text 不再「月 夜 杜 甫」。
+- `RAG_node/hybrid_retriever_patched.py`
+  - `KEYWORD_TIMEOUT`（默认 8s）替代写死的 3s；
+  - `page_content` 改用服务端 `text` 整块原文（`snippet` 只留在 metadata 里）；
+  - 日志打出 `kw=[...] hits=N ms`，通道有没有生效一眼可见。
+
+**验证（本地小语料，裸中文与百分号编码两种请求）**
+
+```text
+{"ok": true, "docs": 2}
+q=杜甫+月夜   → {"q":"杜甫 月夜","keywords":["杜甫","月夜"],"hits":[{"path":"dufu-yueye.json",
+                "snippet":"[月夜] [杜甫] 今夜鄜州月，闺中只独看。…"}],"ms":11.5}
+--data-urlencode q=杜甫 月夜 → 同上（ms 0.8，命中缓存）
+?kw=月夜      → 命中同一条
+```
+
+**算力机复测（2026-11-28 17:10，ver=2026-11-28b）**
+
+```text
+/health → {"ok":true,"ver":"2026-11-28b","docs":26107}
+/search?q=杜甫+月夜 → keywords:["杜甫","月夜"]  hits[0]=唐诗三百首.json#15 (score 13.06)  ms=11.1
+```
+
+→ 编码修复生效；索引里诗词齐全（**不需要重建**）。顺带确认 `keyword.db` 是
+26,107 块（比向量库的 148 万块粗，按 1200 字/块切，诗词 json 约 2.8 块/文件）。
+
+**c 版再修**：`text` 改成「以命中点为中心的 120 token 窗口」而不是整块 1200 字
+—— 实测 `唐诗三百首.json#15` 的命中段在块尾，整块交给 512 token 截断的 reranker
+会被截掉，等于喂噪声。`ver=2026-11-28c`。
+
+**已知待办**：`poet.tang.rank.*.json` 这类「只有诗题目录」的文件会靠密集的
+「月夜 杜甫」抢到 12.9 分，等 rerank 接上后再看是否需要 build 时跳过目录型文件。
+
+**部署**：重传 `scripts/rag_keyword.py` → 重启 `serve`（旧的 8011 进程必须杀掉，
+否则还是旧代码）；重传 `RAG_node/hybrid_retriever_patched.py` 到容器
+`/app/src/core/hybrid_retriever.py` → `docker restart rag-api`。索引无需重建
+（`_seg_cn` 切词方式未变）。
+
 ## 2026-11-28（第五十轮：GLM-5.x 强制思考补丁 —— 用 reasoning_effort 而不是 disabled）
 
 **用户指出**：「GLM-5.3-flash 是强制思考模型，无法关闭，但是也有 low 档位，你看看有没有照顾到。」
