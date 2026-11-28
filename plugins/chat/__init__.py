@@ -3103,6 +3103,38 @@ async def _usage_cmd(event: MessageEvent, arg=CommandArg()):
     await usage_cmd.finish(msg)
 
 
+# 主人加当日额度（2026-11-28 用户）：「每天限制 200 万 token，主人可以
+# `/tokenadd 1000000` 这样增加每日 token 用量。」
+tokenadd_cmd = on_command("tokenadd", aliases={"加额度", "token加"},
+                          priority=1, block=True)
+
+
+@tokenadd_cmd.handle()
+async def _tokenadd_cmd(event: MessageEvent, arg=CommandArg()):
+    if not is_owner(str(event.user_id)):
+        await tokenadd_cmd.finish("这个只有主人能加。")
+    from services import budget_guard
+    raw = str(arg or "").strip().replace(",", "").replace("_", "").replace("，", "")
+    try:
+        n = int(float(raw))
+    except Exception:
+        await tokenadd_cmd.finish(
+            "用法：/tokenadd 1000000（正数加额度，负数减额度；按自然日，跨重启有效）")
+    if n == 0:
+        await tokenadd_cmd.finish("要加多少？例如 /tokenadd 1000000")
+    base = budget_guard.base_limit()
+    if base <= 0:
+        await tokenadd_cmd.finish(
+            "现在没设日预算（LLM_DAILY_BUDGET=0），加额度没意义；"
+            "先在 .env 里给个基础值再 /tokenadd。")
+    budget_guard.add(n)
+    await tokenadd_cmd.finish(
+        f"今日额度已调整：基础 {int(base)}"
+        + (f" + 追加 {int(budget_guard.extra())}" if budget_guard.extra() > 0 else "")
+        + f" = {int(budget_guard.limit())}；已用 {budget_guard.used()}"
+        f"（{budget_guard.ratio() * 100:.0f}%），档位 {budget_guard.state()}")
+
+
 # 调参表（2026-11-20）：所有阈值的当前生效值都在 core/tuning.py
 tuning_cmd = on_command("调参", aliases={"tuning", "参数"}, priority=1, block=True)
 

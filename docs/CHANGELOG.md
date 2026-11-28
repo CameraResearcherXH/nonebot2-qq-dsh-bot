@@ -1,5 +1,52 @@
 # 更新日志
 
+## 2026-11-28（第四十九轮：推理模型默认 low 思考 + 主人 /tokenadd 加额度）
+
+**1. 推理型模型聊天默认 low 思考（防超时）**
+
+用户：「心理活动并非完全的深度思考，用户如果用强制深度思考的模型就会超时，
+建议对这类模型聊天默认 low，用户可以在 `.env` 改等级。」
+
+- 新增 `REASONING_EFFORT`（默认 `low`），只对**推理型模型**注入：
+  - OpenAI / DeepSeek 系 → `reasoning_effort: low|medium|high`；
+  - GLM → `thinking: {type: disabled}`（没有 low 档，直接关）；
+  - Qwen → `enable_thinking: false`；
+  - `auto` = 不注入（老行为）。
+- 判定看模型名：`reasoner / r1 / qwq / o1 / o3 / o4 / thinking / flash / deepseek-v4`。
+- 日志：`[LLM] ☁️ 使用角色扮演模型 deepseek-flash 生成最终回复（思考=low，推理模型已注入）`。
+
+**实测**（容器内真调用）：
+
+```text
+MODEL deepseek-flash EFFORT low
+PAYLOAD {'reasoning_effort': 'low'}
+[LLM] ☁️ 使用角色扮演模型 deepseek-flash 生成最终回复（思考=low，推理模型已注入）
+REPLY 你好呀～今天怎么样？ |||<sticker:打招呼> [[THINK|平平常常的问候，心里却有点暖。]]
+```
+
+> 当前主模型就是 `deepseek-flash`（属于会思考的一类），所以这次是真的生效，不是空转。
+
+**2. 主人 `/tokenadd N` 追加当日额度**
+
+- `services/budget_guard.py`：`limit()` = 基础 `LLM_DAILY_BUDGET` + 当日追加；
+  追加值落 `data/budget_extra.json`（按自然日，跨重启有效，次日自动失效）；
+- `plugins/chat`：新增 `/tokenadd`（别名 `/加额度`、`/token加`），仅主人可用；
+- `/用量` / `/测函数 用量` 显示「其中追加 N」。
+
+**实测**：
+
+```text
+base 2000000.0 extra 0.0 limit 2000000.0
+[BUDGET] /tokenadd +1000000 → 今日追加额度 1000000（总预算 3000000）
+· 日预算：1153500 / 3000000（38%）｜其中追加 1000000｜档位 ok
+[BUDGET] /tokenadd -1000000 → 今日追加额度 0（总预算 2000000）
+```
+
+**3. 验证**
+
+- 部署后 0 Traceback；`check_tuning` PASS；`check_runtime_wiring` 69 PASS / 0 FAIL；
+- napcat 收发正常；`[LLM]` 日志带思考等级，便于 ssh 对账。
+
 ## 2026-11-28（第四十八轮：修「一条消息回两次」—— 工具发送 + 主流程正文双发）
 
 **用户反馈**：「标签已经指向了她，艾特和引用后不仅会指向回复一次，我们的硬逻辑又回复一次。」

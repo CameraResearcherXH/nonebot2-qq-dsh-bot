@@ -36,6 +36,8 @@ except Exception:  # pragma: no cover
 
 SOFT_RATIO = tuning.f("LLM_BUDGET_SOFT_RATIO")
 STATE_FILE = Path(os.getenv("BUDGET_STATE_FILE", "data/budget_notice.json"))
+# `/tokenadd` 追加的当日额度（{"day": "...", "extra": N}，跨重启有效）
+EXTRA_FILE = Path(os.getenv("BUDGET_EXTRA_FILE", "data/budget_extra.json"))
 # 固定话术：`{used}` / `{limit}` / `{pct}` 会被替换
 REST_TEXT = os.getenv(
     "LLM_BUDGET_REST_TEXT",
@@ -61,11 +63,50 @@ def effective() -> bool:
     return _today() >= start
 
 
-def limit() -> float:
+def base_limit() -> float:
+    """`.env` 里的基础日预算（LLM_DAILY_BUDGET）。"""
     try:
         return float(tuning.f("LLM_DAILY_BUDGET") or 0.0)
     except Exception:
         return 0.0
+
+
+def extra() -> float:
+    """今天通过 `/tokenadd` 追加的额度（按自然日，跨重启有效）。"""
+    try:
+        if not EXTRA_FILE.exists():
+            return 0.0
+        d = json.loads(EXTRA_FILE.read_text(encoding="utf-8") or "{}")
+        if str(d.get("day") or "") != _today():
+            return 0.0
+        return max(0.0, float(d.get("extra") or 0.0))
+    except Exception:
+        return 0.0
+
+
+def limit() -> float:
+    """当日总预算 = 基础值 + `/tokenadd` 追加值。"""
+    base = base_limit()
+    if base <= 0:
+        return 0.0
+    return base + extra()
+
+
+def add(n: float) -> float:
+    """`/tokenadd N`：给今天加 N 额度（可为负），返回新的总预算。"""
+    day = _today()
+    cur = extra()
+    new = max(0.0, cur + float(n or 0))
+    try:
+        EXTRA_FILE.parent.mkdir(parents=True, exist_ok=True)
+        EXTRA_FILE.write_text(
+            json.dumps({"day": day, "extra": new}, ensure_ascii=False),
+            encoding="utf-8")
+        logger.info(f"[BUDGET] /tokenadd {n:+.0f} → 今日追加额度 {new:.0f}"
+                    f"（总预算 {limit():.0f}）")
+    except Exception as e:
+        logger.warning(f"[BUDGET] 写额度失败: {type(e).__name__}: {e}")
+    return limit()
 
 
 def used() -> int:
@@ -163,5 +204,7 @@ def status_text() -> str:
     lim = limit()
     if lim <= 0:
         return "· 日预算：没设（LLM_DAILY_BUDGET=0，不刹车）"
+    _ex = extra()
     return (f"· 日预算：{used()} / {int(lim)}（{ratio() * 100:.0f}%）"
-            f"｜档位 {state()}｜生效日 {_start_date() or '立即'}")
+            + (f"｜其中追加 {int(_ex)}" if _ex > 0 else "")
+            + f"｜档位 {state()}｜生效日 {_start_date() or '立即'}")

@@ -32,6 +32,46 @@ _CUR_SEP = "----------- 以下是当前要回复的消息（重点看这条，�
 # 以前两边各写一遍字面量，改一处忘一处就静默失效 —— 统一到这里。
 VISION_TAG = "[图片识别结果]"
 
+# ---------- 思考等级（2026-11-28 用户）----------
+# 用户原话：「我们的心理活动并非完全的深度思考，用户如果用哪些强制深度思考的
+#   模型就会超时。建议对这类模型聊天默认 low，用户也可以自己在 .env 改等级。
+#   low 是为时间不超时考虑的。」
+# 只在**推理型模型**上注入（普通 chat 模型传了会 400）：
+#   · OpenAI 系 → reasoning_effort: low/medium/high
+#   · GLM / Qwen 没有 low 档 → 直接关思考（最快，避免超时）
+# 取值：low（默认）/ medium / high / off（一律关）/ auto（不注入）
+REASONING_EFFORT = (os.getenv("REASONING_EFFORT", "low") or "low").strip().lower()
+_REASONING_MODEL_HINTS = (
+    "reasoner", "-r1", "r1-", "qwq", "o1", "o3", "o4",
+    "thinking", "flash", "deepseek-v4",
+)
+
+
+def _is_reasoning_model(model: str) -> bool:
+    m = str(model or "").lower()
+    return any(h in m for h in _REASONING_MODEL_HINTS)
+
+
+def _reasoning_payload() -> dict:
+    """给推理型模型注入「思考等级」；不认识的模型一律不传（避免 400）。"""
+    if REASONING_EFFORT in ("", "auto", "default"):
+        return {}
+    if not _is_reasoning_model(ROLEPLAY_MODEL):
+        return {}
+    try:
+        from . import providers
+        name = str(providers.resolve("roleplay").get("provider") or "").lower()
+    except Exception:
+        name = ""
+    if name == "glm":
+        # GLM 只有开关，没有 low/medium/high → 默认关（省时间）
+        return {"thinking": {"type": "disabled"}}
+    if name == "qwen":
+        return {"enable_thinking": REASONING_EFFORT in ("medium", "high")}
+    if REASONING_EFFORT == "off":
+        return {"reasoning_effort": "low"}
+    return {"reasoning_effort": REASONING_EFFORT}
+
 # 视频标记：视频（B 站抽帧总结 / 以后接的第三方视频解析）走的是**同一条**
 # 「当前媒体」通道，但话术必须说「视频」。
 # 2026-11-17 审计：视觉分支原来把「图」写死在 4 个地方（system 标题 / user 块 /
@@ -3235,7 +3275,9 @@ async def call_llm(
     # ================= 统一交给角色扮演模型 =================
     # 2026-11-23 用户：角色扮演走 GLM-4-Flash（ROLEPLAY_*），
     # 三方判读/审核继续走 DeepSeek chat（XAI_*）。
-    logger.info(f"[LLM] ☁️ 使用角色扮演模型 {ROLEPLAY_MODEL} 生成最终回复...")
+    logger.info(f"[LLM] ☁️ 使用角色扮演模型 {ROLEPLAY_MODEL} 生成最终回复"
+                f"（思考={REASONING_EFFORT}"
+                f"{'，推理模型已注入' if _reasoning_payload() else '，普通模型不注入'}）...")
     headers = {"Authorization": f"Bearer {ROLEPLAY_API_KEY}",
                "Content-Type": "application/json"}
     kwargs = {"timeout": 60}
@@ -3360,6 +3402,9 @@ async def call_llm(
                     ROLEPLAY_MAX_TOKENS_FIELD: (
                         LONG_DOC_MAX_TOKENS if _long_doc else ROLEPLAY_MAX_TOKENS),
                 }
+                # 2026-11-28：推理型模型默认 low 思考（心理活动不需要深度思考，
+                # 强制思考会超时）。普通 chat 模型不会注入。
+                payload.update(_reasoning_payload())
                 if allow_tools:
                     payload["tools"] = _tools
                     # 强制「不回复」：不是靠提示词祈祷，而是 API 层锁死只有一个选项

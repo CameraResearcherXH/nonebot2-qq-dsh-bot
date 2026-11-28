@@ -88,3 +88,32 @@ provider 内置的 key 会按顺序找，兼容历史变量：
   代码会自动换下一个候选模型；`/测函数 模型` 能看到当前落到哪个。
 - `glm-5.3-flash` 能读图，但「始终思考」不支持关闭，900 token 要 ~23s；日常识图用 `glm-4v-plus`。
 - 改完 `.env` 要 `docker compose up -d --force-recreate bot`（`restart` 不重读 env_file）。
+
+## 6. 思考等级（2026-11-28）
+
+用户原话：「我们的心理活动并非完全的深度思考，用户如果用哪些强制深度思考的模型就会超时。
+建议对这类模型聊天默认 low，用户也可以自己在 `.env` 里改这个深度思考等级。
+low 是为时间不超时考虑的。」
+
+`REASONING_EFFORT`（默认 `low`）只对**推理型模型**注入，普通 chat 模型不受影响：
+
+| 取值 | OpenAI / DeepSeek 系 | GLM | Qwen |
+|---|---|---|---|
+| `low`（默认） | `reasoning_effort: low` | `thinking: {type: disabled}`（GLM 无 low 档，直接关） | `enable_thinking: false` |
+| `medium` / `high` | 原样透传 | `thinking: {type: enabled}` | `enable_thinking: true` |
+| `off` | 降到最低档 | 关 | 关 |
+| `auto` | 不注入（老行为） | 不注入 | 不注入 |
+
+判定「推理型模型」看模型名是否含 `reasoner / r1 / qwq / o1 / o3 / o4 / thinking / flash / deepseek-v4`
+（当前主模型 `deepseek-flash` 就属于这一类，日志会打
+`[LLM] ☁️ 使用角色扮演模型 deepseek-flash 生成最终回复（思考=low，推理模型已注入）`）。
+
+> 为什么 GLM/Qwen 不传 low：这两家只有「开/关」没有等级，传 `reasoning_effort` 反而可能 400。
+> 对它们来说「不超时」最有效的做法就是直接关掉思考。
+
+## 7. 每日 token 额度与 `/tokenadd`（2026-11-28）
+
+- 基础额度：`.env` 的 `LLM_DAILY_BUDGET`（默认 2000000）；
+- 主人可以在群里发 `/tokenadd 1000000` 给**今天**追加额度（`/tokenadd -500000` 减回去）；
+- 追加值落 `data/budget_extra.json`（`{"day": "...", "extra": N}`），跨重启有效、次日自动失效；
+- `/用量` 或 `/测函数 用量` 会显示「其中追加 N」。
