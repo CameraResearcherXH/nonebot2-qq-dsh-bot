@@ -7,6 +7,7 @@
   - 过期：标 status="outdated"，不删
 """
 from core import tuning
+from . import diag as _diag
 from . import memdb as _memdb
 import json
 import logging
@@ -163,6 +164,8 @@ def remember(
             delta=delta, salience=salience, valence=valence,
             turn_id=turn_id, mind=mind,
         )
+    _diag.emit("write", about=about_qq, kind=kind, gid=gid, src="json",
+               txt=text[:60], imp=importance, sal=salience)
     now = time.time()
     text = text.strip()
     # 情绪强度（= 刻痕）统一入口：**salience（涨幅换算）优先**，
@@ -668,6 +671,16 @@ def recall(
         if _picked and mark_hit:
             memdb.note_hits([r.get("id") for _, r in _picked])
         _ms = (time.time() - _t0) * 1000.0
+        _diag.emit(
+            "recall", backend="sqlite", q=query, spk=speaker_qq, gid=gid,
+            limit=limit, n_cand=len(_pairs), n_pick=len(_picked),
+            hit_spk=sum(1 for _, r in _picked
+                        if speaker_qq and str(r.get("about_qq") or "") == str(speaker_qq)),
+            top=[{"id": str(r.get("id") or "")[:8], "s": round(sc, 2),
+                  "who": str(r.get("about_qq") or ""), "k": r.get("kind")}
+                 for sc, r in _pairs[:5]],
+            picked=[str(r.get("id") or "")[:8] for _, r in _picked],
+            ms=round(_ms))
         # 50ms 目标是 **sqlite 角色脑** 的口径；json 后端是 O(N) 全量扫描（实测 ~1s），
         # 在这里告警只会刷屏，所以只在 sqlite 下报。
         if BACKEND == "sqlite" and _ms > RET_CHAR_LATENCY_MS:
@@ -724,6 +737,16 @@ def recall(
     scored.sort(key=lambda x: -x[0])
     top = _diversify(scored, limit)
     _ms = (time.time() - _t0) * 1000.0
+    _diag.emit(
+        "recall", backend="json", q=query, spk=speaker_qq, gid=gid,
+        limit=limit, n_cand=len(scored), n_pick=len(top),
+        hit_spk=sum(1 for _, d in top
+                    if speaker_qq and str(d.get("about_qq") or "") == str(speaker_qq)),
+        top=[{"id": str(d.get("id") or "")[:8], "s": round(sc, 2),
+              "who": str(d.get("about_qq") or ""), "k": d.get("kind")}
+             for sc, d in scored[:5]],
+        picked=[str(d.get("id") or "")[:8] for _, d in top],
+        ms=round(_ms))
     if BACKEND == "sqlite" and _ms > RET_CHAR_LATENCY_MS:
         _log.warning(f"[RECALL] 角色脑 {_ms:.0f}ms > 目标 {RET_CHAR_LATENCY_MS:.0f}ms")
 

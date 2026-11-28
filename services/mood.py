@@ -517,10 +517,12 @@ def observe(session_key: str, impact: int, confidence: float = 0.6, *,
     _sens = max(SENS_MIN, min(SENS_MAX, float(sensitivity if sensitivity is not None else 1.0)))
 
     def _one(rec: dict, scope: str, scale: float = 1.0, base: float = 0.0):
-        # ⚠️ dt_h 必须在 _decay **之前**算：_decay 会把 updated_at 写成 now，
-        #    之后再算永远是 0 → Q 恒 0、P 永不随时间回升（2026-11-25 审计 P0-1）。
+        # Q 回补按真实流逝时间算：用专用 q_at（只在积分 Q 时前进），不用 updated_at。
+        # updated_at 会被 touch/get_mood/全局预衰减重置成 now，拿它算 dt_h 恒 0
+        # → Q 恒 0、P 永不随时间回升（2026-11-28 实测全局 P 塌到 0.0099）。
         try:
-            _prev_ts = float((rec or {}).get("updated_at") or now)
+            _prev_ts = float((rec or {}).get("q_at")
+                             or (rec or {}).get("updated_at") or now)
         except Exception:
             _prev_ts = now
         dt_h = max(0.0, (now - _prev_ts) / 3600.0)
@@ -541,6 +543,7 @@ def observe(session_key: str, impact: int, confidence: float = 0.6, *,
         dv = max(-HARD_CAP, min(HARD_CAP, dv)) * scale
         rec["value"] = _clamp((v + dv) * 100.0)
         rec["updated_at"] = now
+        rec["q_at"] = now
         rec["P"] = max(P_FLOOR, min(1.0, (1.0 - k) * p))
         rec["judge_n"] = int(rec.get("judge_n") or 0) + 1
         if abs(dv) > 1e-6:
@@ -671,7 +674,10 @@ def anchor(session_key: str, level: int, confidence: float = 0.6,
     key = _scope_key(session_key)
     rec = st["sessions"].get(key) or _new_rec(now, _scope_of(key))
     rec = _decay(rec, now)
-    move = _anchor_rec(rec, int(level), confidence, baseline)
+    # 独立 anchor 只由 anchor_tick（静默周期锚点）调用 → 按文档回补 P。
+    # 以前漏传 p_add，静默回补这条路实际不补 P（2026-11-28 审计）。
+    move = _anchor_rec(rec, int(level), confidence, baseline,
+                       p_add=ANCHOR_P_ADD)
     st["sessions"][key] = rec
     _save(st)
     if abs(move) > 1e-9:
@@ -814,7 +820,8 @@ def _new_rec(now: float = 0, scope: str = "global") -> dict:
     _t = now or time.time()
     # anchor_at 必须初始化：留 0 会让「静默 30min」在第一次判读时恒为真 →
     # 每条新会话的第一个观测都被额外锚一次（2026-11-25 真机日志发现）。
-    return {"value": 0.0, "updated_at": _t, "_scope": scope, "anchor_at": _t}
+    return {"value": 0.0, "updated_at": _t, "_scope": scope, "anchor_at": _t,
+            "q_at": _t}
 
 
 def _clamp(v: float) -> float:
@@ -879,6 +886,9 @@ def _decay(rec: dict, now: float, baseline: float = None) -> dict:
         out["judge"] = dict(rec["judge"])
     # P2 状态机字段：不确定度 P、判读次数、上次锚点、人设敏感度
     for _k in ("P", "judge_n", "anchor_at", "anchor_n", "sens",
+               # q_at：Q 回补专用时钟，只在 _one 积分 Q 时前进；衰减/读路径不能丢，
+               # 否则 touch/get_mood 重置 updated_at 会把两次判读间的真实流逝吞掉。
+               "q_at",
                # ±3 日计数（2026-11-27）：衰减时不能丢，否则每天第一次 ±3 判不出来
                "impact3_day", "impact3_n"):
         if rec.get(_k) is not None:
@@ -914,6 +924,7 @@ def _load() -> dict:
     if not isinstance(g, dict):
         g = _new_rec()
     g.setdefault("_scope", "global")
+    g.setdefault("q_at", float(g.get("updated_at") or time.time()))
     s = raw.get("sessions")
     if not isinstance(s, dict):
         s = {}
@@ -921,6 +932,7 @@ def _load() -> dict:
     for _k, _rec in list(s.items()):
         if isinstance(_rec, dict):
             _rec.setdefault("_scope", _scope_of(_k))
+            _rec.setdefault("q_at", float(_rec.get("updated_at") or time.time()))
             # 老记录没有 anchor_at：用最后更新时间当起点，避免升级后第一次判读就锚
             try:
                 _rec.setdefault("anchor_at", float(_rec.get("updated_at") or time.time()))
@@ -1239,7 +1251,8 @@ def set_label(label: str, session_key: str = "") -> str:
 @_serialized
 def set_judge(session_key: str, word: str, value: float, *,
               why: str = "", src: str = "", mind: str = "",
-              delta: float = 0.0) -> dict:
+              delta: float = 0.0, target: str = "",
+              target_qq: str = "") -> dict:
     """
     存**判读模型**给的心情（mood_judge）。这是影子字段：
 
@@ -1266,6 +1279,10 @@ def set_judge(session_key: str, word: str, value: float, *,
            # 这一次判读的「涨幅」（判读原值之差）——好感/记忆刻痕/档案都靠它，
            # 和 value（当前水平，现在进行时）是两回事。
            "delta": round(float(delta or 0.0), 4),
+           # 这一窗的归因（五分类 + 核对通过的 QQ）：MEMO 落记忆时按它定 about_qq，
+           # 以前一律记说话人（design §1.1）。
+           "target": str(target or ""),
+           "target_qq": str(target_qq or ""),
            "at": now}
     st = _load()
     st["global"] = _decay(st["global"], now)

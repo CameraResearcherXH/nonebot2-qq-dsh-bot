@@ -32,7 +32,7 @@ headers = {
     #    换成桌面 Chrome 的 UA，Referer 也必须带（防盗链）。
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/127.0.0.1 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     ),
     "Referer": "https://www.pixiv.net/",
     "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
@@ -43,7 +43,7 @@ headers = {
 WEB_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/127.0.0.1 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     ),
     "Referer": "https://www.pixiv.net/",
     "Accept": "application/json, text/plain, */*",

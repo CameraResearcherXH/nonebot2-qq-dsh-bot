@@ -250,7 +250,7 @@ DOWNLOAD_TIMEOUT_READ = float(os.getenv("DOWNLOAD_TIMEOUT_READ", "180"))
 NETEASE_UA = os.getenv(
     "NETEASE_UA",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/127.0.0.1 Safari/537.36",
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 )
 
 
@@ -396,7 +396,8 @@ RVC_TIMEOUT = float(os.getenv("RVC_TIMEOUT", "1800"))
 def send_heartbeat() -> bool:
     try:
         r = requests.get(f"{BASE_URL}/api/heartbeat",
-                         params={"secret": API_SECRET, "caps": ",".join(_current_caps())},
+                         params={"caps": ",".join(_current_caps())},
+                         headers={"X-Node-Secret": API_SECRET},
                          timeout=5, proxies=PROXIES)
         return r.status_code == 200
     except Exception:
@@ -519,55 +520,71 @@ def upload_complete(task_id: str, file_path=None, result=None, filename=None,
       - result   ：字典（复盘 JSON / 错误信息）
     失败任务也用 result={"error": ...} 回传，让服务器立刻知道失败，
     而不是让 STATUS 永远停在 processing。
+
+    状态机（2026-11-28）：本地 5xx/网络抖动 → 有限重试（默认 3 次，3/6/9s 退避）；
+    4xx（除 408/429）不重试 —— 404 是服务器确实没这个任务，重试也没用。
+    服务器端对重复回传做幂等（duplicate），所以重试不会让成品发两遍。
     """
     url = f"{BASE_URL}/api/tasks/complete"
-    try:
-        if file_path is not None:
-            fp = Path(file_path)
-            f2 = Path(file2) if file2 else None
-            if f2 and not f2.exists():
-                f2 = None
-            size = fp.stat().st_size if fp.exists() else 0
-            if f2:
-                size += f2.stat().st_size
-            tmo = upload_timeout(size)
-            extra = f" + {f2.name}" if f2 else ""
-            print(f"📤 回传 {fp.name}{extra}（{size / 1048576:.1f} MB），超时 {tmo:.0f}s",
-                  flush=True)
-            with contextlib.ExitStack() as stack:
-                fv = stack.enter_context(open(fp, "rb"))
-                files = {"file": (filename or fp.name, fv, "application/octet-stream")}
+    retries = max(1, int(os.getenv("UPLOAD_RETRIES", "3") or 3))
+    last_err = ""
+    for attempt in range(1, retries + 1):
+        try:
+            if file_path is not None:
+                fp = Path(file_path)
+                f2 = Path(file2) if file2 else None
+                if f2 and not f2.exists():
+                    f2 = None
+                size = fp.stat().st_size if fp.exists() else 0
                 if f2:
-                    fv2 = stack.enter_context(open(f2, "rb"))
-                    files["file2"] = (f2.name, fv2, "application/octet-stream")
-                data = {"task_id": task_id, "secret": API_SECRET}
-                # 👇 允许「文件 + JSON」一起回传（/测歌 A/B 需要：成品 mp3 + 判定数据）
-                #    以前带文件就丢掉 result，服务器只能二选一。
-                if result:
-                    data["result"] = json.dumps(result, ensure_ascii=False)
-                r = requests.post(url, data=data, files=files, proxies=PROXIES, timeout=tmo)
-        else:
-            data = {
-                "task_id": task_id,
-                "secret": API_SECRET,
-                "result": json.dumps(result or {}, ensure_ascii=False),
-            }
-            r = requests.post(url, data=data, proxies=PROXIES, timeout=60)
+                    size += f2.stat().st_size
+                tmo = upload_timeout(size)
+                extra = f" + {f2.name}" if f2 else ""
+                print(f"📤 回传 {fp.name}{extra}（{size / 1048576:.1f} MB），超时 {tmo:.0f}s",
+                      flush=True)
+                with contextlib.ExitStack() as stack:
+                    fv = stack.enter_context(open(fp, "rb"))
+                    files = {"file": (filename or fp.name, fv, "application/octet-stream")}
+                    if f2:
+                        fv2 = stack.enter_context(open(f2, "rb"))
+                        files["file2"] = (f2.name, fv2, "application/octet-stream")
+                    data = {"task_id": task_id, "secret": API_SECRET}
+                    # 👇 允许「文件 + JSON」一起回传（/测歌 A/B 需要：成品 mp3 + 判定数据）
+                    #    以前带文件就丢掉 result，服务器只能二选一。
+                    if result:
+                        data["result"] = json.dumps(result, ensure_ascii=False)
+                    r = requests.post(url, data=data, files=files, proxies=PROXIES, timeout=tmo)
+            else:
+                data = {
+                    "task_id": task_id,
+                    "secret": API_SECRET,
+                    "result": json.dumps(result or {}, ensure_ascii=False),
+                }
+                r = requests.post(url, data=data, proxies=PROXIES, timeout=60)
 
-        if r.status_code == 200:
-            print(f"✅ 任务 {task_id} 回传完成", flush=True)
-            return True
-        print(f"❌ 任务 {task_id} 回传失败 HTTP {r.status_code}: {r.text[:200]}", flush=True)
-        return False
-    except Exception as e:
-        print(f"❌ 任务 {task_id} 回传异常: {type(e).__name__}: {e}", flush=True)
-        return False
+            if r.status_code == 200:
+                print(f"✅ 任务 {task_id} 回传完成", flush=True)
+                return True
+            last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+            if 400 <= r.status_code < 500 and r.status_code not in (408, 429):
+                print(f"❌ 任务 {task_id} 回传失败 {last_err}", flush=True)
+                return False
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+        if attempt < retries:
+            wait = min(20, 3 * attempt)
+            print(f"⚠️ 任务 {task_id} 回传第 {attempt}/{retries} 次失败"
+                  f"（{last_err}）→ {wait}s 后重试", flush=True)
+            time.sleep(wait)
+    print(f"❌ 任务 {task_id} 回传最终失败（{last_err}）", flush=True)
+    return False
 
 
 def _download_input(task_id: str, out_path, expect_audio: bool = True, label: str = "") -> bool:
     return download_file(
-        f"{BASE_URL}/api/download/{task_id}?secret={API_SECRET}",
+        f"{BASE_URL}/api/download/{task_id}",
         out_path, expect_audio=expect_audio, label=label or task_id,
+        extra_headers={"X-Node-Secret": API_SECRET},
     )
 
 
@@ -617,7 +634,7 @@ def _demucs_separate(input_wav: Path, want_inst: bool = True, stems: int = 2):
         status = st.get("status")
         if status == "failed":
             print("❌ Demucs 分离失败", flush=True)
-            return None, None
+            return None, [], "unknown"
         if status != "completed":
             continue
 
@@ -778,27 +795,39 @@ def process_split_task(task_id: str, task: dict):
 
     # ⚠️ 必须双文件回传：song_cover 靠 output["vocal"] / output["inst"] 取值
     url = f"{BASE_URL}/api/tasks/complete"
-    try:
-        # 两个 wav 加起来 70~90MB，超时必须按体积算（原来写死 180 会 ReadTimeout）
-        total = (vocal_local.stat().st_size if vocal_local.exists() else 0) + \
-                (inst_local.stat().st_size if inst_local.exists() else 0)
-        tmo = upload_timeout(total)
-        print(f"📤 上传人声 + 伴奏（共 {total / 1048576:.1f} MB），超时 {tmo:.0f}s…", flush=True)
-        with open(vocal_local, "rb") as fv, open(inst_local, "rb") as fi:
-            files = {
-                "vocal": ("vocal.wav", fv, "audio/wav"),
-                "inst": ("inst.wav", fi, "audio/wav"),
-            }
-            data = {"task_id": task_id, "secret": API_SECRET}
-            r = requests.post(url, data=data, files=files, proxies=PROXIES, timeout=tmo)
-        print(f"✅ 分离双文件回传: HTTP {r.status_code}", flush=True)
-        if r.status_code != 200:
-            print(f"   服务器返回: {r.text[:200]}", flush=True)
-    except Exception as e:
-        print(f"❌ 分离回传异常: {type(e).__name__}: {e}", flush=True)
-        # 回传失败也要告诉服务器，否则任务永远停在 processing，
+    _last_err = ""
+    _uploaded = False
+    for _attempt in range(1, 4):
+        try:
+            # 两个 wav 加起来 70~90MB，超时必须按体积算（原来写死 180 会 ReadTimeout）
+            total = (vocal_local.stat().st_size if vocal_local.exists() else 0) + \
+                    (inst_local.stat().st_size if inst_local.exists() else 0)
+            tmo = upload_timeout(total)
+            print(f"📤 上传人声 + 伴奏（共 {total / 1048576:.1f} MB），超时 {tmo:.0f}s…", flush=True)
+            with open(vocal_local, "rb") as fv, open(inst_local, "rb") as fi:
+                files = {
+                    "vocal": ("vocal.wav", fv, "audio/wav"),
+                    "inst": ("inst.wav", fi, "audio/wav"),
+                }
+                data = {"task_id": task_id, "secret": API_SECRET}
+                r = requests.post(url, data=data, files=files, proxies=PROXIES, timeout=tmo)
+            print(f"✅ 分离双文件回传: HTTP {r.status_code}", flush=True)
+            if r.status_code == 200:
+                _uploaded = True
+                break
+            _last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+            print(f"   服务器返回: {_last_err}", flush=True)
+            if 400 <= r.status_code < 500 and r.status_code not in (408, 429):
+                break
+        except Exception as e:
+            _last_err = f"{type(e).__name__}: {e}"
+            print(f"❌ 分离回传异常（第 {_attempt}/3 次）: {_last_err}", flush=True)
+        if _attempt < 3:
+            time.sleep(3 * _attempt)
+    if not _uploaded:
+        # 回传最终还是失败也要告诉服务器，否则任务永远停在 processing，
         # 服务器侧要傻等到自己的等待上限才报错
-        upload_complete(task_id, result={"error": f"upload failed: {type(e).__name__}: {e}"})
+        upload_complete(task_id, result={"error": f"upload failed: {_last_err}"})
 
     # 分离结果异常时保留文件，方便手动听一下到底是 Demucs 的问题还是混音的问题
     keep = db_i < -55 or (db_v > -900 and db_i > -900 and (db_v - db_i) > 10)
@@ -2695,9 +2724,9 @@ def process_rvc_mix_task(task_id: str, task: dict):
 
     inst_path = TEMP_DIR / f"{task_id}_inst.wav"
     if with_inst:
-        inst_url = (f"{BASE_URL}/api/download/{task_id}"
-                    f"?secret={API_SECRET}&field=extra_input")
-        if not download_file(inst_url, inst_path, label="inst"):
+        inst_url = f"{BASE_URL}/api/download/{task_id}?field=extra_input"
+        if not download_file(inst_url, inst_path, label="inst",
+                             extra_headers={"X-Node-Secret": API_SECRET}):
             upload_complete(task_id, result={"error": "inst download failed"})
             return
 
@@ -3175,9 +3204,9 @@ def process_cover_full_task(task_id: str, task: dict):
             # 精确模式：先用浮点预变调，再让 RVC pitch=0
             _ex = float(_j.get("exact") or 0.0)
             if abs(_ex) > 0.05:
-                _shifted = str(Path(vocal_path).with_name("vocal_shifted.wav"))
-                if shift_vocal(vocal_path, _shifted, _ex):
-                    vocal_path = _shifted
+                _shifted = str(Path(vocal_local).with_name("vocal_shifted.wav"))
+                if shift_vocal(vocal_local, _shifted, _ex):
+                    vocal_local = Path(_shifted)
                     _shift = _ex
                     print(f"🎛️ [PITCH] 精确模式：人声已预变调 {_ex:+.2f} 半音，"
                           f"RVC pitch=0", flush=True)
@@ -3187,9 +3216,9 @@ def process_cover_full_task(task_id: str, task: dict):
             _shift = float(pitch)
             # pre 模式：先对人声轨整体变调，再让 RVC pitch=0
             if COVER_PITCH_MODE == "pre" and pitch:
-                _shifted = str(Path(vocal_path).with_name("vocal_shifted.wav"))
-                if shift_vocal(vocal_path, _shifted, pitch):
-                    vocal_path = _shifted
+                _shifted = str(Path(vocal_local).with_name("vocal_shifted.wav"))
+                if shift_vocal(vocal_local, _shifted, pitch):
+                    vocal_local = Path(_shifted)
                     print(f"🎛️ [PITCH] pre 模式：人声已预变调 {pitch:+d} 半音，"
                           f"RVC pitch 归 0", flush=True)
                     pitch = 0
@@ -3372,8 +3401,8 @@ def process_cover_full_task(task_id: str, task: dict):
         file2=out_mp3 if trimmed else None,
     )
 
-    for p in (input_raw, input_wav, vocal_local, inst_local, eng_in, eng_out,
-              out_mp3, short_mp3, *_stems.values()):
+    for p in (input_raw, input_wav, vocal_local, TEMP_DIR / f"{task_id}_vocal.wav",
+              inst_local, eng_in, eng_out, out_mp3, short_mp3, *_stems.values()):
         if p:
             p.unlink(missing_ok=True)
 
@@ -4264,8 +4293,17 @@ def process_draw_task(task_id: str, task: dict):
             ref_path.unlink(missing_ok=True)
         return
 
+    # mode 模板缺失时 _sd_load_workflow 用 txt2img 兜底，参考图实际没进 workflow。
+    # 不能假装按姿势/景深/画风出图成功 → 如实回报降级（2026-11-28 审计）。
+    _degraded = mode != "txt2img" and not (SD_WORKFLOW_DIR / f"{mode}.json").exists()
+    _res = {"mode": "txt2img" if _degraded else mode,
+            "prompt": str(task.get("prompt") or "")[:200]}
+    if _degraded:
+        _res["requested_mode"] = mode
+        _res["note"] = f"「{mode}」workflow 模板缺失，已降级为文生图（参考图未生效）"
+        print(f"⚠️ 画图降级：{mode}.json 缺失 → txt2img 兜底，参考图未生效", flush=True)
     upload_complete(task_id, file_path=png, filename=f"{task_id}_draw.png",
-                    result={"mode": mode, "prompt": str(task.get("prompt") or "")[:200]})
+                    result=_res)
     png.unlink(missing_ok=True)
     if ref_path:
         ref_path.unlink(missing_ok=True)
@@ -4327,7 +4365,7 @@ def check_services() -> bool:
         return u.rsplit(marker, 1)[0] if marker in u else u
 
     http_items = [
-        ("服务器 API", f"{BASE_URL}/api/heartbeat?secret={API_SECRET}"),
+        ("服务器 API", f"{BASE_URL}/api/heartbeat"),
         ("Demucs 分离", "http://127.0.0.1:8005/"),
         ("IndexTTS2", _base(TTS_URL, "/api/")),
         ("Ollama 复盘", _base(LLM_URL, "/v1/") + "/api/tags"),
@@ -4403,7 +4441,7 @@ def check_server_conn() -> bool:
     print(f"🔍 2/2 测 HTTP {BASE_URL}/api/heartbeat …", flush=True)
     try:
         r = requests.get(f"{BASE_URL}/api/heartbeat",
-                         params={"secret": API_SECRET}, timeout=10, proxies=PROXIES)
+                         headers={"X-Node-Secret": API_SECRET}, timeout=10, proxies=PROXIES)
         print(f"  ✅ HTTP {r.status_code}  {r.text[:120]}", flush=True)
         if r.status_code == 403:
             print("     → secret 不一致：对一下 node.env 和服务器 .env 的 API_SECRET", flush=True)
@@ -4442,42 +4480,53 @@ def main():
     check_services()
     clean_temp_dir()
 
-    ok_streak = 0
-    fail_streak = 0
+    # 心跳放独立守护线程：任务 handler 同步跑在主循环（翻唱/TTS 可能几分钟），
+    # 心跳若也在主循环发，重活期间就停摆 → 服务器判离线（2026-11-28 实测 70s 缺口）。
+    hb = {"ok": False, "fail": 0, "ok_streak": 0}
+    hb_wake = threading.Event()
+
+    def _heartbeat_loop():
+        last = 0.0
+        while True:
+            now = time.time()
+            if now - last >= HEARTBEAT_INTERVAL or last == 0.0:
+                ok = send_heartbeat()
+                last = time.time()
+                hb["ok"] = ok
+                if ok:
+                    hb["fail"] = 0
+                    hb["ok_streak"] += 1
+                    if hb["ok_streak"] == 1 or hb["ok_streak"] % 20 == 0:
+                        print(f"[{time.strftime('%H:%M:%S')}] 💓 心跳正常"
+                              f"（已连续 {hb['ok_streak']} 次）", flush=True)
+                else:
+                    hb["ok_streak"] = 0
+                    hb["fail"] += 1
+                    print(f"⚠️ 心跳失败（连续 {hb['fail']} 次）", flush=True)
+            wait = HEARTBEAT_INTERVAL - (time.time() - last)
+            if not hb["ok"]:
+                wait = min(wait, 10 if hb["fail"] >= 10 else 3)
+            hb_wake.wait(max(0.5, wait))
+            hb_wake.clear()
+
+    threading.Thread(target=_heartbeat_loop, daemon=True, name="heartbeat").start()
+
     loop_err_streak = 0
     empty_polls = 0        # 连续空轮询次数（没任务时静默，但别让人以为卡死了）
-    last_hb = 0.0
-    hb_ok = False
 
     while True:
         try:
-            now = time.time()
-
-            # 👇 心跳每 HEARTBEAT_INTERVAL 秒一次（原来每次循环都发，日志被刷爆）
-            if now - last_hb >= HEARTBEAT_INTERVAL or last_hb == 0:
-                hb_ok = send_heartbeat()
-                last_hb = now
-                if not hb_ok:
-                    fail_streak += 1
-                    print(f"⚠️ 心跳失败（连续 {fail_streak} 次）", flush=True)
-                    time.sleep(10 if fail_streak >= 10 else 3)
-                    continue
-                ok_streak += 1
-                fail_streak = 0
-                if loop_err_streak:
-                    print(f"♻️ 连接已恢复（之前连续异常 {loop_err_streak} 次）", flush=True)
-                loop_err_streak = 0
-                if ok_streak == 1 or ok_streak % 20 == 0:
-                    print(f"[{time.strftime('%H:%M:%S')}] 💓 心跳正常（已连续 {ok_streak} 次）", flush=True)
-
-            if not hb_ok:
+            if not hb["ok"]:
                 time.sleep(POLL_INTERVAL)
                 continue
 
             r = requests.get(f"{BASE_URL}/api/tasks/pull",
-                             params={"secret": API_SECRET},
+                             headers={"X-Node-Secret": API_SECRET},
                              timeout=15, proxies=PROXIES)
             data = r.json()
+            if loop_err_streak:
+                print(f"♻️ 连接已恢复（之前连续异常 {loop_err_streak} 次）", flush=True)
+                loop_err_streak = 0
             if not data.get("has_task"):
                 # 没任务时原来完全静默 → 看起来像「卡住了」。
                 # 改成第一次 + 每 12 次（约 1 分钟）报一次，证明轮询在跑。
@@ -4515,12 +4564,12 @@ def main():
             print("\n👋 手动结束", flush=True)
             break
         except Exception as e:
-            # ⚠️ 关键：连接被服务器 RST（容器重启/重建）之后，hb_ok 必须失效、
-            #    last_hb 必须清零，否则会一直用旧状态去 pull，心跳要等满
-            #    HEARTBEAT_INTERVAL 才重发，中间这段时间服务器会认为算力机离线。
+            # ⚠️ 关键：连接被服务器 RST（容器重启/重建）之后，心跳必须立即重发，
+            #    否则要等满 HEARTBEAT_INTERVAL，中间这段时间服务器会认为算力机离线。
+            #    置 ok=False 并唤醒心跳线程，让它马上重探。
             loop_err_streak += 1
-            hb_ok = False
-            last_hb = 0.0
+            hb["ok"] = False
+            hb_wake.set()
             wait = min(30, 2 * loop_err_streak)
             hint = ""
             if isinstance(e, (ConnectionError, OSError)):

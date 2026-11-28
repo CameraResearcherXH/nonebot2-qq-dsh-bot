@@ -18,7 +18,7 @@ from .config import (BOT_MODE, MOCK_REPLY, XAI_API_KEY, XAI_BASE_URL, XAI_MODEL,
                      ROLEPLAY_MAX_TOKENS, ROLEPLAY_MAX_TOKENS_FIELD,
                      NODE_COMPUTE, CODE_AGENT, HARNESS_ENABLED)
 from .persona import persona_for, persona_name
-from . import attention, conv_state, expression, chat_switch, ctx_budget
+from . import attention, conv_state, expression, chat_switch, ctx_budget, diag
 from .memory import add_memory
 from . import agent_client, group_tuning, memory_v2, mood, profiles, group_scene
 from .prompt_builder import PERSONA_RULE, build_packet, recall_hits
@@ -433,12 +433,78 @@ CTX_HARD_CAP = tuning.i("CTX_HARD_CAP")
 is_long_doc = _ld.is_long_doc
 
 
-def _tool_blob(spec: dict) -> str:
-    fn = spec.get("function") or {}
-    parts = [str(fn.get("name") or ""), str(fn.get("description") or "")]
-    for _p in ((fn.get("parameters") or {}).get("properties") or {}):
-        parts.append(str(_p))
-    return " ".join(parts).lower()
+_TOOL_ASCII_RE = re.compile(r"[a-z0-9_]{2,}")
+_TOOL_CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
+
+
+def _tool_words(s: str) -> set:
+    """检索用词：英文词 + 中文二元组。
+
+    原来按单字重合打分（「一」「个」全命中），中文工具挑选几乎随机；
+    词级之后「来一首」才分得清唱歌，「摸头」才分得清 petpet。
+    """
+    t = str(s or "").lower()
+    out = set(_TOOL_ASCII_RE.findall(t))
+    for run in _TOOL_CJK_RE.findall(t):
+        for i in range(len(run) - 1):
+            out.add(run[i:i + 2])
+    return out
+
+
+# 工具名别名（×3）。没列的工具只靠触发词和描述词打分，不会挂不上。
+_TOOL_ALIAS = {
+    "sing": "唱歌 点歌 来一首",
+    "remember": "记住 记一下 帮我记",
+    "recall": "回忆 记忆 想起来 上次 之前",
+    "vision_source": "图片出处 以图搜图 这图哪来的",
+    "video_understand": "视频内容 看懂视频",
+    "web_fetch": "网页 链接 搜索 查资料",
+    "profile_card": "档案卡 印象卡 资料卡",
+    "profile_update": "改档案 更新档案",
+    "set_call": "称呼 怎么叫 外号 改称呼",
+    "lore_add": "设定 世界观 设定集",
+    "sticker_save": "表情包 存表情 收藏表情",
+    "daily_luck": "运势 抽签 运气 吉凶",
+    "girls_2d": "二次元图片 来张图 涩图",
+    "rollpig": "摇猪 骰子 随机数",
+    "steam_judge": "steam 游戏评测 值不值",
+    "petpet": "摸摸 摸头 拍一拍 揉一揉",
+    "api_usage": "额度 用量 花费 token",
+    "hash_decode": "哈希 md5 base64 解码 解密",
+    "chat_switch": "安静 休息 别说话",
+}
+
+# 触发词（×2）。
+_TOOL_KEYWORDS = {
+    "sing": "唱 歌 来一首 唱一个 点播",
+    "remember": "记住 别忘 记下来 帮我记",
+    "recall": "记得 还记得 说过 提过 回想",
+    "vision_source": "出处 哪来的 搜图 识别 什么图",
+    "video_understand": "视频 看看 解析 讲了什么",
+    "web_fetch": "搜 查 找 链接 网址 资料 新闻",
+    "profile_card": "档案 资料 名片 印象",
+    "profile_update": "档案 更新 改 补充",
+    "set_call": "称呼 叫 外号 别名",
+    "lore_add": "设定 世界观 设定集 补充设定",
+    "sticker_save": "表情 表情包 存 收藏",
+    "daily_luck": "运势 抽签 运气 好运 吉凶",
+    "girls_2d": "图 图片 二次元 来一张",
+    "rollpig": "猪 摇 骰子 随机 转",
+    "steam_judge": "steam 游戏 评测 好不好玩 值不值",
+    "petpet": "摸 拍 揉 头 贴贴",
+    "api_usage": "额度 用量 花了 多少 token",
+    "hash_decode": "哈希 md5 sha base64 解码 解密 编码",
+    "chat_switch": "安静 闭嘴 休息 别回",
+}
+
+# kind → 加分工具（atmosphere 意图类型透传进工具检索）。
+_TOOL_KIND_BOOST = {
+    "ask": ("recall", "web_fetch", "vision_source", "video_understand",
+            "profile_card", "api_usage", "hash_decode", "steam_judge", "daily_luck"),
+    "command": ("sing", "petpet", "rollpig", "sticker_save", "girls_2d",
+                "set_call", "remember", "web_fetch", "daily_luck"),
+    "vent": ("petpet", "sticker_save"),
+}
 
 
 def _tool_query_of(text: str) -> str:
@@ -456,7 +522,8 @@ def _tool_query_of(text: str) -> str:
         else:
             # 排除提示/规矩行，取最后一条「像正文」的
             body = [x for x in lines
-                    if not x.startswith(("（", "(", "⚠", "·", "【", "-", "带「"))]
+                    if not x.startswith(("（", "(", "⚠", "·", "【", "-", "带「",
+                                         "搜图源", "trace.moe", "[图片", "[视频"))]
             t = (body or lines)[-1]
     t = re.sub(r"^[\[【][^】\]]*[\]】]\s*", "", t)
     t = re.sub(r"^⭐?\s*#\d+\s*", "", t)   # 有的行是「#消息号 名字(qq): 内容」
@@ -468,14 +535,29 @@ def _tool_query_of(text: str) -> str:
     return t.strip()[:60]
 
 
-def _tool_score(qchars: set, spec: dict) -> int:
-    if not qchars:
-        return 0
-    blob = _tool_blob(spec)
-    return sum(1 for ch in qchars if ch in blob)
+def _tool_score(q: str, qw: set, spec: dict, kind: str = "") -> float:
+    """别名词 ×3、触发词 ×2、描述词 ×1，意图 kind 再补一点。
+
+    别名/触发词按「子串」命中（中文单字如 查/摸/唱 才有用），
+    描述词用二元组求交（避免「一」「个」这类单字噪声）。
+    """
+    fn = spec.get("function") or {}
+    name = str(fn.get("name") or "")
+    score = 0.0
+    for w in _TOOL_ALIAS.get(name, "").split():
+        if w and w in q:
+            score += 3
+    for w in _TOOL_KEYWORDS.get(name, "").split():
+        if w and w in q:
+            score += 2
+    score += len(qw & _tool_words(fn.get("description") or ""))
+    # 只给「已经有词命中」的工具加分：没命中的保持 0，不靠 kind 把无关工具顶上来
+    if score > 0 and kind and name in _TOOL_KIND_BOOST.get(kind, ()):
+        score += 1.5
+    return score
 
 
-def tools_for(key: str, query: str = "") -> list:
+def tools_for(key: str, query: str = "", kind: str = "") -> list:
     """这个会话该挂哪些工具的 spec。
 
     群聊只拿 scope 里带 group 的（再减去黑名单）；给了 query 时按描述重合度取 top N。
@@ -504,23 +586,32 @@ def tools_for(key: str, query: str = "") -> list:
             pass
     n = int(RET_TOOLS_TOP or 0)
     if n <= 0 or len(out) <= n:
+        diag.emit("tools", key=key, q=_tool_query_of(query), k=kind,
+                  total=len(out), n=len(out),
+                  names=[(s.get("function") or {}).get("name") for s in out])
         return out
     core, rest = [], []
     for i, s in enumerate(out):
         name = (s.get("function") or {}).get("name")
         (core if name in _TOOL_CORE else rest).append((i, s))
     _q = _tool_query_of(query)
-    qchars = {c for c in _q.lower() if not c.isspace()}
-    rest.sort(key=lambda it: (-_tool_score(qchars, it[1]), it[0]))
+    _ql = _q.lower()
+    qw = _tool_words(_ql)
+    rest.sort(key=lambda it: (-_tool_score(_ql, qw, it[1], kind), it[0]))
     keep_n = max(0, n - len(core))
     picked = core + rest[:keep_n]
     picked.sort(key=lambda it: it[0])
     result = [s for _, s in picked]
     try:
         logger.info(f"[TOOLS] {key} 挂 {len(result)}/{len(out)} 个"
-                    f"（top{RET_TOOLS_TOP}，query={_q[:24]}）")
+                    f"（top{RET_TOOLS_TOP}，kind={kind or '-'}，query={_q[:24]}）")
     except Exception:
         pass
+    diag.emit("tools", key=key, q=_q, k=kind, total=len(out), n=len(result),
+              names=[(s.get("function") or {}).get("name") for s in result],
+              top=[((s.get("function") or {}).get("name"),
+                    round(_tool_score(_ql, qw, s, kind), 1))
+                   for _, s in rest[:3]])
     return result
 
 
@@ -619,14 +710,18 @@ async def _run_tool_calls(calls: list) -> list:
         except Exception:
             args = {}
         handler = TOOL_HANDLERS.get(name)
+        outcome = "ok"
         if not handler:
+            outcome = "unknown"
             result = f"没有这个工具：{name}"
         elif name in _FAILED_TURN:
             # 2026-11-27：同一回合里失败过的工具不再重试（越试越慢，还会把标记漏出去）
+            outcome = "dup_fail"
             result = (f"「{name}」刚才这一轮已经失败过，别再重试。"
                       f"直接说没弄成 / 换个办法，**不要**把调用写法当话发出去。")
         elif not _skill_ok(name):
             # 2026-11-20：非核心能力被 /技能 关掉 → 直接告诉模型，别让它反复重试
+            outcome = "off"
             result = f"「{name}」这个能力被主人关掉了。用别的方式回答，不要重复调用。"
         else:
             _install_send_capture()
@@ -642,6 +737,7 @@ async def _run_tool_calls(calls: list) -> list:
                 # 2026-11-27：失败要「说清 + 别重试 + 别把调用写法发出去」。
                 # 以前只回一句 `工具 X 执行失败：...`，模型会继续尝试，
                 # 甚至把 `TOOLS|画图` 这类标记当话交给 send。
+                outcome = "fail"
                 _FAILED_TURN.add(name)
                 result = (f"【工具失败】{name} 没跑起来（{type(e).__name__}: {e}）。"
                           f"这一轮不要再调它；也不要跟对方说已经做好了 —— "
@@ -673,6 +769,9 @@ async def _run_tool_calls(calls: list) -> list:
                           f"（你刚才已经通过工具把这些内容发出去了："
                           f"{'；'.join(_uniq)[:300]}）")
         logger.info(f"[TOOL] {name}({args}) → {str(result)[:80]}")
+        diag.emit("tool", name=name,
+                  args=list(args)[:8] if isinstance(args, dict) else [],
+                  outcome=outcome, out_len=len(str(result)))
         out.append({
             "role": "tool",
             "tool_call_id": c.get("id") or name,
@@ -1941,6 +2040,11 @@ LOCAL_LLM_URL = os.getenv("LOCAL_LLM_URL", "http://127.0.0.1:11434/v1/chat/compl
 LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "qwen2.5:7b")
 # 压缩失败时直接把原文给 DeepSeek（超过这个字数才截断，防止 prompt 爆炸）
 SUMMARIZE_FALLBACK_MAX = tuning.i("SUMMARIZE_FALLBACK_MAX")
+# 本地 Qwen 压缩的等待上限与失败冷却（2026-11-28）：
+#   qwen 在算力机上走 SSH 隧道，隧道断的时候每次长文都要白等 15s，整条消息被拖住。
+#   超时收紧到 LQ_TIMEOUT，失败后 LQ_COOLDOWN 秒内直接走原文兜底，不占消息路径。
+LQ_TIMEOUT = max(1.5, float(os.getenv("LQ_TIMEOUT", "6") or 6))
+LQ_COOLDOWN = max(10.0, float(os.getenv("LQ_COOLDOWN", "120") or 120))
 
 # ================= [[MEMO]] 隐藏记忆协议 =================
 # 记忆和情绪的「判断权」交给 DeepSeek 自己，不再由代码关键词硬判。
@@ -2575,6 +2679,7 @@ def _pending_sticker_protocol() -> str:
 # 👇 调用本地 Qwen 进行极速总结
 # 已经警告过的地址，避免每轮对话都刷同一条日志
 _LQ_WARNED = set()
+_LQ_DOWN_AT = 0.0
 
 
 async def summarize_by_local_qwen(long_text: str) -> str:
@@ -2585,10 +2690,16 @@ async def summarize_by_local_qwen(long_text: str) -> str:
       本地 Qwen 不可用 → **直接把原文交出去**，不再截成 150 字。
       理由：原文给 DeepSeek 完全看得懂，硬截断反而会丢掉关键信息；
             只有超过 SUMMARIZE_FALLBACK_MAX（默认 1200 字）才截断，防止 prompt 爆炸。
+      失败后 LQ_COOLDOWN 秒内不再尝试（隧道断的时候每次白等只会拖慢消息）。
     """
+    global _LQ_DOWN_AT
     text = str(long_text or "")
     if len(text) < 150:
         return text  # 本来就很短就不总结了
+    _fallback = (text if len(text) <= SUMMARIZE_FALLBACK_MAX
+                 else smart_truncate(text, SUMMARIZE_FALLBACK_MAX))
+    if time.time() - _LQ_DOWN_AT < LQ_COOLDOWN:
+        return _fallback
 
     logger.info(f"[LocalQwen] 🧠 尝试压缩长文本（原长度 {len(text)}）…")
     prompt = (
@@ -2601,30 +2712,38 @@ async def summarize_by_local_qwen(long_text: str) -> str:
         "temperature": 0.3,
         "max_tokens": 200,
     }
+    _t0 = time.monotonic()
     try:
-        async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
-            r = await client.post(LOCAL_LLM_URL, headers={"Content-Type": "application/json"},
-                                  json=payload)
+        async with httpx.AsyncClient(
+                timeout=httpx.Timeout(LQ_TIMEOUT, connect=2.5),
+                trust_env=False) as client:
+            r = await asyncio.wait_for(
+                client.post(LOCAL_LLM_URL, headers={"Content-Type": "application/json"},
+                            json=payload),
+                timeout=LQ_TIMEOUT)
             r.raise_for_status()
             result = (r.json()["choices"][0]["message"]["content"] or "").strip()
             if result:
                 logger.info(f"[LocalQwen] ✅ 压缩完成：{len(text)} → {len(result)} 字")
+                diag.emit("qwen", ok=True, ms=round((time.monotonic() - _t0) * 1000),
+                          n_in=len(text), n_out=len(result))
+                _LQ_DOWN_AT = 0.0
                 return result
             raise ValueError("本地 Qwen 返回空内容")
     except Exception as e:
+        _LQ_DOWN_AT = time.time()
+        diag.emit("qwen", ok=False, why=type(e).__name__,
+                  ms=round((time.monotonic() - _t0) * 1000))
         # 只警告一次，避免刷屏
         if LOCAL_LLM_URL not in _LQ_WARNED:
             _LQ_WARNED.add(LOCAL_LLM_URL)
             logger.warning(
-                f"[LocalQwen] ⚠️ 本地 Qwen 不可用（{type(e).__name__}: {e}）\n"
-                f"   → 已降级：直接用原文交给 DeepSeek，不再截断\n"
-                f"   → 地址：{LOCAL_LLM_URL}\n"
-                f"   → 注意：compose 是 network_mode=host，应该用 127.0.0.1 而不是 "
-                f"host.docker.internal；且 Ollama 在算力机上，需要 SSH 隧道把 11434 映射到服务器"
+                f"[LocalQwen] ⚠️ 本地 Qwen 不可用（{type(e).__name__}: {e}），"
+                f"{LQ_COOLDOWN:.0f}s 内直接走原文\n"
+                f"   → 地址：{LOCAL_LLM_URL}（compose 是 network_mode=host，"
+                f"用 127.0.0.1；Ollama 在算力机上，需要 SSH 隧道把 11434 映射到服务器）"
             )
-        if len(text) <= SUMMARIZE_FALLBACK_MAX:
-            return text
-        return smart_truncate(text, SUMMARIZE_FALLBACK_MAX)
+        return _fallback
 
 
 # 👇 智能安全截断（兜底用）
@@ -3117,10 +3236,11 @@ async def call_llm(
             if packet.get(_key):
                 msgs.append({"role": "system", "content": packet[_key]})
 
-        if speaker_qq and not packet.get("profiles"):
+        if speaker_qq and not packet.get("profiles") and not TOOL_CTX.get("proactive"):
             # 称呼优先（用户 2026-11-18）：档案里约定过的 call_name 优先，
             # 没有才用群名片/昵称。这里以前直接写 speaker_name（群名片），
             # 于是她回复时也照着群名片叫 —— 上下文和回复的称呼就分叉了。
+            # proactive（她主动开口）时跳过：target 并没说话，不该标成「当前说话人」。
             try:
                 _call = profiles.call_of(speaker_qq, speaker_name, _gid)
             except Exception:
@@ -3328,7 +3448,8 @@ async def call_llm(
 
     # 工具按会话类型挂：默认只有私聊有；napcat_help/napcat_call 群聊也挂
     # （群里禁言、改名片、戳一戳本来就是群里的事，不挂等于她做不到）
-    _tools = [] if no_tools else tools_for(key, text)
+    _tools = [] if no_tools else tools_for(
+        key, text, kind=str(TOOL_CTX.get("intent_kind") or ""))
     allow_tools = bool(_tools)
     # 2026-11-27：本轮「用不了」的工具，明说一句 —— 比让模型自己踩空再补救便宜得多。
     # 挂在最后一个 system 块末尾（不新增块：selftest 卡 `msgs.append` 数量）。
@@ -3361,6 +3482,22 @@ async def call_llm(
         _prompt_chars = sum(len(str(m.get("content") or "")) for m in msgs) + _tool_chars
         try:
             ctx_budget.observe_prompt_total(_prompt_chars, source=str(key))
+        except Exception:
+            pass
+        # 常驻段占比（步 8 裁剪依据）：按 ▍标题聚合每条消息的字符数，
+        # 历史/非 system 归「历史/对话」。每轮一条 diag，够算占比不用另建表。
+        try:
+            _seg = {}
+            for _m in msgs:
+                _c = str(_m.get("content") or "")
+                _hit = re.findall(r"▍([^\n]{1,18})", _c)
+                _t = _hit[0] if _hit else (
+                    "历史/对话" if _m.get("role") != "system" else "其他")
+                _seg[_t] = _seg.get(_t, 0) + len(_c)
+            _seg = dict(sorted(_seg.items(), key=lambda kv: -kv[1])[:8])
+            diag.emit("prompt", key=str(key), total=int(_prompt_chars),
+                      sys=len(_sys_all), user=len(str(text or "")),
+                      tools=_tool_chars, seg=_seg)
         except Exception:
             pass
         _wire = {

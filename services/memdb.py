@@ -24,6 +24,7 @@ import uuid
 from pathlib import Path
 
 from core import tuning
+from . import diag as _diag
 
 DB_PATH = Path(os.getenv("MEMORY_DB", "data/memory.db"))
 
@@ -396,6 +397,8 @@ def remember(*, text: str, kind: str = "event", about_qq: str = "",
     init()
     now = time.time()
     text = (text or "").strip()
+    _diag.emit("write", about=about_qq, kind=kind, gid=gid, src=source,
+               txt=text[:60], imp=importance, sal=salience)
     _ew = max(float(emotion_weight or 0.0), 0.6 if emotion_hit else 0.0)
     _sal = float(salience) if salience is not None else max(0.0, min(1.0, _ew))
     _val = float(valence) if valence is not None else 0.0
@@ -520,6 +523,9 @@ def patch_turn(turn_id: str, **fields) -> bool:
                 c.execute("UPDATE memories SET storage_strength=max(storage_strength, ?), "
                           "retrieval_strength=max(retrieval_strength, ?) WHERE id=?",
                           (_store, _store, r["id"]))
+        if cur.rowcount and "about_qq" in fields:
+            _diag.emit("write_patch", turn=str(turn_id or "")[:8],
+                       about=fields.get("about_qq"))
         c.commit()
         return cur.rowcount > 0
 
@@ -696,28 +702,30 @@ def _ago(sec: float) -> str:
 
 
 def _candidates(c, qt, gid, max_age_days, limit=200):
-    sql = "SELECT * FROM memories WHERE status='active'"
-    args = []
+    # gid / 时间过滤两条路径共用：以前 FTS 分支只过滤 status，漏了 gid/时间
+    # → 跨群泄露 + 无视 max_age_days（2026-11-28 实测跨 6 群命中）。
+    filt = ""
+    fargs = []
     if gid:
-        sql += " AND (gid='' OR gid=?)"
-        args.append(str(gid))
+        filt += " AND (m.gid='' OR m.gid=?)"
+        fargs.append(str(gid))
     if max_age_days and max_age_days > 0:
-        sql += " AND (ts>=? OR importance>=0.8 OR salience>=0.5)"
-        args.append(time.time() - float(max_age_days) * 86400)
+        filt += " AND (m.ts>=? OR m.importance>=0.8 OR m.salience>=0.5)"
+        fargs.append(time.time() - float(max_age_days) * 86400)
     if qt and _INITED["fts"]:
         match = " OR ".join(sorted(set(qt))[:24])
         try:
             rows = c.execute(
                 "SELECT m.* FROM memories_fts f JOIN memories m ON m.rowid=f.rowid "
-                "WHERE memories_fts MATCH ? AND m.status='active' "
-                "ORDER BY rank LIMIT ?", (match, limit)).fetchall()
+                "WHERE memories_fts MATCH ? AND m.status='active'" + filt +
+                " ORDER BY rank LIMIT ?", [match, *fargs, limit]).fetchall()
             if rows:
                 return rows
         except Exception:
             pass
-    sql += " ORDER BY ts DESC LIMIT ?"
-    args.append(limit)
-    return c.execute(sql, args).fetchall()
+    sql = "SELECT * FROM memories m WHERE m.status='active'" + filt
+    sql += " ORDER BY m.ts DESC LIMIT ?"
+    return c.execute(sql, [*fargs, limit]).fetchall()
 
 
 def recall(query: str, *, limit: int = 5, speaker_qq: str = "",

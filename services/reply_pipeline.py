@@ -30,7 +30,7 @@ from collections import deque
 from pathlib import Path
 
 from core import tuning
-from . import perf_stats, ctx_budget
+from . import perf_stats, ctx_budget, diag
 
 try:
     from nonebot import logger
@@ -106,7 +106,7 @@ SUMMARY = {
     "白月光": "借他习惯的说话方式，不做他",
 }
 # 打印顺序（也是 /测函数 流水线 的顺序）
-STAGE_ORDER = ("气氛", "称呼", "状态", "档案", "总结", "记忆", "档案库",
+STAGE_ORDER = ("气氛", "称呼", "状态", "档案", "人物", "总结", "记忆", "档案库",
                "图书馆", "已回", "白月光")
 # 单独一个块标题：/看模板 里一眼能认出「这是流水线取回来的数据」，
 # 而不是混在人格/规矩/历史里找（用户 2026-11-24）。
@@ -331,6 +331,16 @@ async def build(
     except Exception as e:
         fail("档案", e)
 
+    # ---------- ③b 人物事实（design §1.2：「X是谁/把X@出来」硬查，防编造） ----------
+    try:
+        from . import person_facts
+        _pf = person_facts.render(str(text or ""), gid=gid, speaker_qq=speaker_qq)
+        if _pf:
+            blocks.append(_hdr("人物事实") + "\n" + _pf)
+            stages["人物"] = "✓"
+    except Exception as e:
+        fail("人物", e)
+
     # 收「气氛」：它从 ⓪ 就发出去了，和 ①②③ 并行；这里只等结果（最多 ATMO_TIMEOUT）。
     # 放在 blocks 最前面：接话前先读气氛，别等正文写完才想起来「刚才有人在哭」。
     if _atmo_task is not None:
@@ -340,6 +350,10 @@ async def build(
                 min(_atmo_timeout, left()), default={}) or {}
             if _at:
                 _intent = dict(_at)
+                diag.emit("atmo", gid=gid, need=_atmo.need_reply_of(_at),
+                          why=str(_at.get("why") or ""),
+                          kw=list(_at.get("keywords") or [])[:8],
+                          qs=_atmo.queries_of(_at))
                 blocks.insert(0, _atmo.render(_at, n=_atmo_msgs))
                 stages["气氛"] = "✓"
             else:
@@ -426,6 +440,11 @@ async def build(
         query = f"{speaker_name or '对方'} 图片"
     else:
         query = _qs.get("memory") or summary or str(text or "")[:120]
+    diag.emit("query", gid=gid,
+              src=("media" if _is_media else
+                   "atmo" if _qs.get("memory") else
+                   "summary" if summary else "raw"),
+              q=query)
 
     # ---------- ⑤⑥ 记忆 + 图书馆（并行，互不等待） ----------
     async def _mem_stage():

@@ -28,7 +28,7 @@ except Exception:  # pragma: no cover
     logger = logging.getLogger(__name__)
 
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-       "(KHTML, like Gecko) Chrome/127.0.0.1 Safari/537.36")
+       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 _URL_RE = re.compile(r"https?://[^\s<>\"'）)】〕，。！？、]+", re.I)
 _SKIP_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico",
              ".mp4", ".mp3", ".wav", ".zip", ".rar", ".7z", ".exe",

@@ -208,7 +208,7 @@ async def _fetch_image(seg: MessageSegment, path: Path) -> bool:
         return False
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/127.0.0.1 Safari/537.36",
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "*/*",
     }
     try:
@@ -421,6 +421,14 @@ async def _run_draw(bot: Bot, event: MessageEvent, mode: str, desc: str,
                         await bot.send(event, "😢 图画好了，但发图失败，稍后再试。")
                     except Exception:
                         pass
+            # 算力机如实回报的降级/备注（如 pose 模板缺失→文生图）要让用户看到，
+            # 不能只发图、假装按请求模式成功（2026-11-28 审计）。
+            _note = str((S["tasks"].get(task_id, {}).get("meta") or {}).get("note") or "")
+            if _note:
+                try:
+                    await bot.send(event, f"⚠️ {_note}")
+                except Exception:
+                    pass
         finally:
             _ACTIVE_USERS.discard(event.user_id)
             S["tasks"].pop(task_id, None)

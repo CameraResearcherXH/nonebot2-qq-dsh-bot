@@ -64,6 +64,13 @@ GROUP_LABEL = {
     "third_party": "第三方插件",
 }
 
+# 中文组名别名：文档/习惯叫法 → 规范组键。
+# features.md §5.1 写「/技能 关 主动接话」，但组标签是「主动开口」，
+# 不别名就会落到 off_skills 里一个不存在的技能名 → 关了没效果（2026-11-28 审计）。
+GROUP_ALIAS = {
+    "主动接话": "proactive", "主动插话": "proactive",
+}
+
 _LOCK = threading.Lock()
 _CACHE = {"mtime": -1.0, "data": {}}
 
@@ -171,8 +178,9 @@ def set_enabled(target: str, value: bool, gid: str = "") -> dict:
     elif t in SKILL_GROUPS:
         (off_g.discard if value else off_g.add)(t)
     else:
-        # 允许中文组名
+        # 允许中文组名（含别名，如「主动接话」→ proactive）
         _rev = {v: k for k, v in GROUP_LABEL.items()}
+        _rev.update(GROUP_ALIAS)
         if t in _rev:
             g = _rev[t]
             (off_g.discard if value else off_g.add)(g)

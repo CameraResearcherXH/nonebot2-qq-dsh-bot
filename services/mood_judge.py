@@ -59,6 +59,19 @@ _COVERAGE: dict = {}
 _CALLS: dict = {}
 
 
+def _fget(d: dict, key: str, default: float) -> float:
+    """float(d[key])，保留合法 0；仅 None/缺失/异常时回退默认。
+
+    `d.get(key) or default` 会把模型给的 0（完全无关 / 零置信 / 零反应）
+    当假值吞掉、回填默认 → 系统性高估相关度/置信（2026-11-28 审计）。
+    """
+    try:
+        v = (d or {}).get(key)
+        return default if v is None else float(v)
+    except Exception:
+        return default
+
+
 def _calls_left(key: str, now: float) -> int:
     ts = [t for t in _CALLS.get(key, []) if now - float(t) < 3600]
     _CALLS[key] = ts
@@ -1274,6 +1287,24 @@ async def judge_and_store(session_key: str, words: str, ctx_lines=None, *,
             _target, _tgt_qq = resolve_target(
                 _cause, speaker_qq, address_qq, address_kind, address_conf,
                 other_qq=_other_qq)
+            # 写入核对（design §1.1）：判读给的 about_qq 也要过硬核对 ——
+            # 不是本群见过/没被喊过的人，就置空不猜。说话人/Address 目标天然通过。
+            if _tgt_qq:
+                try:
+                    from . import attribution as _attr
+                    _kept, _awhy = _attr.verify(
+                        _tgt_qq, session_key=key, speaker_qq=speaker_qq,
+                        at_qq=(str(address_qq) if str(address_kind) == "person" else ""),
+                        text=f"{res.get('why') or ''}{res.get('other_name') or ''}")
+                    _attr.note("judge", _tgt_qq, _kept, _awhy,
+                               target=_target,
+                               conf=round(float(address_conf or 0.0), 2))
+                    if not _kept:
+                        logger.info(f"[ADDR] {key} 归因核对不过（{_awhy}）"
+                                    f"→ about_qq 置空")
+                        _tgt_qq = ""
+                except Exception as e:
+                    logger.debug(f"[ADDR] 归因核对失败: {type(e).__name__}: {e}")
             if _target == "recipient":
                 logger.info(f"[ADDR] {key} 判读归因 → recipient "
                             f"{_tgt_qq[-4:]}（conf {float(address_conf):.2f}）")
@@ -1300,7 +1331,7 @@ async def judge_and_store(session_key: str, words: str, ctx_lines=None, *,
             # 2026-11-25（P0-7）：relevance 闸门要管**整条链路**，不只 v。
             # 她没写 THINK 且 relation_relevance < gate → v/好感/记忆/群心情都不写。
             try:
-                _relevance = float(res.get("relation_relevance") or 0.5)
+                _relevance = _fget(res, "relation_relevance", 0.5)
             except Exception:
                 _relevance = 0.5
             # 2026-11-26（审计）：以前是 `not wrote and ...`，但 `not wrote` 的窗口
@@ -1367,10 +1398,10 @@ async def judge_and_store(session_key: str, words: str, ctx_lines=None, *,
                     if passive:
                         _imp = max(-1, min(1, _imp))
                     _obs = mood.observe(
-                        key, _imp, float(res.get("confidence") or 0.6),
+                        key, _imp, _fget(res, "confidence", 0.6),
                         sensitivity=(mood.sensitivity(key)
-                                     * float(_tr.get("sensitivity") or 1.0)),
-                        reactivity=float(_tr.get("reactivity") or 0.5),
+                                     * _fget(_tr, "sensitivity", 1.0)),
+                        reactivity=_fget(_tr, "reactivity", 0.5),
                         anchor_level=res.get("anchor_level"),
                         word=res["word"], why=res.get("why") or "",
                         src=res.get("src") or "", about_qq=_tgt_qq,
@@ -1423,7 +1454,8 @@ async def judge_and_store(session_key: str, words: str, ctx_lines=None, *,
             #    delta = 这一次的涨幅（记忆/好感/档案都读它）
             mood.set_judge(key, res["word"], _new_v,
                            why=res.get("why") or "", src=res.get("src") or "",
-                           mind=res.get("mind") or "", delta=_delta)
+                           mind=res.get("mind") or "", delta=_delta,
+                           target=_target, target_qq=_tgt_qq)
 
             # ①b a/d（唤醒/掌控）：一期只记录（置信加权 EMA + 独立半衰期），
             #     **不进 v 的 z/Δ**（emotion §1.5）。低置信判读不会大幅移动它。
@@ -1447,7 +1479,7 @@ async def judge_and_store(session_key: str, words: str, ctx_lines=None, *,
                         about_qq=(_tgt_qq if _target in ("speaker", "recipient", "other")
                                   else ""),
                         target=_target, impact=res.get("impact"), dv=_dv_actual,
-                        confidence=float(res.get("confidence") or 0.6),
+                        confidence=_fget(res, "confidence", 0.6),
                         relevance=_relevance, reason=res.get("why") or "")
                 except Exception as e:
                     logger.debug(f"[MOOD-JUDGE] 写 mood_events 失败: {type(e).__name__}: {e}")
@@ -1499,7 +1531,7 @@ async def judge_and_store(session_key: str, words: str, ctx_lines=None, *,
                         _new_aff = _pf.add_affinity_event(
                             _aff_qq, _dv_actual,
                             reason=res.get("word") or "",
-                            conf=float(res.get("confidence") or 0.6),
+                            conf=_fget(res, "confidence", 0.6),
                             novelty=_nov)
                         logger.info(
                             f"[MOOD-JUDGE] {_aff_qq} 好感v2 dv={_dv_actual:+.3f}"
@@ -1517,8 +1549,8 @@ async def judge_and_store(session_key: str, words: str, ctx_lines=None, *,
                         and (abs(_delta) >= 0.005 or abs(_dv_actual) >= 0.005)
                         and _pf is not None):
                     _cur_aff = float(_pf.get_affinity(_aff_qq))
-                    _gain = 0.04 + 0.12 * float(_tr.get("warmth") or 0.5)
-                    _tsf = 0.6 + 0.8 * float(_tr.get("trust_speed") or 0.5)
+                    _gain = 0.04 + 0.12 * _fget(_tr, "warmth", 0.5)
+                    _tsf = 0.6 + 0.8 * _fget(_tr, "trust_speed", 0.5)
                     # 置信度加权（P0-8）：判读没把握时，事件项不该按满格走。
                     # 用观测的 K（已含 confidence 与 P），没有观测就按 1.0。
                     _k_obs = float((_obs or {}).get("K") or 0.0) if _obs else 1.0
@@ -1562,7 +1594,7 @@ async def judge_and_store(session_key: str, words: str, ctx_lines=None, *,
                     from . import relationship
                     _rel_note = relationship.note_judge(
                         _rel_qq, res, delta=_delta,
-                        relevance=float(res.get("relation_relevance") or 0.5))
+                        relevance=_fget(res, "relation_relevance", 0.5))
                     if _rel_note:
                         logger.info(f"[REL] {_rel_qq} {_rel_note}")
                 except Exception as e:
@@ -1668,7 +1700,7 @@ async def anchor_tick() -> int:
             _base = 0.0
         try:
             move = mood.anchor(key, int(res["anchor_level"]),
-                               float(res.get("confidence") or 0.6), _base)
+                               _fget(res, "confidence", 0.6), _base)
         except Exception as e:
             logger.debug(f"[ANCHOR] {key} 写锚点失败: {type(e).__name__}: {e}")
             continue

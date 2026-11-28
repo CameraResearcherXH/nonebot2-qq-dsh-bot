@@ -8,11 +8,12 @@ import subprocess
 import aiohttp
 import aiofiles
 from pathlib import Path
-from fastapi import APIRouter, UploadFile, File, Form
+from fastapi import APIRouter, UploadFile, File, Form, Request
 from fastapi.responses import FileResponse, JSONResponse
 from nonebot import get_driver, on_message, logger
 from nonebot.adapters.onebot.v11 import Bot, MessageEvent, MessageSegment, GroupMessageEvent
 from nonebot.rule import Rule
+from services import diag
 
 logger.info("🚀 [加载检测] 音频分离调度中心正在初始化...")
 
@@ -32,6 +33,15 @@ if not API_SECRET:
 def _auth_failed(secret) -> bool:
     """没配 secret 时一律拒绝 —— 不能让「空 == 空」变成免密。"""
     return (not API_SECRET) or (str(secret or "") != API_SECRET)
+
+
+def _secret_of(request: Request, fallback: str = "") -> str:
+    """优先读 X-Node-Secret 头，回退 query/form。
+
+    secret 放 URL 会被访问日志/代理记下来（2026-11-28 实测心跳密钥落盘）。
+    新版 node 走头；保留 query 回退是为了服务端先部署时旧 node 不掉线。
+    """
+    return request.headers.get("X-Node-Secret") or fallback
 
 # 心跳超时：算力机超过这么久没心跳就算离线。
 # 原来写死 30 秒 —— 算力机心跳间隔只要稍长一点（或网络抖一下），
@@ -53,6 +63,13 @@ USER_STATE = {}
 #   带 `deliver` 信息的任务（画图/翻唱）重启后会继续等，完成后补发到原会话。
 TASKS_FILE = Path("data/node_tasks.json")
 TASK_TTL = 6 * 3600
+
+# 任务状态机（2026-11-28）：
+#   pending → processing（拉走即租约）→ completed / failed / timeout
+#   processing 的租约只有「算力机心跳也断了」才算过期 —— 翻唱/TTS 这种长任务
+#   心跳一直在，不能被误杀；算力机崩了才把任务从永远的 processing 里救出来。
+TASK_LEASE = max(120.0, float(os.getenv("NODE_TASK_LEASE", "900") or 900))
+TASK_PENDING_TTL = max(120.0, float(os.getenv("NODE_PENDING_TTL", "900") or 900))
 
 
 def save_tasks() -> None:
@@ -111,7 +128,7 @@ def _registry_put(task_id: str, path: str):
 
 
 @router.get("/api/heartbeat")
-async def heartbeat(secret: str = "", caps: str = ""):
+async def heartbeat(request: Request, secret: str = "", caps: str = ""):
     """
     caps：算力机上报自己支持的任务类型（逗号分隔），例如
           "audio_separation,cover,rvc,rvc_mix,split,tts"
@@ -120,7 +137,7 @@ async def heartbeat(secret: str = "", caps: str = ""):
     （split + rvc_mix，要往返两次 76MB wav）。
     老版本 node.py 不上报 caps，就会自动走两段式，不会卡住。
     """
-    if _auth_failed(secret): return {"error": "auth failed"}
+    if _auth_failed(_secret_of(request, secret)): return {"error": "auth failed"}
     STATUS["last_heartbeat"] = time.time()
     if caps:
         parsed = {c.strip() for c in caps.split(",") if c.strip()}
@@ -130,14 +147,18 @@ async def heartbeat(secret: str = "", caps: str = ""):
     return {"status": "ok"}
 
 @router.get("/api/tasks/pull")
-async def pull_task(secret: str = ""):
-    if _auth_failed(secret): return {"error": "auth failed"}
+async def pull_task(request: Request, secret: str = ""):
+    if _auth_failed(_secret_of(request, secret)): return {"error": "auth failed"}
     for task_id, task in list(STATUS["tasks"].items()):
         if task.get("status") == "pending":
             task["status"] = "processing"
+            task["leased_at"] = time.time()
+            task["attempts"] = int(task.get("attempts") or 0) + 1
             # 拉走时就把输入文件登记好：即使任务对象后面被删，node.py 也能重试下载
             _registry_put(task_id, task.get("input", ""))
             save_tasks()
+            diag.emit("node", ev="pull", tid=task_id,
+                      typ=task.get("type"), attempts=task["attempts"])
             return {"has_task": True, "task_id": task_id, "task": task}
         elif task.get("status") == "completed" and time.time() - task.get("complete_time", 0) > 120:
             STATUS["tasks"].pop(task_id, None)
@@ -147,9 +168,9 @@ async def pull_task(secret: str = ""):
 
 
 @router.get("/api/tasks/status")
-async def tasks_status(secret: str = ""):
+async def tasks_status(request: Request, secret: str = ""):
     """调试用：一眼看清算力机心跳和所有任务状态。"""
-    if _auth_failed(secret): return {"error": "auth failed"}
+    if _auth_failed(_secret_of(request, secret)): return {"error": "auth failed"}
     age = time.time() - STATUS["last_heartbeat"] if STATUS["last_heartbeat"] else -1
     return {
         "heartbeat_age_sec": round(age, 1),
@@ -165,14 +186,14 @@ async def tasks_status(secret: str = ""):
 # 👇 用 FileResponse：Starlette 自己走线程池 + 支持 Range 断点续传，
 #    比手写 StreamingResponse 稳得多（之前手写版一遇到慢连接就整个卡住）
 @router.get("/api/download/{task_id}")
-async def download_input(task_id: str, secret: str = "", field: str = ""):
+async def download_input(request: Request, task_id: str, secret: str = "", field: str = ""):
     """
     field 参数：取任务里的其它文件字段。
       默认/空       → task["input"]
       extra_input  → task["extra_input"]（翻唱任务里的伴奏）
     这样算力机拉第二个文件不用新加路由。
     """
-    if _auth_failed(secret):
+    if _auth_failed(_secret_of(request, secret)):
         return JSONResponse({"error": "auth failed"}, status_code=403)
 
     task = STATUS["tasks"].get(task_id) or {}
@@ -213,6 +234,12 @@ async def complete_task(
     if _auth_failed(secret): return {"error": "auth failed"}
     task = STATUS["tasks"].get(task_id)
     if not task: return {"error": "task not found"}
+    # 幂等：node.py 上传重试 / 网络重放时可能再来一条 complete。
+    # 已有成品就只回 ack，不覆盖、不重复触发发送（等待方已经处理过了）。
+    if task.get("status") in ("completed", "failed") and task.get("complete_time"):
+        diag.emit("node", ev="complete_dup", tid=task_id, st=task.get("status"))
+        logger.info(f"[算力机] 重复回传（已 {task.get('status')}）：{task_id} → 忽略")
+        return {"status": "duplicate"}
     
     if vocal and inst:
         vocal_path = TEMP_DIR / f"vocal_{task_id}.wav"
@@ -259,6 +286,15 @@ async def complete_task(
         async with aiofiles.open(out_path, 'wb') as f:
             await f.write(await file.read())
         task["output"] = str(out_path)
+        # 带文件的任务也可能附 JSON 元数据（如画图降级告知）；保留供发起方读取。
+        # 以前 elif file 分支直接丢弃 result，降级/备注到不了用户（2026-11-28 审计）。
+        if result:
+            try:
+                _m = json.loads(result)
+                if isinstance(_m, dict):
+                    task["meta"] = _m
+            except Exception:
+                pass
         logger.info(f"[算力机] 单文件任务完成: {task_id}（{out_path.name}）")
         # 单段式翻唱会同时传两个：「语音版（截到高潮）」+「完整版」
         # hasattr 判断是因为直接调用（自检）时默认值还是 File(None) 对象而不是 None
@@ -279,10 +315,64 @@ async def complete_task(
     else:
         logger.info(f"[算力机] 清理幽灵任务: {task_id}")
 
-    task["status"] = "completed"
+    # 算力机失败时回传 {"error": ...} 字典（无文件）→ 置 failed，
+    # 让 draw/song_cover/补发各路径如实报失败，而不是当成「画好了/翻好了」。
+    _out = task.get("output")
+    _failed = isinstance(_out, dict) and bool(_out.get("error"))
+    task["status"] = "failed" if _failed else "completed"
     task["complete_time"] = time.time()
     save_tasks()
+    diag.emit("node", ev="complete", tid=task_id, typ=task.get("type"),
+              st=task["status"], attempts=int(task.get("attempts") or 0))
     return {"status": "success"}
+
+
+def _reap_once() -> None:
+    """状态机兜底：把「永远 pending / 永远 processing」的任务判死。
+
+    · pending 超过 TASK_PENDING_TTL（算力机一直离线）→ timeout
+    · processing 且心跳已断、租约超过 TASK_LEASE（算力机拉走就崩了）→ timeout
+    判死后等待方会按失败收尾，任务表 120s 后自动清掉。
+    """
+    now = time.time()
+    hb_age = (now - STATUS["last_heartbeat"]) if STATUS["last_heartbeat"] else 1e9
+    node_online = hb_age < HEARTBEAT_TIMEOUT
+    n = 0
+    for task_id, task in list(STATUS["tasks"].items()):
+        st = task.get("status")
+        try:
+            if st == "pending":
+                born = float(task.get("created") or 0)
+                if born and now - born > TASK_PENDING_TTL:
+                    task["status"] = "timeout"
+                    task["complete_time"] = now
+                    diag.emit("node", ev="reap_timeout", tid=task_id,
+                              typ=task.get("type"), st="pending")
+                    n += 1
+            elif st == "processing" and not node_online:
+                leased = float(task.get("leased_at") or task.get("created") or 0)
+                if leased and now - leased > TASK_LEASE:
+                    task["status"] = "timeout"
+                    task["complete_time"] = now
+                    diag.emit("node", ev="reap_timeout", tid=task_id,
+                              typ=task.get("type"), st="processing",
+                              attempts=int(task.get("attempts") or 0))
+                    n += 1
+        except Exception:
+            continue
+    if n:
+        save_tasks()
+        logger.warning(f"[算力机] 租约过期 → {n} 个任务判超时")
+
+
+async def _reap_loop():
+    while True:
+        await asyncio.sleep(60)
+        try:
+            _reap_once()
+        except Exception as e:
+            logger.debug(f"[算力机] 租约回收异常: {type(e).__name__}: {e}")
+
 
 driver = get_driver()
 driver.server_app.include_router(router)
@@ -368,6 +458,7 @@ async def _on_bot_connect_resume(bot):
         return
     _RESUME_STARTED = True
     asyncio.create_task(_periodic_save_tasks())
+    asyncio.create_task(_reap_loop())
     n = 0
     for tid, t in list(STATUS["tasks"].items()):
         st = t.get("status")
@@ -419,7 +510,7 @@ async def queue_task_for_download(bot: Bot, event: MessageEvent, state_info: dic
         await bot.send(event, "⏳ 正在从 QQ 服务器下载音频（大文件可能需要时间）...")
         try:
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.1 Safari/537.36",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Accept": "*/*"
             }
             async with aiohttp.ClientSession() as session:
@@ -459,6 +550,14 @@ async def queue_task_for_download(bot: Bot, event: MessageEvent, state_info: dic
         # 算力机一直没拉走（离线）→ 别让用户干等 5 分钟
         if st.get("status") == "pending" and _i >= 30:
             await bot.send(event, "❌ 算力机离线（60 秒内没接任务），请稍后再试。")
+            STATUS["tasks"].pop(task_id, None)
+            return
+        if st.get("status") in ("failed", "timeout"):
+            _err = st.get("output")
+            if isinstance(_err, dict):
+                _err = _err.get("error") or str(_err)
+            logger.error(f"❌ 算力机处理失败: {_err}")
+            await bot.send(event, f"❌ 算力机处理失败：{_err or '未知错误'}")
             STATUS["tasks"].pop(task_id, None)
             return
         if st.get("status") == "completed":
@@ -559,7 +658,7 @@ async def _(bot: Bot, event: MessageEvent):
                 
     if file_seg:
         WAITING_FOR_UPLOAD.discard(event.user_id)
-        task_id = str(int(time.time()))
+        task_id = str(time.time_ns())
         USER_STATE[event.user_id] = {
             "status": "waiting_format",
             "task_id": task_id,
@@ -588,7 +687,7 @@ async def _(bot: Bot, event: MessageEvent):
         await inline_handler.finish("❌ 算力机离线，暂时无法提供分离服务。")
 
     file_seg = next((seg for seg in event.get_message() if seg.type == "file"), None)
-    task_id = str(int(time.time()))
+    task_id = str(time.time_ns())
     USER_STATE[event.user_id] = {
         "status": "waiting_format",
         "task_id": task_id,

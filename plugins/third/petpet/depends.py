@@ -368,10 +368,13 @@ def RegexArg(key: str):
     def dependency(state: T_State):
         try:
             arg: dict = state[REGEX_DICT]
-            return arg.get(key, None)
+            # 消费方注解是 str（如 my_friend name: str = RegexArg("name")），
+            # 返回 None 会在 nonebot 依赖解析阶段 TypeMisMatch，且 name.strip() 会炸。
+            # 缺组/异常一律给 ""，让 `x.strip() or 默认` 正常兜底（2026-11-28 审计）。
+            return arg.get(key) or ""
         except Exception as e:  # noqa: BLE001
             logger.exception(f"[PETPET] RegexArg 依赖失败 {type(e).__name__}: {e}")
-            return None
+            return ""
 
     return Depends(dependency)
 
@@ -384,7 +387,9 @@ def Arg(possible_values=None):
         if args:
             arg = args[0]
             if possible_values and arg not in possible_values:
-                return
+                # 非法受限值：消费方注解 str，返回 None → TypeMisMatch。
+                # 给 ""，meme 体的 `if arg == "右"` / `arg or 默认` 自然走默认分支。
+                return ""
             return arg
         else:
             return ""

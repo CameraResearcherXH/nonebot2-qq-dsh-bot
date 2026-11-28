@@ -611,6 +611,12 @@ def render_style_only(gid: str, target_qq: str = "",
 
     if not ENABLED:
         return ""
+    # 借风格总开关（tuning：0=只给 1 行事实）。事实行档案块已写，这里不重复；
+    # 关时不借句式 → 返回空。以前这条路径完全不读 BORROW，总开关被绕过
+    # （2026-11-28 审计：reply_pipeline 走 render_style_only）。
+    if not int(BORROW or 0):
+        return ""
+    _r = _borrow_ratio()
     if target_qq:
         m = person_moon(gid, target_qq)
         if not m:
@@ -625,9 +631,9 @@ def render_style_only(gid: str, target_qq: str = "",
         if ex:
             lines.append("· 他最近的原话（学句长/标点/口头禅，别照抄内容）："
                          + " / ".join(f"「{x[:40]}」" for x in ex))
-        lines.append(f"· 这次回 {who}：多用他习惯的句式 / 口头禅 / 标点")
+        lines.append(f"· 这次回 {who}：可以借 **{_r:.0%}** 的句式 / 口头禅 / 标点")
         lines.append("· 内容还是你自己的；别照抄原句、别每句都用、别把自己变成他。")
-        return "\n".join(lines)
+        return "\n".join(lines)[:BORROW_CHARS]
 
     m = group_moon(gid)
     if not m:
@@ -642,9 +648,9 @@ def render_style_only(gid: str, target_qq: str = "",
     if ex:
         lines.append("· 他最近的原话（学句长/标点/口头禅，别照抄内容）："
                      + " / ".join(f"「{x[:40]}」" for x in ex))
-    lines.append("· 这次是回大家 / 吐槽：可以带一点他的说话方式")
+    lines.append(f"· 这次是回大家 / 吐槽：可以借 **{_r:.0%}** 的说话方式")
     lines.append("· 别丢自己的性格、别照抄原句、别每句都用。")
-    return "\n".join(lines)
+    return "\n".join(lines)[:BORROW_CHARS]
 
 
 def status_text(gid: str = "") -> str:

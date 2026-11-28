@@ -1,43 +1,54 @@
 # 更新日志
+## 2026-11-28（第五十三轮：审计修复落地 + 六环诊断 + 闭环回放 + 节能模式）
 
-## 2026-11-28（第五十三轮：构建源全部参数化 —— 墙内也能 build）
+### 一、审计修复落地（P1–P3，16 项）
 
-**用户反馈**：墙内机器 `docker compose up -d --build` 连撞三堵墙：
+- 心情判读改用真实时钟（q_at），修复跨天/节流误判；
+- 人声分离适配 demucs 3 元组返回 + vocal 本地路径 + 临时文件清理；
+- `tool_dispatcher` 上报真实任务状态；心跳改守护线程并带 `X-Node-Secret` 头；
+- 识图简报合并为单条，减少一次 LLM 调用；
+- 配置读取修复 falsy-zero（`0`/`False` 被误当缺省）；
+- 记忆库 FTS 检索恢复 gid/时间过滤；
+- 白月光 `render_style_only` 增加 BORROW 保护；
+- 锚点 `p_add` 修正；proactive 上下文标记修正；
+- `skill_switch` 支持 GROUP_ALIAS；`agent_client` 显式 `method="hybrid"`；
+- `petpet` 空参数 `Arg/RegexArg` 修正；画图降级提示（3 个文件）；
+- `make_dist.py` 修 UA 误脱敏（`Chrome/120.0.0.0` 不再被换成 `127.0.0.1`）；
+- 算力机 `node.py`：上传有限重试（5xx/网络抖动 3/6/9s 退避，4xx 不重试）+
+  分裂上传重试；服务端对重复回传幂等。
 
-1. `failed to resolve source metadata for docker.io/docker/dockerfile:1`
-   —— Dockerfile 第一行 `# syntax=docker/dockerfile:1` 让 BuildKit 先去 Docker Hub
-   拉「Dockerfile 前端镜像」，而墙内连 `registry-1.docker.io` 都是 dial timeout；
-2. `FROM python:3.11-slim` 同样来自 Docker Hub，拉不到；
-3. 好不容易过了上面两步，`apt-get install chromium` 从 `deb.debian.org` 拉了
-   **5705 秒（95 分钟）还没完** —— chromium + chromium-driver 合计 ~400MB。
+### 二、整体设计步骤 0–9
 
-**改动**
+- 工具任务状态机：pending→processing 租约（900s）、60s 回收、重复完成幂等；
+- 六环诊断账本 `services/diag.py`：recall/tools/write/view/attr/atmo/query/
+  qwen/node/lag/prompt，`digest()` 汇总，`/记忆体检` 显示趋势；
+- 事件循环 watchdog：1500ms 阈值、60s 预热、120s 节流、卡住栈转储；
+- LLM prompt 分段账本：每次调用记录总字符与各分段占比；
+- 闭环回放 `scripts/replay_closed_loop.py`：真实历史分桶（@/普通/提问/吐槽/短句）、
+  假 Bot 拦截发送、DIAG/用量重定向沙箱、自动读取 `.env` 保持与线上同配置；
+- 新增 `services/attribution.py`（归因核对）与 `services/person_facts.py`。
 
-| 位置 | 改动 |
-|---|---|
-| Dockerfile 第 1 行 | **删掉** `# syntax=docker/dockerfile:1`（`RUN --mount=type=cache` 由引擎内置前端支持，Docker 18.09+） |
-| Dockerfile | 新增 `ARG PYTHON_IMAGE` + `FROM ${PYTHON_IMAGE}` |
-| Dockerfile | 新增 `ARG APT_MIRROR`，在 apt 层把 `deb.debian.org` 替换成它 |
-| Dockerfile | 新增 `ARG PIP_INDEX_URL` / `PIP_TRUSTED_HOST`，三处 `pip install` 显式带 `--index-url/--trusted-host` |
-| Dockerfile | 新增 `ARG PLAYWRIGHT_DOWNLOAD_HOST`（空值必须 `unset`，playwright 拿到空串会拼坏 URL） |
-| docker-compose.yml | `bot.build` 从 `build: .` 改成带 5 个 args，全部 `${VAR:-默认值}` |
-| .env.example | 新增「0. 构建源」段 |
+### 三、节能模式排障（重要）
 
-**默认值一律保持海外最优**（`pypi.org` / `deb.debian.org`），线上香港机器不用改任何东西；
-墙内 build 在 `.env` 里填：
+`nonebot.init()` 不会读取 `.env`，配置来自 docker compose `env_file`，且只在
+**容器创建时**烘入；因此改 `.env` 后 `docker restart` 不生效，必须
+`docker compose up -d` 重建容器。修复后 `POWER_MODE=eco` 生效：
+场景审核 / 主动开口 / 图书馆按需关闭，回复管线不变。
 
-```ini
-PYTHON_IMAGE=docker.m.daocloud.io/library/python:3.11-slim
-APT_MIRROR=https://mirrors.aliyun.com
-PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
-PIP_TRUSTED_HOST=mirrors.aliyun.com
-PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright
-```
+### 四、闭环验证（eco 配置，真实历史消息回放）
 
-**坑（写进注释了）**：`python:3.11-slim` 现在是 Debian **trixie**，用 deb822 格式的
-`/etc/apt/sources.list.d/debian.sources`，只 sed 老的 `/etc/apt/sources.list` 等于没改 ——
-所以替换逻辑同时扫两个文件，且**只替换主机名**（`/debian`、`/debian-security` 路径不变，
-阿里云/清华/中科大 都符合）。
+- @ 消息 2/2 回复且在人格内；非 @ 按 COOLDOWN 明确记录原因后安静；
+- 单轮 3.7–8s，审核 0ms，prompt 约 6.8–7.5k tokens（缓存命中 38%）；
+- 记忆写入 138 次空 0；归因 51 次 speaker 置信 0.99；
+- 本地 Qwen 2.5:7b 压缩管线 3 处（工具结果 / RAG 事实 / 识图描述）实测正常，
+  失败（6s 超时）自动回退原文；
+- 遗留问题见 `docs/legacy-issues-20261128.md`（主动开口几乎不通过、
+  记忆写入带〔引用…〕脚手架）。
+
+### 五、本仓说明
+
+- `.env` 为脱敏版：密钥/账号/群号替换为占位符，其余（模式、模型、预算、
+  tuning 覆盖值等）与线上一致，便于对照实际运行参数。
 
 ## 2026-11-28（第五十二轮：NapCat 镜像下架处置 + RAG 分阶段计时）
 

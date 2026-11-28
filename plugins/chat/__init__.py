@@ -39,12 +39,15 @@ from services.access import is_owner, display_name, nickname_variants
 from services import (profiles, memory_v2, mood, group_roster, referee,
                        dialogue_log, group_scene, scene_auditor, conv_state)
 from services import view_frequency as vf_mod
+from services import diag
+from services import watchdog
 from services.config import GROUP_WATCH_MODE, POWER_MODE, power_on  # noqa: E402
 from services import (attention, expression, chat_switch, proactive, mood_judge,
                       profile_miner, quiet_advisor, skill_switch, segments,
                       poke_guard)
 # 意图层（2026-11-27）：只给主动插话用一个「该不该接」的闸门（默认关）。
 from services import atmosphere as atmo_intent
+from services import attribution
 from services import identity as identity_mod
 from services.prompt_builder import build_prompt
 
@@ -2912,6 +2915,18 @@ async def _start_anchor_timer(bot):
     except Exception as e:
         logger.debug(f"[ANCHOR] 启动失败: {type(e).__name__}: {e}")
 
+
+@_driver.on_bot_connect
+async def _start_lag_watch(bot):
+    if getattr(_start_lag_watch, "_started", False):
+        return
+    _start_lag_watch._started = True
+    try:
+        asyncio.create_task(watchdog.loop())
+        logger.info(f"[WATCHDOG] 事件循环 lag 自检已启动（阈值 {watchdog.LAG_MS:.0f}ms）")
+    except Exception as e:
+        logger.debug(f"[WATCHDOG] 启动失败: {type(e).__name__}: {e}")
+
 # 2026-11-20 工程结构化：把实现注册到 core，供新插件统一调用
 try:
     from core import pipeline as _pipeline
@@ -4813,6 +4828,31 @@ async def _session_worker(bot: Bot, session_key: str):
                         _already_replied(session_key, _rm)
                 ev = _seg_records[-1].get("ev") or item[0]
                 text = segments.format(_seg_records)
+                # 👇 识图描述合并：segments.format 只渲染段内图片占位「[图片]」，
+                #    下面 exclude_mids 又会把同 mid 的识图简报排掉 → 描述两头落空
+                #    （2026-11-28 实测视觉丢失链）。段里有图片就把识别结果并进 text。
+                _item_text = str(item[1] or "")
+                _has_img = False
+                for _r in _seg_records:
+                    _ev = _r.get("ev")
+                    if _ev is not None and any(
+                            getattr(s, "type", "") == "image"
+                            for s in _ev.get_message()):
+                        _has_img = True
+                        break
+                if _has_img:
+                    _vdesc = (_item_text if _item_text.startswith(llm_mod.VISION_TAG)
+                              else "")
+                    if not _vdesc:
+                        try:
+                            from plugins import vision_agent as _va
+                            _d = str((_va.last_image(session_key) or {}).get("desc") or "")
+                            if _d:
+                                _vdesc = f"{llm_mod.VISION_TAG} 图片内容:{_d}"
+                        except Exception:
+                            _vdesc = ""
+                    if _vdesc:
+                        text = f"{text}\n\n{_vdesc}"
                 _gid_s = str(getattr(ev, "group_id", "") or "")
                 # 👇 上下文和判心情**同源同条数**（用户 2026-11-22）：
                 #    都读 group_scene 里「收发件人标签处理过的历史」，
@@ -4939,6 +4979,16 @@ async def _session_worker(bot: Bot, session_key: str):
 
         # 2026-11-20 记录模型 v2：每个 turn 先落一条 pending（记忆全记）。
         # 判读回来再由 mood_judge.patch_turn 补 delta/salience/valence/mood_word。
+        # detail 只存「她真正要回的那句」：text 是 build_prompt 拼好的整段群聊模板，
+        # 直接落库会让记忆详情全是「（这一段群聊共 N 条…」分段说明（真机 diag 抓到）。
+        _turn_msg = ""
+        try:
+            if _seg_records:
+                _turn_msg = str((_seg_records[-1] or {}).get("text") or "").strip()
+        except Exception:
+            _turn_msg = ""
+        if not _turn_msg:
+            _turn_msg = llm_mod._tool_query_of(text)
         _turn_id = "%s:%s" % (session_key, getattr(ev, "message_id", "") or int(time.time() * 1000))
         try:
             memory_v2.upsert_turn({
@@ -4947,8 +4997,8 @@ async def _session_worker(bot: Bot, session_key: str):
                 "gid": str(getattr(ev, "group_id", "") or ""),
                 "about_qq": speaker_qq,
                 "kind": "event",
-                "title": str(text or "")[:30],
-                "detail": str(text or ""),
+                "title": _turn_msg[:30],
+                "detail": _turn_msg,
                 "source": "turn",
                 "importance": 0.5,
             })
@@ -4968,6 +5018,14 @@ async def _session_worker(bot: Bot, session_key: str):
                     level="owner" if is_owner(speaker_qq) else "member",
                 )
                 profiles.touch_profile(speaker_qq, text)
+                # 自述别名（design §1.1）：「我叫阿明 / 叫我小明」是 direct 证据。
+                # 只认说话人自己说的；他述（「他叫阿明」）不在这里学。
+                _new_alias = profiles.learn_self_intro(
+                    speaker_qq, text,
+                    msg_id=str(getattr(ev, "message_id", "") or ""),
+                    gid=str(getattr(ev, "group_id", "") or ""))
+                if _new_alias:
+                    logger.info(f"[ALIAS] {speaker_qq} 自述别名「{_new_alias}」已记（direct）")
                 # 说话方式（是否有 face）
                 has_face = any(seg.type in ("face", "mface") for seg in ev.get_message())
                 profiles.update_style(speaker_qq, msg_len=len(text), has_emoji=has_face)
@@ -5212,6 +5270,8 @@ async def _session_worker(bot: Bot, session_key: str):
                 # L0 自检要用 kind（vent 禁方案词）：流水线已经调过 atmosphere，
                 # 直接复用它的结构化结果，别再花一次调用。
                 _intent_now = dict((_pl or {}).get("intent") or {})
+                # 意图类型透传给工具检索（ask → 查证类工具加分，command → 行动类加分）
+                llm_mod.TOOL_CTX["intent_kind"] = atmo_intent.kind_of(_intent_now)
                 # 只有标题、一个块都没拿到 → 退回静态拼装，别让空流水线把
                 # 记忆/图书馆/心情全跳过（否则她这轮什么参考都没有）。
                 if _staged.strip() == reply_pipeline.PIPE_HEADER:
@@ -5485,6 +5545,22 @@ async def _session_worker(bot: Bot, session_key: str):
                 # 它只进 bond 时间线 + 低权重记忆，**不动心情** ——
                 # 否则「他让我唱歌」这种中性事件会把心情拉平。
                 _is_bond = str(memo.get("kind") or "").lower() == "bond"
+                # 归因（design §1.1）：判读给了 recipient/other 且那个 QQ
+                # 就在**当前这条消息的证据**里（说话人 / @对象 / 回复对象）→
+                # 才按 target 记；判读过期或对不上证据就仍记说话人。
+                _about = speaker_qq
+                try:
+                    _tg = str(_jd.get("target") or "")
+                    _tq = str(_jd.get("target_qq") or "")
+                    _ev = {str(speaker_qq or ""), str(_reply_to_qq or "")}
+                    if str((_addr or {}).get("to_kind") or "") == "person":
+                        _ev.add(str((_addr or {}).get("to_qq") or ""))
+                    if _jd_fresh and _tg in ("recipient", "other") and _tq in _ev:
+                        _about = _tq
+                        attribution.note("memo", speaker_qq, _tq, "judge_target",
+                                         target=_tg, memo=mtext[:40])
+                except Exception:
+                    _about = speaker_qq
                 # 👇 「发件人 / 收件人标签」落到记忆上（用户 2026-11-19）：
                 #    记忆要带群号，才能实现 memory_v2.group_ok() 的「群内记忆只在群内用」。
                 #    以前 group_ok 的过滤逻辑存在，但**没有任何代码写「群号:」前缀** →
@@ -5507,7 +5583,7 @@ async def _session_worker(bot: Bot, session_key: str):
                     memory_v2.remember(
                         text=_mtext,
                         kind=memo.get("kind") or "impression",
-                        about_qq=speaker_qq,
+                        about_qq=_about,
                         tags=memo.get("tags") or [],
                         importance=0.45 if _is_bond else float(imp),
                         # 刻痕 = |Δ|（这件事让她变了多少），不是当前心情水平。
@@ -5544,7 +5620,7 @@ async def _session_worker(bot: Bot, session_key: str):
                 if _bond_worthy:
                     try:
                         profiles.add_bond_note(
-                            speaker_qq, mtext, emotion=emo,
+                            _about, mtext, emotion=emo,
                             mood_word=(_jword if _jd_fresh else ""),
                             mind=(str(_jd.get("mind") or "") if _jd_fresh else ""),
                             delta=(_jdelta if _jd_fresh else None))
@@ -5559,7 +5635,7 @@ async def _session_worker(bot: Bot, session_key: str):
                         # （固定 9 个词只用来估数值方向）
                         mood.bump_by_emotion(
                             memo.get("emotion_raw") or emo,
-                            reason=mtext, about_qq=speaker_qq,
+                            reason=mtext, about_qq=_about,
                             session_key=session_key,
                         )
                     except Exception as e:
@@ -5592,9 +5668,20 @@ async def _session_worker(bot: Bot, session_key: str):
             ).strip() or reply
             try:
                 if clean_reply and len(clean_reply.strip()) >= 5:
+                    # turn 事件只存「她真正在回的那句」，不存整段群聊模板：
+                    # 以前存 text = build_prompt 输出，记忆详情里全是
+                    # 「（这一段群聊共 N 条…按时间顺序…」这种分段说明（真机 diag 抓到）。
+                    _turn_text = ""
+                    try:
+                        if _seg_records:
+                            _turn_text = str((_seg_records[-1] or {}).get("text") or "").strip()
+                    except Exception:
+                        _turn_text = ""
+                    if not _turn_text:
+                        _turn_text = llm_mod._tool_query_of(text)
                     memory_v2.remember(
                         # 用「这是你之前的回复」而不是「我：」，避免模型把两条都当成别人说的
-                        text=f"{speaker_name}：{text}\n{_SELF_PREFIX}{clean_reply[:120]}",
+                        text=f"{speaker_name}：{_turn_text[:200]}\n{_SELF_PREFIX}{clean_reply[:120]}",
                         kind="event",
                         about_qq=speaker_qq,
                         importance=0.5,
@@ -6443,6 +6530,10 @@ async def _random_chat_loop(bot: Bot):
 
                     if not decision["reply"]:
                         logger.debug(f"[GROUP] {gid} 不接话: {decision['reason']}")
+                        # 接话机会账本（薄）：每次闸门判定落一条 meta，离线可评
+                        diag.emit("view", gid=gid, ok=False, gate="decide",
+                                  why=str(decision.get("reason") or "")[:60],
+                                  rel=round(float(rel or 0), 2))
                         continue
 
                     # 👇 意图层闸门（2026-11-27，默认关）：只挡「主动插话」，
@@ -6459,6 +6550,8 @@ async def _random_chat_loop(bot: Bot):
                             logger.info(
                                 f"[INTENT] {gid} 意图=不用接"
                                 f"（{_it.get('why') or '—'}）→ 本轮不插话")
+                            diag.emit("view", gid=gid, ok=False, gate="intent",
+                                      why=str(_it.get("why") or "")[:60])
                             continue
 
                     # 查看频率：刚连说过几句 → 内部频率已经衰减，这里会自然收敛；
@@ -6475,6 +6568,8 @@ async def _random_chat_loop(bot: Bot):
                     if not _vf.decide(_ext, random.random()):
                         logger.info(
                             f"[VIEW] {gid} 本轮不放行（{_vf.describe()}｜external={_ext:.2f}）")
+                        diag.emit("view", gid=gid, ok=False, gate="freq",
+                                  why=_vf.describe()[:60], ext=round(_ext, 2))
                         continue
                     _vf.activate(_ext)
 
@@ -6483,8 +6578,13 @@ async def _random_chat_loop(bot: Bot):
                     if _gdone >= proactive.GROUP_MAX_PER_DAY:
                         logger.info(f"[PROACTIVE] {gid} 今天已主动 {_gdone} 次"
                                     f"（上限 {proactive.GROUP_MAX_PER_DAY}）→ 跳过")
+                        diag.emit("view", gid=gid, ok=False, gate="cap",
+                                  n=_gdone, lim=int(proactive.GROUP_MAX_PER_DAY))
                         continue
                     logger.info(f"[GROUP] {gid} 主动插话: {decision['reason']}")
+                    diag.emit("view", gid=gid, ok=True, gate="pass",
+                              why=str(decision.get("reason") or "")[:60],
+                              rel=round(float(rel or 0), 2), ext=round(_ext, 2))
                     # 先占住这个群的插话名额：LLM 调用/发送失败也不要在下个 tick 重试，
                     # 否则同一条话会被插两次（"接话两次"的另一半原因）。
                     last_random_chat[gid] = time.time()
@@ -8364,6 +8464,29 @@ async def _(event: MessageEvent):
         lines.append(f"💤 长期没被想起 {r['stale_total']} 条，最久的 3 条：")
         for s in r["stale"][:3]:
             lines.append(f"  {s['days']} 天 「{s['text']}」")
+    try:
+        d = diag.digest()
+        if d["n"]:
+            lines.append(f"📈 今日诊断 {d['n']} 条")
+            if d["recall"]:
+                rc = d["recall"]
+                lines.append(f"  · 召回 {rc['n']} 次｜空 {rc['empty']}｜均 {rc['ms']}ms")
+            if d["tools"]:
+                lines.append(f"  · 工具选择 {d['tools']['n']} 次｜平均挂载 {d['tools']['mount']}%")
+            if d["write"]:
+                lines.append(f"  · 写入 {d['write']['n']} 条｜about 空 {d['write']['empty']}%")
+            if d["view"]:
+                vw = d["view"]
+                rej = "、".join(f"{k} {v}" for k, v in sorted((vw["reject"] or {}).items()))
+                lines.append(f"  · 接话机会 {vw['n']} 次｜通过 {vw['pass']}｜拦：{rej or '无'}")
+            if d["qwen"]:
+                lines.append(f"  · 本地Qwen {d['qwen']['n']} 次｜成 {d['qwen']['ok']}")
+            if d["node"]:
+                lines.append("  · 算力机 " + "、".join(f"{k} {v}" for k, v in d["node"].items()))
+            if d["lag"]:
+                lines.append(f"  · 循环卡顿 {d['lag']['n']} 次｜最久 {d['lag']['max_ms']}ms")
+    except Exception as e:
+        lines.append(f"（诊断趋势读取失败：{type(e).__name__}）")
     await mem_check.finish("\n".join(lines))
 
 
@@ -8420,8 +8543,12 @@ async def _send_proactive(bot: Bot, cand: dict) -> bool:
     _old = dict(llm_mod.TOOL_CTX)
     try:
         # 主动找人没有 event（不是谁发消息触发的），但要让工具层知道「跟谁说话」
+        # proactive=True：抑制 call_llm 的「当前说话人」行——是她主动开口，
+        # target 并没说话，标成「当前说话人」会和 prompt_block「不是他找你」矛盾。
+        # speaker_qq 仍保留给安静判定/post_rules/工具用（2026-11-28 审计）。
         llm_mod.set_tool_context(bot=bot, event=None, speaker_qq=qq,
-                                 speaker_name=name, addressed=True, newer_count=0)
+                                 speaker_name=name, addressed=True, newer_count=0,
+                                 proactive=True)
         reply, _ = await call_llm(key, text, group_context=lines or None,
                                   speaker_qq=qq, speaker_name=name)
     except Exception as e:
@@ -9862,7 +9989,7 @@ register_tool(
 _GIRL_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/127.0.0.1 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
     )
 }
 

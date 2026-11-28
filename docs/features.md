@@ -167,7 +167,7 @@
 - **文件**：
   - `node.py`：算力机主程序
   - `node.env.example`：配置模板（复制成 `node.env` 再填）
-  - `node_config/prompt_presets.py`：画图 prompt / 采样配方
+  - `config/prompt_presets.py`：画图 prompt / 采样配方（node.py:3861 实际导入路径；`node_config/` 下有一份相同副本，无代码引用）
   - `comfy_workflows/*.json`：ComfyUI workflow 模板
   - `my_kkI_rvc.py`：RVC 单文件推理入口
   - `rvc_pipeline.py`：RVC 音域对齐 / 变调 / 混音流水线
@@ -203,7 +203,7 @@
 
 ## 11. 参数与阈值
 
-所有可调参数集中在 `core/tuning.py`（229 项，全部中文说明），`.env` 同名变量可覆盖。
+所有可调参数集中在 `core/tuning.py`（504 项，全部中文说明），`.env` 同名变量可覆盖。
 完整表见 [tuning.md](tuning.md)。改完用：
 
 ```bash

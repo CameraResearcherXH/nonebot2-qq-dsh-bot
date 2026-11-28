@@ -364,7 +364,12 @@ async def _rag_search(query: str) -> dict | None:
     """
     data = await _post_json(
         f"{AGENT_BASE_URL}{RAG_TOOL_ENDPOINT}",
-        {"query": str(query or "")[:300], "top_k": max(3, WORLD_TOP)},
+        # rag_search 工具硬编码默认 method="vector"，会覆盖 RAG 项目
+        # Config.DEFAULT_RETRIEVAL_METHOD="hybrid"。显式传 hybrid，走 patched
+        # retriever 的「关键词优先 + 向量补充」，减少宋词/结构化文档的无关命中
+        # （2026-11-28 审计；不传则纯向量，正是图书馆自 suspend 的诱因之一）。
+        {"query": str(query or "")[:300], "top_k": max(3, WORLD_TOP),
+         "method": "hybrid"},
         RAG_TOOL_TIMEOUT,
     )
     if data is None:

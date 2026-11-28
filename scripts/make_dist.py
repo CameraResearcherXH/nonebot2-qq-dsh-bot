@@ -254,6 +254,11 @@ def redact_hosts(dest: Path) -> list:
             _ip = _m.group(0)
             if _is_private_ip(_ip) or _ip in keep_ips:
                 continue
+            # UA/版本号（Chrome/120.0.0.0、Edge/120.0.0.0 …）不是主机地址。
+            # 匹配点前是「字母+/」即 UA token；「://」前一位是 / 不是字母，不会误判，
+            # 真主机 http://IP 仍照常脱敏（2026-11-28 审计：以前把 UA 版本号也换成 127.0.0.1）。
+            if re.search(r"[A-Za-z]+/$", new[:_m.start()]):
+                continue
             hits.append((p.relative_to(dest).as_posix(), "公网 IP", "[REDACTED]"))
             new = new.replace(_ip, "127.0.0.1")
         if new != text:

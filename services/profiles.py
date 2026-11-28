@@ -142,6 +142,67 @@ def remove_alias(qq: str, name: str) -> dict:
     return p
 
 
+# ---------- 别名证据（design §1.1） ----------
+# 别名不再只靠群名片：自述（「我叫阿明」）是 direct 证据；他述（「他叫阿明」）
+# 只能算 reported。同一名字出现不同来源 → conflicted（保留，不删）。
+_ALIAS_SRC_NAME = {"direct": "自述", "reported": "他述", "uncertain": "转述",
+                   "conflicted": "来源冲突"}
+
+
+def add_alias_evidence(qq: str, name: str, *, src: str = "direct",
+                       msg_id: str = "", gid: str = "") -> dict:
+    qq, name = str(qq or "").strip(), str(name or "").strip()[:12]
+    if not qq or not name:
+        return {}
+    p = get_profile(qq)
+    ev = p.setdefault("alias_src", {})
+    cur = ev.get(name) or {}
+    old = str(cur.get("src") or "")
+    if src == "direct" or old == "direct":
+        merged = "direct"
+    elif old and old != src:
+        merged = "conflicted"
+    else:
+        merged = src
+    ev[name] = {"src": merged, "at": time.time(),
+                "msg": str(msg_id or "")[:40], "gid": str(gid or "")}
+    p["alias_src"] = dict(list(ev.items())[-40:])
+    if name not in (p.get("aliases") or []):
+        p["aliases"] = [a for a in (p.get("aliases") or []) if a][:29] + [name]
+    _save("profile", qq, p)
+    try:
+        from . import diag
+        diag.emit("alias", qq=qq, name=name, src=merged, old=old, gid=gid)
+    except Exception:
+        pass
+    return p
+
+
+_SELF_INTRO = (
+    re.compile(r"(?:可以|就)?(?:叫我|喊我|管我叫)\s*([^\s，。,.!?！？、：:]{1,10})"),
+    re.compile(r"^(?:其实)?我(?:的名字)?(?:叫|叫做|是)\s*([^\s，。,.!?！？、：:]{1,8})"),
+)
+_NAME_STOP = ("什么", "谁", "多少", "哪", "吗", "呢", "吧", "哦", "啊", "呀",
+              "的", "了", "你", "我", "他", "她", "不", "没")
+
+
+def learn_self_intro(qq: str, text: str, *, msg_id: str = "", gid: str = "") -> str:
+    """从「我叫X / 叫我X」里学一个自述别名（direct 证据）。返回学到的名字。"""
+    t = str(text or "").strip()
+    if not qq or not t or len(t) > 60:
+        return ""
+    for rgx in _SELF_INTRO:
+        m = rgx.search(t)
+        if not m:
+            continue
+        name = m.group(1).strip("「」『』“”\"'：:")
+        if not name or any(s in name for s in _NAME_STOP):
+            continue
+        add_alias_evidence(qq, name, src="direct", msg_id=msg_id, gid=gid)
+        return name
+    return ""
+
+
 def clear_call_names(qq: str, *, call_name: bool = True, bot_alias: bool = True,
                      gid: str = "") -> dict:
     """删掉称呼（call_name / bot_alias），并把旧 call_name 从 aliases 里移除。
